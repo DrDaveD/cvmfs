@@ -89,24 +89,25 @@ class DirectoryEntryBase {
     { }
 
   // accessors
-  inline bool IsRegular() const                { return S_ISREG(mode_); }
-  inline bool IsLink() const                   { return S_ISLNK(mode_); }
-  inline bool IsDirectory() const              { return S_ISDIR(mode_); }
+  inline bool IsRegular() const                 { return S_ISREG(mode_); }
+  inline bool IsLink() const                    { return S_ISLNK(mode_); }
+  inline bool IsDirectory() const               { return S_ISDIR(mode_); }
 
-  inline inode_t inode() const                 { return inode_; }
-  inline inode_t parent_inode() const          { return parent_inode_; }
+  inline inode_t inode() const                  { return inode_; }
+  inline inode_t parent_inode() const           { return parent_inode_; }
   //inline uint32_t generation() const           { return generation_; }
-  inline uint32_t linkcount() const            { return linkcount_; }
-  inline NameString name() const               { return name_; }
-  inline LinkString symlink() const            { return symlink_; }
+  inline uint32_t linkcount() const             { return linkcount_; }
+  inline NameString name() const                { return name_; }
+  inline LinkString symlink() const             { return symlink_; }
 
-  inline time_t mtime() const                  { return mtime_; }
-  inline unsigned int mode() const             { return mode_; }
-  inline uid_t uid() const                     { return uid_; }
-  inline gid_t gid() const                     { return gid_; }
+  inline time_t mtime() const                   { return mtime_; }
+  inline unsigned int mode() const              { return mode_; }
+  inline uid_t uid() const                      { return uid_; }
+  inline gid_t gid() const                      { return gid_; }
 
-  inline hash::Any checksum() const            { return checksum_; }
-  inline const hash::Any *checksum_ptr() const { return &checksum_; }
+  inline shash::Any checksum() const            { return checksum_; }
+  inline const shash::Any *checksum_ptr() const { return &checksum_; }
+  inline shash::Algorithms hash_algorithm() const { return checksum_.algorithm; }
 
   inline uint64_t size() const {
     return (IsLink()) ? symlink().GetLength() : size_;
@@ -127,6 +128,9 @@ class DirectoryEntryBase {
   inline void set_linkcount(const uint32_t linkcount) {
     assert(linkcount > 0);
     linkcount_ = linkcount;
+  }
+  inline void set_symlink(const LinkString &symlink) {
+    symlink_ = symlink;
   }
 
   /**
@@ -181,7 +185,7 @@ class DirectoryEntryBase {
 
   // checksum is not part of the file system intrinsics, though can be computed
   // just using the file contents... we therefore put it in this base class.
-  hash::Any checksum_;
+  shash::Any checksum_;
 };
 
 /**
@@ -210,26 +214,31 @@ class DirectoryEntry : public DirectoryEntryBase {
    */
   inline explicit DirectoryEntry(const DirectoryEntryBase& base) :
     DirectoryEntryBase(base),
-    catalog_(NULL),
     cached_mtime_(0),
     hardlink_group_(0),
     is_nested_catalog_root_(false),
     is_nested_catalog_mountpoint_(false),
-    is_chunked_file_(false) {}
+    is_chunked_file_(false),
+    is_negative_(false) {}
 
   inline DirectoryEntry() :
-    catalog_(NULL),
     cached_mtime_(0),
     hardlink_group_(0),
     is_nested_catalog_root_(false),
     is_nested_catalog_mountpoint_(false),
-    is_chunked_file_(false) {}
+    is_chunked_file_(false),
+    is_negative_(false) {}
 
   inline explicit DirectoryEntry(SpecialDirents special_type) :
-    catalog_((Catalog *)(-1)) { };
+    cached_mtime_(0),
+    hardlink_group_(0),
+    is_nested_catalog_root_(false),
+    is_nested_catalog_mountpoint_(false),
+    is_chunked_file_(false),
+    is_negative_(true) { assert(special_type == kDirentNegative); };
 
   inline SpecialDirents GetSpecial() const {
-    return (catalog_ == (Catalog *)(-1)) ? kDirentNegative : kDirentNormal;
+    return is_negative_ ? kDirentNegative : kDirentNormal;
   }
 
   Differences CompareTo(const DirectoryEntry &other) const;
@@ -240,7 +249,7 @@ class DirectoryEntry : public DirectoryEntryBase {
     return !(*this == other);
   }
 
-  inline bool IsNegative() const { return GetSpecial() == kDirentNegative; }
+  inline bool IsNegative() const { return is_negative_; }
 
   inline bool IsNestedCatalogRoot() const { return is_nested_catalog_root_; }
   inline bool IsNestedCatalogMountpoint() const {
@@ -248,7 +257,6 @@ class DirectoryEntry : public DirectoryEntryBase {
   }
   inline bool IsChunkedFile() const { return is_chunked_file_; }
 
-  inline const Catalog *catalog() const  { return catalog_; }
   inline uint32_t hardlink_group() const { return hardlink_group_; }
   inline time_t cached_mtime() const     { return cached_mtime_; }
 
@@ -266,10 +274,7 @@ class DirectoryEntry : public DirectoryEntryBase {
     is_chunked_file_ = val;
   }
 
-private:
-  // Associated cvmfs catalog
-  Catalog* catalog_;
-
+ private:
   time_t cached_mtime_;  /**< can be compared to mtime to figure out if caches
                               need to be invalidated (file has changed) */
 
@@ -281,6 +286,7 @@ private:
   bool is_nested_catalog_root_;
   bool is_nested_catalog_mountpoint_;
   bool is_chunked_file_;
+  bool is_negative_;
 };
 
 /**

@@ -79,7 +79,19 @@ typedef std::map<uint64_t, HardlinkGroup> HardlinkGroupMap;
  */
 class SyncMediator {
   friend class SyncUnion;
+ private:
+  enum ChangesetAction {
+    kAdd,
+    kAddCatalog,
+    kAddHardlinks,
+    kTouch,
+    kRemove,
+    kRemoveCatalog
+  };
+
  public:
+  static const unsigned int processing_dot_interval = 100;
+
   SyncMediator(catalog::WritableCatalogManager *catalog_manager,
                const SyncParameters *params);
   virtual ~SyncMediator();
@@ -89,7 +101,7 @@ class SyncMediator {
   void Remove(SyncItem &entry);
   void Replace(SyncItem &entry);
 
-	void EnterDirectory(SyncItem &entry);
+  void EnterDirectory(SyncItem &entry);
   void LeaveDirectory(SyncItem &entry);
 
   manifest::Manifest *Commit();
@@ -101,6 +113,9 @@ class SyncMediator {
   void RegisterUnionEngine(SyncUnion *engine) {
     union_engine_ = engine;
   }
+
+  void PrintChangesetNotice(const ChangesetAction action,
+                            const std::string &extra_info) const;
 
   // Called after figuring out the type of a path (file, symlink, dir)
   void AddFile(SyncItem &entry);
@@ -145,7 +160,7 @@ class SyncMediator {
   // Hardlink handling
   void CompleteHardlinks(SyncItem &entry);
   HardlinkGroupMap &GetHardlinkMap() { return hardlink_stack_.top(); }
-	void LegacyRegularHardlinkCallback(const std::string &parent_dir,
+  void LegacyRegularHardlinkCallback(const std::string &parent_dir,
                                      const std::string &file_name);
   void LegacySymlinkHardlinkCallback(const std::string &parent_dir,
                                       const std::string &file_name);
@@ -168,16 +183,17 @@ class SyncMediator {
    */
   HardlinkGroupMapStack hardlink_stack_;
 
-	/**
-	 * New and modified files are sent to an external spooler for hashing and
+  /**
+   * New and modified files are sent to an external spooler for hashing and
    * compression.  A spooler callback adds them to the catalogs, once processed.
-	 */
+   */
   pthread_mutex_t lock_file_queue_;
   SyncItemList file_queue_;
 
   HardlinkGroupList hardlink_queue_;
 
   const SyncParameters *params_;
+  mutable unsigned int changed_items_;
 };  // class SyncMediator
 
 }  // namespace publish

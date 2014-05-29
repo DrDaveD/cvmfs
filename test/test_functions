@@ -9,7 +9,7 @@
 # `export CVMFS_TEST_SRVDEBUG=startup` - for interactive debugging with gdb
 
 
-CVMFS_TEST_DEBUGLOG=
+CVMFS_TEST_DEBUGLOG=${CVMFS_TEST_DEBUGLOG:=}
 CVMFS_TEST_PROXY=${CVMFS_TEST_PROXY:=http://ca-proxy.cern.ch:3128}
 CVMFS_TEST_SCRATCH=${CVMFS_TEST_SCRATCH:=/tmp/cvmfs-test}
 CVMFS_TEST_EXCLUDE=${CVMFS_TEST_EXCLUDE:=}
@@ -17,45 +17,18 @@ CVMFS_TEST_SYSLOG_FACILITY=${CVMFS_TEST_SYSLOG_FACILITY:=5}
 CVMFS_TEST_SYSLOG_TARGET=${CVMFS_TEST_SYSLOG_TARGET:=/var/log/cvmfs-testing.log}
 
 CVMFS_TEST_REPO=${CVMFS_TEST_REPO:=test.cern.ch}
+CVMFS_TEST_REPO_MORE=${CVMFS_TEST_REPO_MORE:=test-more.cern.ch}
 CVMFS_TEST_USER=${CVMFS_TEST_USER:=sftnight}   # user and group are used to over-
 CVMFS_TEST_GROUP=${CVMFS_TEST_GROUP:=sftnight} # write the owner of files for testing
 
+CVMFS_TEST_UNIONFS=${CVMFS_TEST_UNIONFS:=aufs} # union filesystem type to test
 CVMFS_TEST_SRVDEBUG=${CVMFS_TEST_SRVDEBUG:=}
+CVMFS_TEST_HASHALGO=${CVMFS_TEST_HASHALGO:=sha1}
 
 die() {
   echo -e $1 >&2
   exit 1
 }
-
-# iptables handling
-IPTABLES_STARTUP="/etc/init.d/iptables"
-IPTABLES="/sbin/iptables"
-IPTABLES_SAVE="/sbin/iptables-save"
-IPTABLES_RESTORE="/sbin/iptables-restore"
-
-if [ ! -f $IPTABLES ] ; then
-  if [ -f "/usr/sbin/iptables" ] ; then
-    IPTABLES="/usr/sbin/iptables"
-  else
-    die "iptables binary not found"
-  fi
-fi
-
-if [ ! -f $IPTABLES_SAVE ] ; then
-  if [ -f "/usr/sbin/iptables-save" ] ; then
-    IPTABLES_SAVE="/usr/sbin/iptables-save"
-  else
-    die "iptables-save binary not found"
-  fi
-fi
-
-if [ ! -f $IPTABLES_RESTORE ] ; then
-  if [ -f "/usr/sbin/iptables-restore" ] ; then
-    IPTABLES_RESTORE="/usr/sbin/iptables-restore"
-  else
-    die "iptables-restore binary not found"
-  fi
-fi
 
 
 # find the service binary
@@ -67,8 +40,26 @@ else
 fi
 
 # find the name of the httpd service
-apache="httpd"
-which apache2 >/dev/null 2>&1 && apache="apache2"
+
+
+# figure out the installed apache platform
+if which httpd2 >/dev/null 2>&1; then #SLES/OpenSuSE
+  APACHE_SERVICE="apache2"
+  APACHE_CONF=${APACHE_SERVICE}
+  APACHE_BIN=$(which httpd2)
+elif which apache2 >/dev/null 2>&1; then # Debian based
+  APACHE_SERVICE="apache2"
+  APACHE_CONF=${APACHE_SERVICE}
+  APACHE_BIN=$(which apache2)
+else
+  APACHE_SERVICE="httpd" # EL based
+  APACHE_CONF=${APACHE_SERVICE}
+  APACHE_BIN="/usr/sbin/httpd"
+fi
+
+version_major() { echo $1 | cut --delimiter=. --fields=1; }
+version_minor() { echo $1 | cut --delimiter=. --fields=2; }
+version_patch() { echo $1 | cut --delimiter=. --fields=3; }
 
 # ensures that a generic service is running
 # @param service  the name of the service
@@ -87,6 +78,10 @@ service_switch() {
     off)
       echo "stopping $service_name..."
       sudo $service_binary $service_name stop || return 101
+      ;;
+    restart)
+      echo "restarting $service_name..."
+      sudo $service_binary $service_name restart || return 102
       ;;
     *)
       echo "unrecognized state switching for $service_name"
@@ -117,11 +112,19 @@ service_should_switch() {
   return 1
 }
 
+
+# checks if autofs is running on /cvmfs
+# @return   0 when autofs is mounted on /cvmfs
+autofs_check() {
+  cat /proc/mounts | grep -q "^/etc/auto.cvmfs /cvmfs "
+}
+
+
 # ensures that autofs is on or off
 # @param state   the desired state of autofs (on|off)
 # @return        0 on success
 autofs_switch() {
-  cat /proc/mounts | grep -q "^/etc/auto.cvmfs /cvmfs "
+  autofs_check
   service_should_switch $1 $?
   if [ $? -eq 0 ]; then
     service_switch autofs $1
@@ -136,10 +139,10 @@ autofs_switch() {
 # @param state   the desired state of autofs (on|off)
 # @return        0 on success
 apache_switch() {
-  sudo $service_binary $apache status > /dev/null 2>&1
+  sudo $service_binary $APACHE_SERVICE status > /dev/null 2>&1
   service_should_switch $1 $?
   if [ $? -eq 0 ]; then
-    service_switch $apache $1
+    service_switch $APACHE_SERVICE $1
     return $?
   else
     return 0 # already in correct state
@@ -326,23 +329,30 @@ destroy_repo() {
 }
 
 
+has_repo() {
+  local repo=$1
+  cvmfs_server list | grep -q "^$repo "
+}
+
+
 create_repo() {
   local repo=$1
   local uid=$2
   local debug_log=$3
+  local extra_options="$4"
 
   echo "Shutting down autofs for the cvmfs mounts"
   autofs_switch off || return 100
 
-  if cvmfs_server list | grep -q $repo; then
+  if has_repo $repo; then
     echo "Repository $repo is already present... removing it"
     destroy_repo $repo || return 101
   fi
 
   echo "Creating new repository $repo..."
-  sudo cvmfs_server mkfs -o $uid -m $repo || return 102
+  sudo cvmfs_server mkfs -o $uid -m -f ${CVMFS_TEST_UNIONFS} -a ${CVMFS_TEST_HASHALGO} $extra_options $repo || return 102
 
-  if [ x$debug_log != x ]; then
+  if [ x$debug_log != x -a x$debug_log != xNO ]; then
     echo "CVMFS_DEBUGLOG=$debug_log" | sudo tee -a /etc/cvmfs/repositories.d/${repo}/client.conf
   fi
 }
@@ -352,8 +362,9 @@ create_empty_repo() {
   local repo=$1
   local uid=$2
   local debug_log=$3
+  local extra_options="$4"
 
-  create_repo $repo $uid $debug_log || return 101
+  create_repo $repo $uid $debug_log $extra_options || return 101
 
   sudo cvmfs_server transaction $repo || return 102
   rm -f /cvmfs/$repo/new_repository
@@ -395,6 +406,33 @@ create_filled_repo() {
   popdir
 
   sudo cvmfs_server publish $repo || return 103
+}
+
+
+# generates a huge dummy repository content with 500.000 directory entries
+# in a somewhat representative directory structure
+#
+# @param  repo_dir   where to put the dummy dirents
+make_huge_repo() {
+  local repo_dir=$1
+  python ${TEST_ROOT}/mock_services/make_repo.py \
+    --max-dir-depth        7                     \
+    --num-subdirs          5                     \
+    --num-files-per-dir    5                     \
+    --min-file-size        0                     \
+    --max-file-size     5120                     \
+    $repo_dir
+}
+
+
+# creates a big file at a given location with a given size
+# @param path  the location of the new file
+# @param size  the desired size in megabytes
+create_big_file() {
+  local path=$1
+  local size=$2
+
+  dd if=/dev/zero of=$path bs=1024k count=$size
 }
 
 
@@ -492,6 +530,41 @@ compare_directories() {
 }
 
 
+# run a binary in the background and return it's PID through stdout
+#
+# @param logfile  a path to a logfile for outputs of the started program
+# @return         the process ID of the created background service
+run_background_service() {
+  local logfile=$1
+  shift 1
+
+  local srv_pid
+
+  # shell for the win!
+  # This spawns a shell executing the passed command string (sudo sh -c) which
+  # will print it's PID (echo $$) into a fifo and execute the user defined
+  # binary redirecting its outputs into the logfile (exec $@ >> $logfile 2>&1).
+  # Furthermore it disconnects the new process from the executing shell (nohup),
+  # satisfies the I/O requirements of nohup (2>&1 < /dev/null) and sends it to
+  # the background (&)
+  #   Credit: Dario Berzano helped with that monster!
+  local fifo="pid_fifo"
+  mkfifo $fifo || return 1
+  nohup sh -c "echo \$\$ > $fifo; exec $@ >> $logfile 2>&1" 2>&1 < /dev/null &
+  srv_pid=$(cat $fifo)
+  rm -f $fifo
+
+  # check if the background process is running
+  if ! sudo kill -0 $srv_pid > /dev/null 2>&1; then
+    return 4
+  fi
+
+  # print the PID of the background process and return successfully
+  echo $srv_pid
+  return 0
+}
+
+
 # open a port for incoming connections. It will accept the connection but stay
 # silent on it
 #
@@ -506,88 +579,20 @@ open_silent_port() {
   local protocol=$1
   local port=$2
   local logfile=$3
+  local pid
+  local cmd
+  local retcode
 
-  local server_pid_tmp=""
-  server_pid_tmp=$(mktemp -q)
+  cmd="sudo python ${TEST_ROOT}/mock_services/silent_socket.py $protocol $port"
+  pid=$(run_background_service $logfile "$cmd")
+  retcode=$?
 
-  nohup sudo ${TEST_ROOT}/mock_services/silent_socket.py $protocol $port >> $server_pid_tmp 2>>$logfile &
-  sleep 1
-  server_pid=$(head -n1 $server_pid_tmp)
-  rm -f $server_pid_tmp
-
-  if ! sudo kill -0 $server_pid > /dev/null 2>&1; then
-    return 4
+  if [ $retcode -ne 0 ]; then
+    return $retcode
   fi
-
-  echo $server_pid
-  return 0
-}
-
-
-# starts a perl helper service
-#
-# @param service_name   the identifier of the service to be started:
-#                       i.e.  named, httpd, webproxy
-# @param __             all addtional parameters will be passed to the starting
-#                       perl service
-# @return               the process ID of the started service
-start_perl_service() {
-  service_name=$1
-  shift
-
-  # check if the service exists
-  if [ ! -f $TEST_ROOT/mock_services/Services/$service_name/main.pl ]; then
-    echo "No such perl service '$service_name'"
-    return 1
-  fi
-
-  # start the service
-  pushdir $TEST_ROOT/mock_services > /dev/null
-  output=$(sudo perl Services/$service_name/main.pl $@)
-  popdir > /dev/null
-  pid=$(echo "$output" | grep SAVE_PID | cut -d : -f 2)
-
-  # log its process ID
-  mkdir -p service_pids
-  touch service_pids/$pid
 
   echo $pid
-  return 0
-}
-
-
-# kills a single perl process
-#
-# @param pid   the process ID of the perl service to be killed
-kill_perl_service() {
-  pid=$1
-
-  # check if the process ID was logged before
-  if [ ! -f service_pids/$pid ]; then
-    echo "No such perl service with process ID: $pid"
-    return 1
-  fi
-
-  # kill the service
-  sudo kill $pid
-  rm -f service_pids/$pid
-
-  return 0
-}
-
-
-# kills all perl services that might still run in the background
-kill_all_perl_services() {
-  # check if there are any services to kill
-  if [ ! -d service_pids ]; then
-    return 0
-  fi
-
-  # kill them all!!
-  services=$(ls service_pids)
-  for service in $services; do
-    kill_perl_service $service
-  done
+  return $retcode
 }
 
 
@@ -613,8 +618,10 @@ get_catalog_count() {
 }
 
 # uses `cvmfs_server check` to check the integrity of the catalog structure
+# additionally it might check the backend storage integrity as well when
+# provided with -i
 # @param repo    the repository to be checked
-check_catalogs() {
+check_repository() {
   local repo=$1
   shift 1
 
@@ -638,7 +645,7 @@ publish_repo() {
   shift 1
 
   # parse the command line arguments (keep quotation marks)
-  args=""
+  args="-v"
   while [ $# -gt 0 ]; do
     if echo $1 | grep -q "\s"; then
       args="$args \"$1\""
@@ -665,6 +672,15 @@ publish_repo() {
 
   return 0
 }
+
+
+# sources the repository server configuration file for the given repo name
+# @param name  the name of the repository to load the configs for
+load_repo_config() {
+  local name=$1
+  . /etc/cvmfs/repositories.d/${name}/server.conf
+}
+
 
 # runs the given command and measures the time it took to execute
 stop_watch() {
@@ -707,4 +723,98 @@ popdir() {
     cd -
     return $?
   fi
+}
+
+
+# retrieves the apache version string "2.x.xx"
+get_apache_version() {
+  ${APACHE_BIN} -v | head -n1 | \
+    sed 's/^Server version: Apache\/\([0-9]\+\.[0-9]\+\.[0-9]\+\).*$/\1/'
+}
+
+
+# figure out apache config file mode
+#
+# @return   apache config mode (stdout) (see globals below)
+APACHE_CONF_MODE_OLD=1 # *.conf goes to ${APACHE_CONF}/conf.d
+APACHE_CONF_MODE_NEW=2 # *.conf goes to ${APACHE_CONF}/conf-available
+get_apache_conf_mode() {
+  local minor_apache_version=$(version_minor "$(get_apache_version)")
+  if [ $minor_apache_version -ge 4 ] || [ -d /etc/${APACHE_CONF}/conf-available ]; then
+    echo $APACHE_CONF_MODE_NEW
+  else
+    echo $APACHE_CONF_MODE_OLD
+  fi
+}
+
+
+# find location of apache configuration files
+#
+# @return   the location of apache configuration files (stdout)
+get_apache_conf_path() {
+  local res_path="/etc/${APACHE_CONF}"
+  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_NEW" ]; then
+    echo "${res_path}/conf-available"
+  else
+    echo "${res_path}/conf.d"
+  fi
+}
+
+
+# returns the apache configuration string for 'allow from all'
+# Note: this is necessary, since apache 2.4.x formulates that different
+#
+# @return   a configuration snippet to allow s'th from all hosts (stdout)
+get_compatible_apache_allow_from_all_config() {
+  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_NEW" ]; then
+    echo "Require all granted"
+  else
+    local nl='
+'
+    echo "Order allow,deny${nl}    Allow from all"
+  fi
+}
+
+
+# writes apache configuration file
+# This figures out where to put the apache configuration file depending
+# on the running apache version
+# Note: Configuration file content is expected to come through stdin
+#
+# @param   file_name  the name of the apache config file (no path!)
+# @return             0 on success
+create_apache_config_file() {
+  local file_name=$1
+  local conf_path
+  conf_path="$(get_apache_conf_path)"
+
+  # create (or append) the conf file
+  cat - | sudo tee ${conf_path}/${file_name} > /dev/null || return 1
+
+  # the new apache requires the enable the config afterwards
+  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_NEW" ]; then
+    sudo a2enconf $file_name > /dev/null || return 2
+  fi
+
+  return 0
+}
+
+
+# removes apache config files dependent on the apache version in place
+# Note: As of apache 2.4.x `a2disconf` needs to be called before removal
+#
+# @param   file_name  the name of the conf file to be removed (no path!)
+# @return  0 on successful removal
+remove_apache_config_file() {
+  local file_name=$1
+  local conf_path
+  conf_path="$(get_apache_conf_path)/${file_name}"
+
+  # disable configuration on newer apache versions
+  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_NEW" ]; then
+    sudo a2disconf $file_name > /dev/null 2>&1 || return 1
+  fi
+
+  # remove configuration file
+  sudo rm -f $conf_path
 }

@@ -7,8 +7,10 @@ set (CVMFS_LOADER_SOURCES
   smalloc.h atomic.h shortstring.h fs_traversal.h
   platform.h platform_linux.h platform_osx.h
   logging_internal.h logging.h logging.cc
+  prng.h
   hash.h hash.cc
   util.h util.cc
+  sanitizer.h sanitizer.cc
   options.h options.cc
   globals.h globals.cc
   loader_talk.h loader_talk.cc
@@ -26,16 +28,18 @@ set (CVMFS_CLIENT_SOURCES
   cache.h cache.cc
   platform.h platform_osx.h platform_linux.h
   monitor.h monitor.cc
-  util.cc util.h
+  prng.h util.cc util.h
+  backoff.h backoff.cc
   duplex_zlib.h compression.h compression.cc
+  sanitizer.cc sanitizer.h
   download.cc download.h
+  wpad.cc wpad.h
   manifest.h manifest.cc
   manifest_fetch.h manifest_fetch.cc
   murmur.h smallhash.h
   bigvector.h
   lru.h
   globals.h globals.cc
-  peers.h peers.cc
   sql.h sql.cc
   catalog_sql.h catalog_sql.cc
   catalog.h catalog.cc
@@ -59,6 +63,7 @@ set (CVMFS2_DEBUG_SOURCES
   loader.h compat.cc compat.h
   history.h history.cc
   quota_listener.h quota_listener.cc
+  auto_umount.h auto_umount.cc
   cvmfs.h cvmfs.cc
 )
 
@@ -83,6 +88,7 @@ set (CVMFS_FSCK_SOURCES
   smalloc.h
   atomic.h
   duplex_zlib.h compression.cc compression.h
+  prng.h
   hash.cc hash.h
   util.cc util.h
   cvmfs_fsck.cc)
@@ -95,22 +101,29 @@ set (CVMFS_SWISSKNIFE_SOURCES
   globals.cc globals.h
   manifest.h manifest.cc
   manifest_fetch.h manifest_fetch.cc
+  prng.h
   hash.h hash.cc
   compression.h compression.cc
   util.h util.cc
   util_concurrency.h util_concurrency_impl.h util_concurrency.cc
 
-  upload_file_chunker.h upload_file_chunker.cc
-  upload_file_chunker_xor32.h upload_file_chunker_xor32.cc
-  upload_file_processor.h upload_file_processor.cc
+  file_processing/async_reader.h file_processing/async_reader_impl.h file_processing/async_reader.cc
+  file_processing/char_buffer.h
+  file_processing/chunk.h file_processing/chunk.cc
+  file_processing/chunk_detector.h file_processing/chunk_detector.cc
+  file_processing/file.h file_processing/file.cc
+  file_processing/io_dispatcher.h file_processing/io_dispatcher.cc
+  file_processing/processor.h file_processing/processor.cc
+  file_processing/file_processor.h file_processing/file_processor.cc
+
   upload.h upload.cc
   upload_spooler_definition.h upload_spooler_definition.cc
   upload_facility.h upload_facility.cc
   upload_local.h upload_local.cc
-  upload_riak.h upload_riak.cc
   upload_spooler_result.h
   json_document.h json_document.cc
 
+  sanitizer.cc sanitizer.h
   duplex_curl.h download.h download.cc
   signature.cc signature.h
 
@@ -141,11 +154,18 @@ set (CVMFS_SWISSKNIFE_SOURCES
   swissknife_info.h swissknife_info.cc
   swissknife_history.h swissknife_history.cc
   swissknife_migrate.h swissknife_migrate.cc
+  swissknife_scrub.h swissknife_scrub.cc
   swissknife.h swissknife.cc)
 
 
 set (CVMFS_SWISSKNIFE_DEBUG_SOURCES
   ${CVMFS_SWISSKNIFE_SOURCES}
+)
+
+set (CVMFS_SUID_HELPER_SOURCES
+  platform.h platform_osx.h platform_linux.h
+  sanitizer.h sanitizer.cc
+  cvmfs_suid_helper.cc
 )
 
 #
@@ -184,7 +204,7 @@ if (BUILD_CVMFS)
   add_executable (cvmfs_fsck ${CVMFS_FSCK_SOURCES})
 
   if (LIBFUSE_BUILTIN)
-    add_dependencies (cvmfs_fuse_debug libfuse) # here it does not matter if libfuse or libfuse4x
+    add_dependencies (cvmfs_fuse_debug libfuse) # here it does not matter if libfuse or osxfuse
     add_dependencies (cvmfs_fuse libfuse)       # at this point only the appropriate one is defined
   endif (LIBFUSE_BUILTIN)
 
@@ -192,6 +212,11 @@ if (BUILD_CVMFS)
     add_dependencies (cvmfs_fuse_debug libcares libcurl)
     add_dependencies (cvmfs_fuse libcares libcurl)
   endif (LIBCURL_BUILTIN)
+
+  if (PACPARSER_BUILTIN)
+    add_dependencies (cvmfs_fuse_debug pacparser)
+    add_dependencies (cvmfs_fuse pacparser)
+  endif (PACPARSER_BUILTIN)
 
   if (SQLITE3_BUILTIN)
     add_dependencies (cvmfs_fuse_debug sqlite3)
@@ -225,9 +250,9 @@ if (BUILD_CVMFS)
   set_target_properties (cvmfs_fuse_debug PROPERTIES VERSION ${CernVM-FS_VERSION_STRING})
 
   # link the stuff (*_LIBRARIES are dynamic link libraries *_archive are static link libraries ... one of them will be empty for each dependency)
-  target_link_libraries (cvmfs2 ${CVMFS_LOADER_LIBS} ${OPENSSL_LIBRARIES} fuse ${RT_LIBRARY} pthread dl)
-  target_link_libraries (cvmfs_fuse_debug    ${CVMFS2_DEBUG_LIBS} ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${ZLIB_LIBRARIES} ${LEVELDB_LIBRARIES} ${OPENSSL_LIBRARIES} ${FUSE_LIBRARIES} ${LIBFUSE_ARCHIVE} ${SQLITE3_ARCHIVE} ${LIBCURL_ARCHIVE} ${LEVELDB_ARCHIVE} ${CARES_ARCHIVE} ${ZLIB_ARCHIVE} ${RT_LIBRARY} pthread dl)
-  target_link_libraries (cvmfs_fuse      ${CVMFS2_LIBS} ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${ZLIB_LIBRARIES} ${LEVELDB_LIBRARIES} ${OPENSSL_LIBRARIES} ${FUSE_LIBRARIES} ${LIBFUSE_ARCHIVE} ${SQLITE3_ARCHIVE} ${LIBCURL_ARCHIVE} ${LEVELDB_ARCHIVE} ${CARES_ARCHIVE} ${ZLIB_ARCHIVE} ${RT_LIBRARY} pthread dl)
+  target_link_libraries (cvmfs2 ${CVMFS_LOADER_LIBS} ${OPENSSL_LIBRARIES} ${LIBFUSE} ${RT_LIBRARY} pthread dl)
+  target_link_libraries (cvmfs_fuse_debug    ${CVMFS2_DEBUG_LIBS} ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${PACPARSER_LIBRARIES} ${ZLIB_LIBRARIES} ${LEVELDB_LIBRARIES} ${OPENSSL_LIBRARIES} ${FUSE_LIBRARIES} ${LIBFUSE_ARCHIVE} ${SQLITE3_ARCHIVE} ${LIBCURL_ARCHIVE} ${PACPARSER_ARCHIVE} ${LEVELDB_ARCHIVE} ${CARES_ARCHIVE} ${ZLIB_ARCHIVE} ${RT_LIBRARY} pthread dl)
+  target_link_libraries (cvmfs_fuse      ${CVMFS2_LIBS} ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${PACPARSER_LIBRARIES} ${ZLIB_LIBRARIES} ${LEVELDB_LIBRARIES} ${OPENSSL_LIBRARIES} ${FUSE_LIBRARIES} ${LIBFUSE_ARCHIVE} ${SQLITE3_ARCHIVE} ${LIBCURL_ARCHIVE} ${PACPARSER_ARCHIVE} ${LEVELDB_ARCHIVE} ${CARES_ARCHIVE} ${ZLIB_ARCHIVE} ${RT_LIBRARY} pthread dl)
   target_link_libraries (cvmfs_fsck    ${CVMFS_FSCK_LIBS} ${ZLIB_LIBRARIES} ${OPENSSL_LIBRARIES} ${ZLIB_ARCHIVE} pthread)
 
 endif (BUILD_CVMFS)
@@ -243,6 +268,11 @@ if (BUILD_LIBCVMFS)
     set (LIBCVMFS_LIBS ${CARES_ARCHIVE} ${LIBCVMFS_LIBS} )
     set (LIBCVMFS_LIBS ${LIBCURL_ARCHIVE} ${LIBCVMFS_LIBS} )
   endif (LIBCURL_BUILTIN)
+
+  if (PACPARSER_BUILTIN)
+    add_dependencies (cvmfs_only pacparser)
+    set (LIBCVMFS_LIBS ${PACPARSER_ARCHIVE} ${LIBCVMFS_LIBS} )
+  endif (PACPARSER_BUILTIN)
 
   if (SQLITE3_BUILTIN)
     add_dependencies (cvmfs_only sqlite3)
@@ -278,7 +308,7 @@ if (BUILD_LIBCVMFS)
   add_dependencies (libcvmfs cvmfs_only)
 
   add_executable( test_libcvmfs ${TEST_LIBCVMFS_SOURCES} )
-  target_link_libraries( test_libcvmfs ${CMAKE_CURRENT_BINARY_DIR}/libcvmfs.a ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${ZLIB_LIBRARIES} ${OPENSSL_LIBRARIES} ${RT_LIBRARY} pthread dl )
+  target_link_libraries( test_libcvmfs ${CMAKE_CURRENT_BINARY_DIR}/libcvmfs.a ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${PACPARSER_LIBRARIES} ${ZLIB_LIBRARIES} ${OPENSSL_LIBRARIES} ${RT_LIBRARY} pthread dl )
   add_dependencies (test_libcvmfs libcvmfs)
 
 endif (BUILD_LIBCVMFS)
@@ -286,6 +316,7 @@ endif (BUILD_LIBCVMFS)
 if (BUILD_SERVER)
   # create targets with according sources and static link libraries
   add_executable (cvmfs_swissknife ${CVMFS_SWISSKNIFE_SOURCES})
+  add_executable (cvmfs_suid_helper ${CVMFS_SUID_HELPER_SOURCES})
 
   include (${VJSON_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
   add_dependencies (cvmfs_swissknife libvjson)
@@ -304,10 +335,14 @@ if (BUILD_SERVER)
     add_dependencies (cvmfs_swissknife zlib)
   endif (ZLIB_BUILTIN)
 
+  if (TBB_PRIVATE_LIB)
+    add_dependencies (cvmfs_swissknife libtbb)
+  endif (TBB_PRIVATE_LIB)
+
   set_target_properties (cvmfs_swissknife PROPERTIES COMPILE_FLAGS "${CVMFS_SWISSKNIFE_CFLAGS}" LINK_FLAGS "${CVMFS_SWISSKNIFE_LD_FLAGS}")
 
   # link the stuff (*_LIBRARIES are dynamic link libraries)
-  target_link_libraries (cvmfs_swissknife  ${CVMFS_SWISSKNIFE_LIBS} ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${ZLIB_LIBRARIES} ${OPENSSL_LIBRARIES} ${LIBCURL_ARCHIVE} ${CARES_ARCHIVE} ${SQLITE3_ARCHIVE} ${ZLIB_ARCHIVE} ${RT_LIBRARY} ${VJSON_ARCHIVE} pthread dl)
+  target_link_libraries (cvmfs_swissknife  ${CVMFS_SWISSKNIFE_LIBS} ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${ZLIB_LIBRARIES} ${TBB_LIBRARIES} ${OPENSSL_LIBRARIES} ${LIBCURL_ARCHIVE} ${CARES_ARCHIVE} ${SQLITE3_ARCHIVE} ${ZLIB_ARCHIVE} ${RT_LIBRARY} ${VJSON_ARCHIVE} pthread dl)
 
   if (BUILD_SERVER_DEBUG)
     add_executable (cvmfs_swissknife_debug ${CVMFS_SWISSKNIFE_DEBUG_SOURCES})
@@ -324,20 +359,24 @@ if (BUILD_SERVER)
       add_dependencies (cvmfs_swissknife_debug zlib)
     endif (ZLIB_BUILTIN)
 
-    set_target_properties (cvmfs_swissknife_debug PROPERTIES COMPILE_FLAGS "${CVMFS_SWISSKNIFE_DEBUG_CFLAGS}" LINK_FLAGS "${CVMFS_SWISSKNIFE_LD_FLAGS}")
+    if (TBB_PRIVATE_LIB)
+      add_dependencies (cvmfs_swissknife_debug libtbb)
+    endif (TBB_PRIVATE_LIB)
+
+    set_target_properties (cvmfs_swissknife_debug PROPERTIES COMPILE_FLAGS "${CVMFS_SWISSKNIFE_DEBUG_CFLAGS}" LINK_FLAGS "${CVMFS_SWISSKNIFE_DEBUG_LD_FLAGS}")
 
     # link the stuff (*_LIBRARIES are dynamic link libraries)
-    target_link_libraries (cvmfs_swissknife_debug  ${CVMFS_SWISSKNIFE_LIBS} ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${ZLIB_LIBRARIES} ${OPENSSL_LIBRARIES} ${LIBCURL_ARCHIVE} ${CARES_ARCHIVE} ${SQLITE3_ARCHIVE} ${ZLIB_ARCHIVE} ${RT_LIBRARY} ${VJSON_ARCHIVE} pthread dl)
+    if (NOT TBB_DEBUG_LIBRARIES)
+      message (WARNING "Debug libraries of TBB were not found. Using the release versions instead.")
+      set (TBB_DEBUG_LIBRARIES ${TBB_LIBRARIES})
+    endif (NOT TBB_DEBUG_LIBRARIES)
+    target_link_libraries (cvmfs_swissknife_debug  ${CVMFS_SWISSKNIFE_LIBS} ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${ZLIB_LIBRARIES} ${OPENSSL_LIBRARIES} ${LIBCURL_ARCHIVE} ${CARES_ARCHIVE} ${SQLITE3_ARCHIVE} ${ZLIB_ARCHIVE} ${TBB_DEBUG_LIBRARIES} ${RT_LIBRARY} ${VJSON_ARCHIVE} pthread dl)
   endif (BUILD_SERVER_DEBUG)
 endif (BUILD_SERVER)
 
 #
 # installation
 #
-
-if (NOT DEFINED CMAKE_INSTALL_LIBDIR)
-  set(CMAKE_INSTALL_LIBDIR "lib")
-endif()
 
 if (BUILD_CVMFS)
   install (
@@ -358,6 +397,13 @@ if (BUILD_CVMFS)
     PERMISSIONS    OWNER_READ OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
   )
 
+  install (
+    FILES         bash_completion/cvmfs.bash_completion
+    RENAME        cvmfs
+    DESTINATION   /etc/bash_completion.d
+    PERMISSIONS   OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+  )
+
 endif (BUILD_CVMFS)
 
 if (BUILD_LIBCVMFS)
@@ -376,6 +422,13 @@ if (BUILD_SERVER)
     TARGETS     cvmfs_swissknife
     RUNTIME
     DESTINATION    bin
+  )
+
+  install (
+    TARGETS     cvmfs_suid_helper
+    RUNTIME
+    DESTINATION    bin
+    PERMISSIONS    OWNER_READ OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE SETUID
   )
 
   if (BUILD_SERVER_DEBUG)

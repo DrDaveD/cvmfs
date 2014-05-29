@@ -90,62 +90,66 @@ class Catalog : public SingleCopy {
   friend class SqlLookup;                  // for mangled inode and uid/gid maps
   friend class swissknife::CommandMigrate; // for catalog version migration
  public:
-  static const uint64_t kDefaultTTL = 3600;  /**< 1 hour default TTL */
+  static const uint64_t kDefaultTTL = 900;  /**< 15 minutes default TTL */
 
   Catalog(const PathString  &path,
-          const hash::Any   &catalog_hash,
+          const shash::Any   &catalog_hash,
                 Catalog     *parent);
   virtual ~Catalog();
 
   static Catalog *AttachFreely(const std::string  &root_path,
                                const std::string  &file,
-                               const hash::Any    &catalog_hash,
+                               const shash::Any   &catalog_hash,
                                      Catalog      *parent = NULL);
 
   bool OpenDatabase(const std::string &db_path);
 
   bool LookupInode(const inode_t inode,
-                   DirectoryEntry *dirent, hash::Md5 *parent_md5path) const;
-  bool LookupMd5Path(const hash::Md5 &md5path, DirectoryEntry *dirent) const;
+                   DirectoryEntry *dirent, shash::Md5 *parent_md5path) const;
+  bool LookupMd5Path(const shash::Md5 &md5path, DirectoryEntry *dirent) const;
   inline bool LookupPath(const PathString &path, DirectoryEntry *dirent) const
   {
-    return LookupMd5Path(hash::Md5(path.GetChars(), path.GetLength()), dirent);
+    return LookupMd5Path(shash::Md5(path.GetChars(), path.GetLength()), dirent);
   }
+  bool LookupRawSymlink(const PathString &path, LinkString *raw_symlink) const;
 
-  bool ListingMd5Path(const hash::Md5 &md5path,
+  bool ListingMd5Path(const shash::Md5 &md5path,
                       DirectoryEntryList *listing) const;
   inline bool ListingPath(const PathString &path,
                       DirectoryEntryList *listing) const
   {
-    return ListingMd5Path(hash::Md5(path.GetChars(), path.GetLength()),
+    return ListingMd5Path(shash::Md5(path.GetChars(), path.GetLength()),
                           listing);
   }
-  bool ListingMd5PathStat(const hash::Md5 &md5path,
+  bool ListingMd5PathStat(const shash::Md5 &md5path,
                           StatEntryList *listing) const;
   bool ListingPathStat(const PathString &path,
                        StatEntryList *listing) const
   {
-    return ListingMd5PathStat(hash::Md5(path.GetChars(), path.GetLength()),
+    return ListingMd5PathStat(shash::Md5(path.GetChars(), path.GetLength()),
                               listing);
   }
   bool AllChunksBegin();
-  bool AllChunksNext(hash::Any *hash, ChunkTypes *type);
+  bool AllChunksNext(shash::Any *hash, ChunkTypes *type);
   bool AllChunksEnd();
 
-  inline bool ListFileChunks(const PathString &path, FileChunkList *chunks) const
+  inline bool ListPathChunks(const PathString &path,
+                             const shash::Algorithms interpret_hashes_as,
+                             FileChunkList *chunks) const
   {
-    return ListMd5PathChunks(hash::Md5(path.GetChars(), path.GetLength()),
-                             chunks);
+    return ListMd5PathChunks(shash::Md5(path.GetChars(), path.GetLength()),
+                             interpret_hashes_as, chunks);
   }
-  bool ListMd5PathChunks(const hash::Md5 &md5path, FileChunkList *chunks) const;
+  bool ListMd5PathChunks(const shash::Md5 &md5path,
+                         const shash::Algorithms interpret_hashes_as,
+                         FileChunkList *chunks) const;
 
   uint64_t GetTTL() const;
   uint64_t GetRevision() const;
   uint64_t GetNumEntries() const;
-  hash::Any GetPreviousRevision() const;
+  shash::Any GetPreviousRevision() const;
   const Counters& GetCounters() const { return counters_; };
 
-  inline bool read_only() const { return read_only_; }
   inline float schema() const { return database().schema_version(); }
   inline PathString path() const { return path_; }
   inline Catalog* parent() const { return parent_; }
@@ -154,7 +158,8 @@ class Catalog : public SingleCopy {
   inline void set_inode_range(const InodeRange value) { inode_range_ = value; }
   inline std::string database_path() const { return database_->filename(); }
   inline PathString root_prefix() const { return root_prefix_; }
-  inline hash::Any hash() const { return catalog_hash_; }
+  inline shash::Any hash() const { return catalog_hash_; }
+  inline bool volatile_flag() const { return volatile_flag_; }
 
   inline bool IsInitialized() const {
     return inode_range_.IsInitialized() && initialized_;
@@ -164,11 +169,13 @@ class Catalog : public SingleCopy {
 
   typedef struct {
     PathString path;
-    hash::Any hash;
+    shash::Any hash;
+    uint64_t size;
   } NestedCatalog;
   typedef std::vector<NestedCatalog> NestedCatalogList;
-  NestedCatalogList *ListNestedCatalogs() const;
-  bool FindNested(const PathString &mountpoint, hash::Any *hash) const;
+  const NestedCatalogList& ListNestedCatalogs() const;
+  bool FindNested(const PathString &mountpoint,
+                  shash::Any *hash, uint64_t *size) const;
 
   void SetInodeAnnotation(InodeAnnotation *new_annotation);
   void SetOwnerMaps(const OwnerMap *uid_map, const OwnerMap *gid_map);
@@ -178,6 +185,7 @@ class Catalog : public SingleCopy {
   mutable HardlinkGroupMap hardlink_groups_;
 
   bool InitStandalone(const std::string &database_file);
+  bool ReadCatalogCounters();
 
   /**
    * Specifies the SQLite open flags.  Overwritten by r/w catalog.
@@ -200,7 +208,7 @@ class Catalog : public SingleCopy {
   inline const Database &database() const { return *database_; }
   inline void set_parent(Catalog *catalog) { parent_ = catalog; }
 
-  bool read_only_;
+  void ResetNestedCatalogCache();
 
  private:
   typedef std::map<PathString, Catalog*> NestedCatalogMap;
@@ -209,20 +217,24 @@ class Catalog : public SingleCopy {
   inode_t GetMangledInode(const uint64_t row_id,
                           const uint64_t hardlink_group) const;
 
-  void FixTransitionPoint(const hash::Md5 &md5path,
+  void FixTransitionPoint(const shash::Md5 &md5path,
                           DirectoryEntry *dirent) const;
 
  private:
+  bool LookupEntry(const shash::Md5 &md5path, const bool expand_symlink,
+                   DirectoryEntry *dirent) const;
   Database *database_;
   pthread_mutex_t *lock_;
 
-  const hash::Any catalog_hash_;
+  const shash::Any catalog_hash_;
   PathString root_prefix_;
   PathString path_;
+  bool volatile_flag_;
 
   Catalog *parent_;
   NestedCatalogMap children_;
-  mutable NestedCatalogList *nested_catalog_cache_;
+  mutable NestedCatalogList nested_catalog_cache_;
+  mutable bool              nested_catalog_cache_dirty_;
 
   bool initialized_;
   InodeRange inode_range_;

@@ -4,26 +4,41 @@
 script_location=$(dirname $(readlink --canonicalize $0))
 . ${script_location}/common_setup.sh
 
-# custom kernel packages
-knl_firmware="http://ecsft.cern.ch/dist/cvmfs/kernel/2.6.32-358.2.1.el6/kernel-aufs21-firmware-2.6.32-358.2.1.el6.x86_64.rpm"
-knl="http://ecsft.cern.ch/dist/cvmfs/kernel/2.6.32-358.2.1.el6/kernel-aufs21-2.6.32-358.2.1.el6.x86_64.rpm"
-aufs_util="http://ecsft.cern.ch/dist/cvmfs/kernel/aufs2-util/aufs2-util-2.1-1.x86_64.rpm"
+# create additional disk partitions to accomodate CVMFS test repos
+echo -n "creating additional disk partitions... "
+disk_to_partition=/dev/vda
+free_disk_space=$(get_unpartitioned_space $disk_to_partition)
+if [ $free_disk_space -lt 25000000000 ]; then # at least 25GB required
+  die "fail (not enough unpartitioned disk space - $free_disk_space bytes)"
+fi
+partition_size=$(( $free_disk_space / 2 - 10240000))
+create_partition $disk_to_partition $partition_size || die "fail (creating partition 1)"
+create_partition $disk_to_partition $partition_size || die "fail (creating partition 2)"
+echo "done"
+
+# custom kernel packages (figures out the newest installed kernel, downloads and
+#                         installs the associated patched aufs version of it)
+knl_version=$(rpm -qa --last | grep -e '^kernel-[0-9]' | head -n 1 | sed -e 's/^kernel-\(.*\)\.x86_64.*$/\1/')
+aufs_util_version="2.1-2"
+knl_firmware="https://ecsft.cern.ch/dist/cvmfs/kernel/${knl_version}/kernel-firmware-${knl_version}.aufs21.x86_64.rpm"
+knl="https://ecsft.cern.ch/dist/cvmfs/kernel/${knl_version}/kernel-${knl_version}.aufs21.x86_64.rpm"
+aufs_util="https://ecsft.cern.ch/dist/cvmfs/kernel/aufs2-util/aufs2-util-${aufs_util_version}.x86_64.rpm"
 
 # download the custom kernel RPMs (including AUFS)
-echo -n "download custom kernel RPMs... "
-wget $knl_firmware > /dev/null 2>&1 || die "fail"
-wget $knl          > /dev/null 2>&1 || die "fail"
+echo -n "download custom kernel RPMs for $knl_version ... "
+wget --no-check-certificate --quiet $knl_firmware || die "fail"
+wget --no-check-certificate --quiet $knl          || die "fail"
 echo "done"
 
 # install custom kernel
 echo -n "install custom kernel RPMs... "
-sudo rpm -ivh $(basename $knl_firmware) > /dev/null 2>&1 || die "fail"
-sudo rpm -ivh $(basename $knl)          > /dev/null 2>&1 || die "fail"
+sudo rpm -ivh $(basename $knl_firmware) > /dev/null || die "fail"
+sudo rpm -ivh $(basename $knl)          > /dev/null || die "fail"
 echo "done"
 
 # download AUFS user space tools
 echo -n "download AUFS user space utilities... "
-wget $aufs_util > /dev/null 2>&1 || die "fail"
+wget --no-check-certificate --quiet $aufs_util || die "fail"
 echo "done"
 
 # install AUFS user space utilities
@@ -50,29 +65,10 @@ echo "done"
 echo "installing additional RPM packages..."
 install_from_repo gcc
 install_from_repo gcc-c++
-install_from_repo libuuid-devel
 
-echo "installing perl dependencies for certain test cases... "
-mkdir perl
-cd perl
-
-zeromq_src="http://download.zeromq.org/zeromq-2.2.0.tar.gz"
-wget $zeromq_src > /dev/null 2>&1                         || die "fail (download zeromq)"
-tar -xzf $(basename $zeromq_src)                          || die "fail (extract zeromq)"
-cd $(basename $zeromq_src .tar.gz)
-./configure --prefix=/usr --libdir=/usr/lib64 > /dev/null || die "fail (configure zeromq)"
-make > /dev/null                                          || die "fail (compile zeromq)"
-sudo make install > /dev/null                             || die "fail (install zeromq)"
-cd ..
-
-sudo curl -o /usr/bin/cpanm -L http://cpanmin.us > /dev/null || die "fail (download cpan)"
-sudo chmod 555 /usr/bin/cpanm                                || die "fail (chmod cpan)"
-
-sudo cpanm --notest ZeroMQ          > /dev/null   || die "fail (install ZeroMQ-perl)"
-sudo cpanm --notest IO::Interface   > /dev/null   || die "fail (install IO::Interface)"
-sudo cpanm --notest Socket          > /dev/null   || die "fail (install Socket)"
-sudo cpanm --notest URI             > /dev/null   || die "fail (install URI)"
-cd ..
+# increase open file descriptor limits
+echo -n "increasing ulimit -n ... "
+set_nofile_limit 65536 || die "fail"
 echo "done"
 
 # rebooting the system (returning 0 value)

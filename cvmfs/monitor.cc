@@ -64,6 +64,7 @@ Pipe *pipe_watchdog_ = NULL;
 platform_spinlock lock_handler_;
 stack_t sighandler_stack_;
 pid_t watchdog_pid_ = 0;
+void (*on_crash_)(void) = NULL;
 
 typedef std::map<int, struct sigaction> SigactionMap;
 SigactionMap old_signal_handlers_;
@@ -360,17 +361,23 @@ static void Watchdog() {
   ControlFlow::Flags control_flow;
 
   if (!pipe_watchdog_->Read(&control_flow)) {
+    // Re-activate µSyslog, if necessary
+    SetLogMicroSyslog(GetLogMicroSyslog());
     LogEmergency("unexpected termination (" + StringifyInt(control_flow) + ")");
+    if (on_crash_) on_crash_();
   } else {
     switch (control_flow) {
       case ControlFlow::kProduceStacktrace:
         LogEmergency(ReportStacktrace());
+        if (on_crash_) on_crash_();
         break;
 
       case ControlFlow::kQuit:
         break;
 
       default:
+        // Re-activate µSyslog, if necessary
+        SetLogMicroSyslog(GetLogMicroSyslog());
         LogEmergency("unexpected error");
         break;
     }
@@ -393,6 +400,8 @@ bool Init(const string &cache_dir, const std::string &process_name,
 
 
 void Fini() {
+  on_crash_ = NULL;
+
   // Reset signal handlers
   if (spawned_) {
     signal(SIGQUIT, SIG_DFL);
@@ -420,6 +429,7 @@ void Fini() {
   cache_dir_ = NULL;
   exe_path_ = NULL;
   platform_spinlock_destroy(&lock_handler_);
+  LogCvmfs(kLogMonitor, kLogDebug, "monitor stopped");
 }
 
 /**
@@ -447,10 +457,17 @@ void Spawn() {
           pipe_pid.Write(watchdog_pid);
           close(pipe_pid.write_end);
           // Close all unused file descriptors
+          // close also usyslog, only get it back if necessary
+          //string usyslog_save = GetLogMicroSyslog();
+          string debuglog_save = GetLogDebugFile();
+          //SetLogMicroSyslog("");
+          SetLogDebugFile("");
           for (int fd = 0; fd < max_fd; fd++) {
             if (fd != pipe_watchdog_->read_end)
               close(fd);
           }
+          //SetLogMicroSyslog(usyslog_save);  // no-op if usyslog not used
+          SetLogDebugFile(debuglog_save);  // no-op if debug log not used
           Watchdog();
           exit(0);
         }
@@ -504,6 +521,12 @@ void Spawn() {
 
   spawned_ = true;
 }
+
+
+void RegisterOnCrash(void (*CleanupOnCrash)(void)) {
+  on_crash_ = CleanupOnCrash;
+}
+
 
 unsigned GetMaxOpenFiles() {
   static unsigned max_open_files;

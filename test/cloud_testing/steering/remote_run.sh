@@ -13,6 +13,8 @@ usage() {
   echo
   echo "Mandatory options:"
   echo "-r <test script>      platform specific script (inside the cvmfs sources)"
+  echo "-s <server package>   CernVM-FS server package to be tested"
+  echo "-c <client package>   CernVM-FS client package to be tested"
   echo
   echo "Optional parameters:"
   echo "-p <platform path>    custom search path for platform specific script"
@@ -21,6 +23,8 @@ usage() {
   exit 1
 }
 
+export LC_ALL=C
+
 # static information (check also remote_setup.sh and run.sh)
 cvmfs_workspace="/tmp/cvmfs-test-workspace"
 cvmfs_source_directory="${cvmfs_workspace}/cvmfs-source"
@@ -28,22 +32,35 @@ cvmfs_setup_log="${cvmfs_workspace}/setup.log"
 cvmfs_run_log="${cvmfs_workspace}/run.log"
 cvmfs_test_log="${cvmfs_workspace}/test.log"
 cvmfs_unittest_log="${cvmfs_workspace}/unittest.log"
+cvmfs_migrationtest_log="${cvmfs_workspace}/migrationtest.log"
 
 # parameterized variables
 platform_script=""
 platform_script_path=""
 test_username="sftnight"
+server_package=""
+client_package=""
 
 # from now on everything is logged to the logfile
 # Note: the only output of this script is the absolute path to the generated
 #       log files
+sudo chmod a+w $cvmfs_run_log
 exec &> $cvmfs_run_log
 
+# switch to working directory
+cd $cvmfs_workspace
+
 # read parameters
-while getopts "r:p:u:" option; do
+while getopts "r:s:c:p:u:" option; do
   case $option in
     r)
       platform_script=$OPTARG
+      ;;
+    s)
+      server_package=$(readlink --canonicalize $(basename $OPTARG))
+      ;;
+    c)
+      client_package=$(readlink --canonicalize $(basename $OPTARG))
       ;;
     p)
       platform_script_path=$OPTARG
@@ -59,9 +76,21 @@ while getopts "r:p:u:" option; do
 done
 
 # check if we have all bits and pieces
-if [ x$platform_script = "x" ]; then
+if [ x$platform_script = "x" ] ||
+   [ x$client_package  = "x" ] ||
+   [ x$server_package  = "x" ]; then
   usage "Missing parameter(s)"
 fi
+
+# check if the needed packages are downloaded
+if [ ! -f $server_package ] ||
+   [ ! -f $client_package ]; then
+  usage "Missing package(s)"
+fi
+
+# export the location of the client and server packages
+export CVMFS_CLIENT_PACKAGE=$client_package
+export CVMFS_SERVER_PACKAGE=$server_package
 
 # change working directory to test workspace
 cd $cvmfs_workspace
@@ -79,6 +108,9 @@ fi
 
 # run the platform specific script to perform CernVM-FS tests
 echo "running platform specific script $platform_script ..."
-sudo -H -u $test_username sh $platform_script_abs -t $cvmfs_source_directory   \
-                                                  -l $cvmfs_test_log           \
-                                                  -u $cvmfs_unittest_log
+sudo -H -E -u $test_username sh $platform_script_abs -t $cvmfs_source_directory\
+                                                     -l $cvmfs_test_log        \
+                                                     -s $server_package        \
+                                                     -c $client_package        \
+                                                     -u $cvmfs_unittest_log    \
+                                                     -m $cvmfs_migrationtest_log

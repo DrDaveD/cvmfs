@@ -1,42 +1,39 @@
 #!/bin/sh
 
+script_location=$(dirname $(readlink --canonicalize $0))
+. ${script_location}/common.sh
+
 #
 # Common functionality for cloud platform test execution engine (test setup)
 # After sourcing this file the following variables are set:
 #
-#  SERVER_PACKAGE       location of the CernVM-FS server package to install
-#  CLIENT_PACKAGE       location of the CernVM-FS client package to install
-#  OLD_CLIENT_PACKAGE   location of an old CernVM-FS client package for hotpatch
-#  KEYS_PACKAGE         location of the CernVM-FS public keys package
-#  SOURCE_DIRECTORY     location of the CernVM-FS sources forming above packages
-#  UNITTEST_PACKAGE     location of the CernVM-FS unit test package
-#  TEST_LOGFILE         location of the test logfile to be used
-#  UNITTEST_LOGFILE     location of the unit test logfile to be used
-#
-# NOTE: the OLD_CLIENT_PACKAGE is not mandatory and should be checked for exist-
-#       ance before usage
+#  SERVER_PACKAGE        location of the CernVM-FS server package to install
+#  CLIENT_PACKAGE        location of the CernVM-FS client package to install
+#  KEYS_PACKAGE          location of the CernVM-FS public keys package
+#  SOURCE_DIRECTORY      location of the CernVM-FS sources forming above packages
+#  UNITTEST_PACKAGE      location of the CernVM-FS unit test package
+#  TEST_LOGFILE          location of the test logfile to be used
+#  UNITTEST_LOGFILE      location of the unit test logfile to be used
+#  MIGRATIONTEST_LOGFILE location of the migration test logfile to be used
 #
 
 SERVER_PACKAGE=""
 CLIENT_PACKAGE=""
-OLD_CLIENT_PACKAGE=""
 UNITTEST_PACKAGE=""
 KEYS_PACKAGE=""
 SOURCE_DIRECTORY=""
 TEST_LOGFILE=""
 UNITTEST_LOGFILE=""
+MIGRATIONTEST_LOGFILE=""
 
 # parse script parameters (same for all platforms)
-while getopts "s:c:o:k:t:g:l:u:" option; do
+while getopts "s:c:k:t:g:l:u:m:" option; do
   case $option in
     s)
       SERVER_PACKAGE=$OPTARG
       ;;
     c)
       CLIENT_PACKAGE=$OPTARG
-      ;;
-    o)
-      OLD_CLIENT_PACKAGE=$OPTARG
       ;;
     k)
       KEYS_PACKAGE=$OPTARG
@@ -53,6 +50,9 @@ while getopts "s:c:o:k:t:g:l:u:" option; do
     u)
       UNITTEST_LOGFILE=$OPTARG
       ;;
+    m)
+      MIGRATIONTEST_LOGFILE=$OPTARG
+      ;;
     ?)
       shift $(($OPTIND-2))
       usage "Unrecognized option: $1"
@@ -61,13 +61,14 @@ while getopts "s:c:o:k:t:g:l:u:" option; do
 done
 
 # check that all mandatory parameters are set
-if [ x$SERVER_PACKAGE   = "x" ] ||
-   [ x$CLIENT_PACKAGE   = "x" ] ||
-   [ x$KEYS_PACKAGE     = "x" ] ||
-   [ x$SOURCE_DIRECTORY = "x" ] ||
-   [ x$UNITTEST_PACKAGE = "x" ] ||
-   [ x$TEST_LOGFILE     = "x" ] ||
-   [ x$UNITTEST_LOGFILE = "x" ]; then
+if [ x$SERVER_PACKAGE        = "x" ] ||
+   [ x$CLIENT_PACKAGE        = "x" ] ||
+   [ x$KEYS_PACKAGE          = "x" ] ||
+   [ x$SOURCE_DIRECTORY      = "x" ] ||
+   [ x$UNITTEST_PACKAGE      = "x" ] ||
+   [ x$TEST_LOGFILE          = "x" ] ||
+   [ x$UNITTEST_LOGFILE      = "x" ] ||
+   [ x$MIGRATIONTEST_LOGFILE = "x" ]; then
   echo "missing parameter(s), cannot run platform dependent test script"
   exit 100
 fi
@@ -103,7 +104,7 @@ check_package_manager_response() {
   if [ $retcode -ne 0 ]; then
     echo "fail"
     echo "$pkg_mgr_name said:"
-    echo $package_mgr_output
+    echo $pkg_mgr_output
     exit 102
   else
     echo "done"
@@ -172,8 +173,12 @@ attach_user_group() {
 }
 
 
-die() {
-  local msg="$1"
-  echo $msg
-  exit 103
+set_nofile_limit() {
+  local limit_value=$1
+  echo "*    hard nofile $limit_value" | sudo tee --append /etc/security/limits.conf > /dev/null
+  echo "*    soft nofile $limit_value" | sudo tee --append /etc/security/limits.conf > /dev/null
+  echo "root hard nofile $limit_value" | sudo tee --append /etc/security/limits.conf > /dev/null
+  echo "root soft nofile $limit_value" | sudo tee --append /etc/security/limits.conf > /dev/null
 }
+
+echo "Hostname is $(hostname)"

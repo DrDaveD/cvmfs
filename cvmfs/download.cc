@@ -50,83 +50,33 @@
 #include "logging.h"
 #include "atomic.h"
 #include "hash.h"
+#include "prng.h"
 #include "util.h"
 #include "compression.h"
 #include "smalloc.h"
+#include "sanitizer.h"
 
 using namespace std;  // NOLINT
 
 namespace download {
 
-set<CURL *> *pool_handles_idle_ = NULL;
-set<CURL *> *pool_handles_inuse_ = NULL;
-uint32_t pool_max_handles_;
-CURLM *curl_multi_ = NULL;
-curl_slist *http_headers_ = NULL;
-curl_slist *http_headers_nocache_ = NULL;
 
-pthread_t thread_download_;
-atomic_int32 multi_threaded_;
-int pipe_terminate_[2];
+static inline bool EscapeUrlChar(char input, char output[3]) {
+  if (((input >= '0') && (input <= '9')) ||
+      ((input >= 'A') && (input <= 'Z')) ||
+      ((input >= 'a') && (input <= 'z')) ||
+      (input == '/') || (input == ':') || (input == '.') ||
+      (input == '+') || (input == '-') ||
+      (input == '[') || (input == ']'))
+  {
+    output[0] = input;
+    return false;
+  }
 
-int pipe_jobs_[2];
-struct pollfd *watch_fds_ = NULL;
-uint32_t watch_fds_size_ = 0;
-uint32_t watch_fds_inuse_ = 0;
-uint32_t watch_fds_max_;
-
-pthread_mutex_t lock_options_ = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t lock_synchronous_mode_ = PTHREAD_MUTEX_INITIALIZER;
-char *opt_dns_server_ = NULL;
-unsigned opt_timeout_proxy_ ;
-unsigned opt_timeout_direct_;
-vector<string> *opt_host_chain_ = NULL;
-vector<int> *opt_host_chain_rtt_ = NULL; /**< created by SetHostChain(),
-  filled by probe_hosts.  Contains time to get .cvmfschecksum in ms.
-  -1 is unprobed, -2 is error */
-unsigned opt_host_chain_current_;
-vector< vector<string> > *opt_proxy_groups_ = NULL;
-unsigned opt_proxy_groups_current_;
-unsigned opt_proxy_groups_current_burned_;
-unsigned opt_num_proxies_;
-
-unsigned opt_max_retries_ = 0;
-unsigned opt_backoff_init_ms_ = 0;
-unsigned opt_backoff_max_ms_ = 0;
-
-bool opt_ipv4_only_ = false;
-
-
-/**
- * More than one proxy group can be considered as group of primary proxies
- * followed by backup proxy groups, e.g. at another site.
- * If opt_proxy_groups_reset_after_ is > 0, cvmfs will reset its proxy group
- * to the first one after opt_proxy_groups_reset_after_ seconds are elapsed.
- */
-time_t opt_timestamp_backup_proxies_ = 0;
-time_t opt_timestamp_failover_proxies_ = 0;  // failover within the same group
-unsigned opt_proxy_groups_reset_after_ = 0;
-
-/**
- * Similarly to proxy group reset, we'd also like to reset the host after a
- * failover.  Host outages can last longer and might come with a separate
- * reset delay.
- */
-time_t opt_timestamp_backup_host_ = 0;
-unsigned opt_host_reset_after_ = 0;
-
-// Writes and reads should be atomic because reading happens in a different
-// thread than writing.
-Statistics *statistics_;
-
-string Statistics::Print() const {
-  return
-    "Transferred Bytes: " + StringifyInt(uint64_t(transferred_bytes)) + "\n" +
-    "Transfer duration: " + StringifyInt(uint64_t(transfer_time)) + " s\n" +
-    "Number of requests: " + StringifyInt(num_requests) + "\n" +
-    "Number of retries: " + StringifyInt(num_retries) + "\n" +
-    "Number of proxy failovers: " + StringifyInt(num_proxy_failover) + "\n" +
-    "Number of host failovers: " + StringifyInt(num_host_failover) + "\n";
+  output[0] = '%';
+  output[1] = (input / 16) + ((input / 16 <= 9) ? '0' : 'A'-10);
+  output[2] = (input % 16) + ((input % 16 <= 9) ? '0' : 'A'-10);
+  return true;
 }
 
 
@@ -136,21 +86,14 @@ string Statistics::Print() const {
  */
 static string EscapeUrl(const string &url) {
   string escaped;
+  escaped.reserve(url.length());
 
+  char escaped_char[3];
   for (unsigned i = 0, s = url.length(); i < s; ++i) {
-    if (((url[i] >= '0') && (url[i] <= '9')) ||
-        ((url[i] >= 'A') && (url[i] <= 'Z')) ||
-        ((url[i] >= 'a') && (url[i] <= 'z')) ||
-        (url[i] == '/') || (url[i] == ':') || (url[i] == '.') ||
-        (url[i] == '+') || (url[i] == '-') ||
-        (url[i] == '[') || (url[i] == ']'))
-    {
-      escaped += url[i];
-    } else {
-      escaped += '%';
-      escaped += (url[i] / 16) + ((url[i] / 16 <= 9) ? '0' : 'A'-10);
-      escaped += (url[i] % 16) + ((url[i] % 16 <= 9) ? '0' : 'A'-10);
-    }
+    if (EscapeUrlChar(url[i], escaped_char))
+      escaped.append(escaped_char, 3);
+    else
+      escaped.push_back(escaped_char[0]);
   }
   LogCvmfs(kLogDownload, kLogDebug, "escaped %s to %s",
            url.c_str(), escaped.c_str());
@@ -160,200 +103,55 @@ static string EscapeUrl(const string &url) {
 
 
 /**
- * Switches to the next host in the chain.  If info is set, switch only if the
- * current host is identical to the one used by info, otherwise another transfer
- * has already done the switch.
+ * escaped array needs to be sufficiently large.  It's size is calculated by
+ * passing NULL to EscapeHeader.
  */
-void SwitchHost(JobInfo *info) {
-  bool do_switch = true;
-
-  pthread_mutex_lock(&lock_options_);
-  if (!opt_host_chain_ || (opt_host_chain_->size() == 1)) {
-    pthread_mutex_unlock(&lock_options_);
-    return;
-  }
-
-  if (info) {
-    char *effective_url;
-    curl_easy_getinfo(info->curl_handle, CURLINFO_EFFECTIVE_URL,
-                      &effective_url);
-    if (!HasPrefix(string(effective_url) + "/",
-                   (*opt_host_chain_)[opt_host_chain_current_] + "/",
-                   true))
-    {
-      do_switch = false;
-      LogCvmfs(kLogDownload, kLogDebug, "don't switch host, "
-               "effective url: %s, current host: %s", effective_url,
-               (*opt_host_chain_)[opt_host_chain_current_].c_str());
-    }
-  }
-
-  if (do_switch) {
-    string old_host = (*opt_host_chain_)[opt_host_chain_current_];
-    opt_host_chain_current_ = (opt_host_chain_current_+1) %
-                              opt_host_chain_->size();
-    statistics_->num_host_failover++;
-    LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
-             "switching host from %s to %s", old_host.c_str(),
-             (*opt_host_chain_)[opt_host_chain_current_].c_str());
-
-    // Remeber the timestamp of switching to backup host
-    if (opt_host_reset_after_ > 0) {
-      if (opt_host_chain_current_ != 0) {
-        if (opt_timestamp_backup_host_ == 0)
-          opt_timestamp_backup_host_ = time(NULL);
-      } else {
-        opt_timestamp_backup_host_ = 0;
-      }
-    }
-  }
-  pthread_mutex_unlock(&lock_options_);
-}
-
-
-void SwitchHost() {
-  SwitchHost(NULL);
-}
-
-
-/**
- * Jumps to the next proxy in the ring of forward proxy servers.
- * Selects one randomly from a load-balancing group.
- *
- * If info is set, switch only if the current proxy is identical to the one used
- * by info, otherwise another transfer has already done the switch.
- */
-static void SwitchProxy(JobInfo *info) {
-  pthread_mutex_lock(&lock_options_);
-
-  if (!opt_proxy_groups_) {
-    pthread_mutex_unlock(&lock_options_);
-    return;
-  }
-  if (info &&
-      ((*opt_proxy_groups_)[opt_proxy_groups_current_][0] != info->proxy))
-  {
-    pthread_mutex_unlock(&lock_options_);
-    return;
-  }
-
-  statistics_->num_proxy_failover++;
-  string old_proxy = (*opt_proxy_groups_)[opt_proxy_groups_current_][0];
-
-  // If all proxies from the current load-balancing group are burned, switch to
-  // another group
-  if (opt_proxy_groups_current_burned_ ==
-      (*opt_proxy_groups_)[opt_proxy_groups_current_].size())
-  {
-    opt_proxy_groups_current_burned_ = 0;
-    if (opt_proxy_groups_->size() > 1) {
-      opt_proxy_groups_current_ = (opt_proxy_groups_current_ + 1) %
-                                  opt_proxy_groups_->size();
-      // Remeber the timestamp of switching to backup proxies
-      if (opt_proxy_groups_reset_after_ > 0) {
-        if (opt_proxy_groups_current_ > 0) {
-          if (opt_timestamp_backup_proxies_ == 0)
-            opt_timestamp_backup_proxies_ = time(NULL);
-          //LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
-          //         "switched to (another) backup proxy group");
-        } else {
-          opt_timestamp_backup_proxies_ = 0;
-          //LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
-          //         "switched back to primary proxy group");
+static unsigned EscapeHeader(const string &header,
+                             char *escaped_buf,
+                             size_t buf_size)
+{
+  unsigned esc_pos = 0;
+  char escaped_char[3];
+  for (unsigned i = 0, s = header.size(); i < s; ++i) {
+    if (EscapeUrlChar(header[i], escaped_char)) {
+      for (unsigned j = 0; j < 3; ++j) {
+        if (escaped_buf) {
+          if (esc_pos >= buf_size)
+            return esc_pos;
+          escaped_buf[esc_pos] = escaped_char[j];
         }
-        opt_timestamp_failover_proxies_ = 0;
+        esc_pos++;
       }
+    } else {
+      if (escaped_buf) {
+        if (esc_pos >= buf_size)
+          return esc_pos;
+        escaped_buf[esc_pos] = escaped_char[0];
+      }
+      esc_pos++;
     }
-  } else {
-    // failover within the same group
-    if (opt_proxy_groups_reset_after_ > 0) {
-      if (opt_timestamp_failover_proxies_ == 0)
-        opt_timestamp_failover_proxies_ = time(NULL);
-    }
   }
 
-  vector<string> *group = &((*opt_proxy_groups_)[opt_proxy_groups_current_]);
-  const unsigned group_size = group->size();
-
-  // Move active proxy to the back
-  if (opt_proxy_groups_current_burned_) {
-    const string swap = (*group)[0];
-    (*group)[0] = (*group)[group_size - opt_proxy_groups_current_burned_];
-    (*group)[group_size - opt_proxy_groups_current_burned_] = swap;
-  }
-  opt_proxy_groups_current_burned_++;
-
-  // Select new one
-  if ((group_size - opt_proxy_groups_current_burned_) > 0) {
-    int select = random() % (group_size - opt_proxy_groups_current_burned_ + 1);
-
-    // Move selected proxy to front
-    const string swap = (*group)[select];
-    (*group)[select] = (*group)[0];
-    (*group)[0] = swap;
-  }
-
-  LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
-           "switching proxy from %s to %s",
-           old_proxy.c_str(), (*group)[0].c_str());
-  LogCvmfs(kLogDownload, kLogDebug, "%d proxies remain in group",
-           group_size - opt_proxy_groups_current_burned_);
-
-  pthread_mutex_unlock(&lock_options_);
+  return esc_pos;
 }
 
 
-/**
- * Selects a new random proxy in the current load-balancing group.  Resets the
- * "burned" counter.
- */
-static void RebalanceProxiesUnlocked() {
-  if (!opt_proxy_groups_)
-    return;
+static Failures PrepareDownloadDestination(JobInfo *info) {
+  info->destination_mem.size = 0;
+  info->destination_mem.pos = 0;
+  info->destination_mem.data = NULL;
 
-  opt_timestamp_failover_proxies_ = 0;
-  opt_proxy_groups_current_burned_ = 1;
-  vector<string> *group = &((*opt_proxy_groups_)[opt_proxy_groups_current_]);
-  int select = random() % group->size();
-  const string swap = (*group)[select];
-  (*group)[select] = (*group)[0];
-  (*group)[0] = swap;
-  //LogCvmfs(kLogDownload, kLogDebug | kLogSyslog,
-  //         "switching proxy from %s to %s (rebalance)",
-  //         (*group)[select].c_str(), swap.c_str());
-}
+  if (info->destination == kDestinationFile)
+    assert(info->destination_file != NULL);
 
-
-void RebalanceProxies() {
-  pthread_mutex_lock(&lock_options_);
-  RebalanceProxiesUnlocked();
-  pthread_mutex_unlock(&lock_options_);
-}
-
-
-/**
- * Switches to the next load-balancing group of proxy servers.
- */
-void SwitchProxyGroup() {
-  pthread_mutex_lock(&lock_options_);
-
-  if (!opt_proxy_groups_ || (opt_proxy_groups_->size() < 2)) {
-    pthread_mutex_unlock(&lock_options_);
-    return;
+  if (info->destination == kDestinationPath) {
+    assert(info->destination_path != NULL);
+    info->destination_file = fopen(info->destination_path->c_str(), "w");
+    if (info->destination_file == NULL)
+      return kFailLocalIO;
   }
 
-  string old_proxy = (*opt_proxy_groups_)[opt_proxy_groups_current_][0];
-  opt_proxy_groups_current_ = (opt_proxy_groups_current_ + 1) %
-                              opt_proxy_groups_->size();
-  opt_proxy_groups_current_burned_ = 1;
-  opt_timestamp_backup_proxies_ = time(NULL);
-  opt_timestamp_failover_proxies_ = 0;
-  //LogCvmfs(kLogDownload, kLogDebug | kLogSyslog,
-  //         "switching proxy from %s to %s (manual group change)",
-  //         old_proxy.c_str(),
-  //         (*opt_proxy_groups_)[opt_proxy_groups_current_][0].c_str());
-
-  pthread_mutex_unlock(&lock_options_);
+  return kFailOk;
 }
 
 
@@ -385,6 +183,11 @@ static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
                header_line.c_str());
       if (header_line[i] == '5') {
         // 5XX returned by host
+        info->error_code = kFailHostHttp;
+      } else if ((header_line.length() > i+2) && (header_line[i] == '4') &&
+                 (header_line[i+1] == '0') && (header_line[i+2] == '4'))
+      {
+        // 404: the stratum 1 does not have the newest files
         info->error_code = kFailHostHttp;
       } else {
         info->error_code = (info->proxy == "") ? kFailHostHttp :
@@ -427,12 +230,14 @@ static size_t CallbackCurlData(void *ptr, size_t size, size_t nmemb,
     return 0;
 
   if (info->expected_hash)
-    hash::Update((unsigned char *)ptr, num_bytes, info->hash_context);
+    shash::Update((unsigned char *)ptr, num_bytes, info->hash_context);
 
   if (info->destination == kDestinationMem) {
     // Write to memory
-    if (info->destination_mem.pos + num_bytes > info->destination_mem.size)
+    if (info->destination_mem.pos + num_bytes > info->destination_mem.size) {
+      info->error_code = kFailBadData;
       return 0;
+    }
     memcpy(info->destination_mem.data + info->destination_mem.pos,
            ptr, num_bytes);
     info->destination_mem.pos += num_bytes;
@@ -445,10 +250,15 @@ static size_t CallbackCurlData(void *ptr, size_t size, size_t nmemb,
         zlib::DecompressZStream2File(&info->zstream,
                                      info->destination_file,
                                      ptr, num_bytes);
-      if (retval == zlib::kStreamError) {
+      if (retval == zlib::kStreamDataError) {
         LogCvmfs(kLogDownload, kLogDebug, "failed to decompress %s",
                  info->url->c_str());
         info->error_code = kFailBadData;
+        return 0;
+      } else if (retval == zlib::kStreamIOError) {
+        LogCvmfs(kLogDownload, kLogSyslogErr, "decompressing %s, local IO error",
+                 info->url->c_str());
+        info->error_code = kFailLocalIO;
         return 0;
       }
     } else {
@@ -464,10 +274,319 @@ static size_t CallbackCurlData(void *ptr, size_t size, size_t nmemb,
 
 
 /**
+ * Called when new curl sockets arrive or existing curl sockets depart.
+ */
+int DownloadManager::CallbackCurlSocket(CURL *easy,
+                                        curl_socket_t s,
+                                        int action,
+                                        void *userp,
+                                        void *socketp)
+{
+  //LogCvmfs(kLogDownload, kLogDebug, "CallbackCurlSocket called with easy "
+  //         "handle %p, socket %d, action %d", easy, s, action);
+  DownloadManager *download_mgr = static_cast<DownloadManager *>(userp);
+  if (action == CURL_POLL_NONE)
+    return 0;
+
+  // Find s in watch_fds_
+  unsigned index;
+  for (index = 0; index < download_mgr->watch_fds_inuse_; ++index) {
+    if (download_mgr->watch_fds_[index].fd == s)
+      break;
+  }
+  // Or create newly
+  if (index == download_mgr->watch_fds_inuse_) {
+    // Extend array if necessary
+    if (download_mgr->watch_fds_inuse_ == download_mgr->watch_fds_size_)
+    {
+      download_mgr->watch_fds_size_ *= 2;
+      download_mgr->watch_fds_ = static_cast<struct pollfd *>(
+        srealloc(download_mgr->watch_fds_,
+                 download_mgr->watch_fds_size_*sizeof(struct pollfd)));
+    }
+    download_mgr->watch_fds_[download_mgr->watch_fds_inuse_].fd = s;
+    download_mgr->watch_fds_[download_mgr->watch_fds_inuse_].events = 0;
+    download_mgr->watch_fds_[download_mgr->watch_fds_inuse_].revents = 0;
+    download_mgr->watch_fds_inuse_++;
+  }
+
+  switch (action) {
+    case CURL_POLL_IN:
+      download_mgr->watch_fds_[index].events |= POLLIN | POLLPRI;
+      break;
+    case CURL_POLL_OUT:
+      download_mgr->watch_fds_[index].events |= POLLOUT | POLLWRBAND;
+      break;
+    case CURL_POLL_INOUT:
+      download_mgr->watch_fds_[index].events |=
+        POLLIN | POLLPRI | POLLOUT | POLLWRBAND;
+      break;
+    case CURL_POLL_REMOVE:
+      if (index < download_mgr->watch_fds_inuse_-1)
+        download_mgr->watch_fds_[index] =
+          download_mgr->watch_fds_[download_mgr->watch_fds_inuse_-1];
+      download_mgr->watch_fds_inuse_--;
+      // Shrink array if necessary
+      if ((download_mgr->watch_fds_inuse_ > download_mgr->watch_fds_max_) &&
+          (download_mgr->watch_fds_inuse_ < download_mgr->watch_fds_size_/2))
+      {
+        download_mgr->watch_fds_size_ /= 2;
+        //LogCvmfs(kLogDownload, kLogDebug, "shrinking watch_fds_ (%d)",
+        //         watch_fds_size_);
+        download_mgr->watch_fds_ = static_cast<struct pollfd *>(
+          srealloc(download_mgr->watch_fds_,
+                   download_mgr->watch_fds_size_*sizeof(struct pollfd)));
+        //LogCvmfs(kLogDownload, kLogDebug, "shrinking watch_fds_ done",
+        //         watch_fds_size_);
+      }
+      break;
+    default:
+      break;
+  }
+
+  return 0;
+}
+
+
+/**
+ * Worker thread event loop.  Waits on new JobInfo structs on a pipe.
+ */
+void *DownloadManager::MainDownload(void *data) {
+  LogCvmfs(kLogDownload, kLogDebug, "download I/O thread started");
+  DownloadManager *download_mgr = static_cast<DownloadManager *>(data);
+
+  download_mgr->watch_fds_ =
+    static_cast<struct pollfd *>(smalloc(2 * sizeof(struct pollfd)));
+  download_mgr->watch_fds_size_ = 2;
+  download_mgr->watch_fds_[0].fd = download_mgr->pipe_terminate_[0];
+  download_mgr->watch_fds_[0].events = POLLIN | POLLPRI;
+  download_mgr->watch_fds_[0].revents = 0;
+  download_mgr->watch_fds_[1].fd = download_mgr->pipe_jobs_[0];
+  download_mgr->watch_fds_[1].events = POLLIN | POLLPRI;
+  download_mgr->watch_fds_[1].revents = 0;
+  download_mgr->watch_fds_inuse_ = 2;
+
+  int still_running = 0;
+  struct timeval timeval_start, timeval_stop;
+  gettimeofday(&timeval_start, NULL);
+  while (true) {
+    int timeout;
+    if (still_running) {
+      timeout = 1;
+    } else {
+      timeout = -1;
+      gettimeofday(&timeval_stop, NULL);
+      download_mgr->statistics_->transfer_time +=
+        DiffTimeSeconds(timeval_start, timeval_stop);
+    }
+    int retval = poll(download_mgr->watch_fds_, download_mgr->watch_fds_inuse_,
+                      timeout);
+    if (retval < 0) {
+      continue;
+    }
+
+    // Handle timeout
+    if (retval == 0) {
+      retval = curl_multi_socket_action(download_mgr->curl_multi_,
+                                        CURL_SOCKET_TIMEOUT,
+                                        0,
+                                        &still_running);
+    }
+
+    // Terminate I/O thread
+    if (download_mgr->watch_fds_[0].revents)
+      break;
+
+    // New job arrives
+    if (download_mgr->watch_fds_[1].revents) {
+      download_mgr->watch_fds_[1].revents = 0;
+      JobInfo *info;
+      ReadPipe(download_mgr->pipe_jobs_[0], &info, sizeof(info));
+      //LogCvmfs(kLogDownload, kLogDebug, "IO thread, got job: url %s, compressed %d, nocache %d, destination %d, file %p, expected hash %p, wait at %d", info->url->c_str(), info->compressed, info->nocache,
+      //         info->destination, info->destination_file, info->expected_hash, info->wait_at[1]);
+
+      if (!still_running)
+        gettimeofday(&timeval_start, NULL);
+      CURL *handle = download_mgr->AcquireCurlHandle();
+      download_mgr->InitializeRequest(info, handle);
+      download_mgr->SetUrlOptions(info);
+      curl_multi_add_handle(download_mgr->curl_multi_, handle);
+      retval = curl_multi_socket_action(download_mgr->curl_multi_,
+                                        CURL_SOCKET_TIMEOUT,
+                                        0,
+                                        &still_running);
+      //LogCvmfs(kLogDownload, kLogDebug, "socket action returned with %d, still_running %d", retval, still_running);
+    }
+
+    // Activity on curl sockets
+    for (unsigned i = 2; i < download_mgr->watch_fds_inuse_; ++i) {
+      if (download_mgr->watch_fds_[i].revents) {
+        int ev_bitmask = 0;
+        if (download_mgr->watch_fds_[i].revents & (POLLIN | POLLPRI))
+          ev_bitmask |= CURL_CSELECT_IN;
+        if (download_mgr->watch_fds_[i].revents & (POLLOUT | POLLWRBAND))
+          ev_bitmask |= CURL_CSELECT_IN;
+        if (download_mgr->watch_fds_[i].revents & (POLLERR | POLLHUP | POLLNVAL))
+          ev_bitmask |= CURL_CSELECT_ERR;
+        download_mgr->watch_fds_[i].revents = 0;
+
+        retval = curl_multi_socket_action(download_mgr->curl_multi_,
+                                          download_mgr->watch_fds_[i].fd,
+                                          ev_bitmask,
+                                          &still_running);
+        //LogCvmfs(kLogDownload, kLogDebug, "socket action on socket %d, returned with %d, still_running %d", watch_fds_[i].fd, retval, still_running);
+      }
+    }
+
+    // Check if transfers are completed
+    CURLMsg *curl_msg;
+    int msgs_in_queue;
+    while ((curl_msg = curl_multi_info_read(download_mgr->curl_multi_,
+                                            &msgs_in_queue)))
+    {
+      if (curl_msg->msg == CURLMSG_DONE) {
+        download_mgr->statistics_->num_requests++;
+        JobInfo *info;
+        CURL *easy_handle = curl_msg->easy_handle;
+        int curl_error = curl_msg->data.result;
+        curl_easy_getinfo(easy_handle, CURLINFO_PRIVATE, &info);
+        //LogCvmfs(kLogDownload, kLogDebug, "Done message for %s", info->url->c_str());
+
+        curl_multi_remove_handle(download_mgr->curl_multi_, easy_handle);
+        if (download_mgr->VerifyAndFinalize(curl_error, info)) {
+          curl_multi_add_handle(download_mgr->curl_multi_, easy_handle);
+          retval = curl_multi_socket_action(download_mgr->curl_multi_,
+                                            CURL_SOCKET_TIMEOUT,
+                                            0,
+                                            &still_running);
+        } else {
+          // Return easy handle into pool and write result back
+          download_mgr->ReleaseCurlHandle(easy_handle);
+
+          WritePipe(info->wait_at[1], &info->error_code,
+                    sizeof(info->error_code));
+        }
+      }
+    }
+  }
+
+  for (set<CURL *>::iterator i = download_mgr->pool_handles_inuse_->begin(),
+       iEnd = download_mgr->pool_handles_inuse_->end(); i != iEnd; ++i)
+  {
+    curl_multi_remove_handle(download_mgr->curl_multi_, *i);
+    curl_easy_cleanup(*i);
+  }
+  download_mgr->pool_handles_inuse_->clear();
+  free(download_mgr->watch_fds_);
+
+  LogCvmfs(kLogDownload, kLogDebug, "download I/O thread terminated");
+  return NULL;
+}
+
+
+//------------------------------------------------------------------------------
+
+
+HeaderLists::~HeaderLists() {
+  for (unsigned i = 0; i < blocks_.size(); ++i) {
+    delete[] blocks_[i];
+  }
+  blocks_.clear();
+}
+
+
+curl_slist *HeaderLists::GetList(const char *header) {
+  return Get(header);
+}
+
+
+curl_slist *HeaderLists::DuplicateList(curl_slist *slist) {
+  assert(slist);
+  curl_slist *copy = GetList(slist->data);
+  copy->next = slist->next;
+  curl_slist *prev = copy;
+  slist = slist->next;
+  while (slist) {
+    curl_slist *new_link = Get(slist->data);
+    new_link->next = slist->next;
+    prev->next = new_link;
+    prev = new_link;
+    slist = slist->next;
+  }
+  return copy;
+}
+
+
+void HeaderLists::AppendHeader(curl_slist *slist, const char *header) {
+  assert(slist);
+  curl_slist *new_link = Get(header);
+  new_link->next = NULL;
+
+  while (slist->next)
+    slist = slist->next;
+  slist->next = new_link;
+}
+
+
+void HeaderLists::PutList(curl_slist *slist) {
+  while (slist) {
+    curl_slist *next = slist->next;
+    Put(slist);
+    slist = next;
+  }
+}
+
+
+string HeaderLists::Print(curl_slist *slist) {
+  string verbose;
+  while (slist) {
+    verbose += string(slist->data) + "\n";
+    slist = slist->next;
+  }
+  return verbose;
+}
+
+
+curl_slist *HeaderLists::Get(const char *header) {
+  for (unsigned i = 0; i < blocks_.size(); ++i) {
+    for (unsigned j = 0; j < kBlockSize; ++j) {
+      if (!IsUsed(&(blocks_[i][j]))) {
+        blocks_[i][j].data = const_cast<char *>(header);
+        return &(blocks_[i][j]);
+      }
+    }
+  }
+
+  // All used, new block
+  AddBlock();
+  blocks_[blocks_.size()-1][0].data = const_cast<char *>(header);
+  return &(blocks_[blocks_.size()-1][0]);
+}
+
+
+void HeaderLists::Put(curl_slist *slist) {
+  slist->data = NULL;
+  slist->next = NULL;
+}
+
+
+void HeaderLists::AddBlock(){
+  curl_slist *new_block = new curl_slist[kBlockSize];
+  for (unsigned i = 0; i < kBlockSize; ++i) {
+    Put(&new_block[i]);
+  }
+  blocks_.push_back(new_block);
+}
+
+
+//------------------------------------------------------------------------------
+
+
+/**
  * Gets an idle CURL handle from the pool. Creates a new one and adds it to
  * the pool if necessary.
  */
-static CURL *AcquireCurlHandle() {
+CURL *DownloadManager::AcquireCurlHandle() {
   CURL *handle;
 
   if (pool_handles_idle_->empty()) {
@@ -491,7 +610,7 @@ static CURL *AcquireCurlHandle() {
 }
 
 
-static void ReleaseCurlHandle(CURL *handle) {
+void DownloadManager::ReleaseCurlHandle(CURL *handle) {
   set<CURL *>::iterator elem = pool_handles_inuse_->find(handle);
   assert(elem != pool_handles_inuse_->end());
 
@@ -508,7 +627,7 @@ static void ReleaseCurlHandle(CURL *handle) {
  * Request parameters set the URL and other options such as timeout and
  * proxy.
  */
-static void InitializeRequest(JobInfo *info, CURL *handle) {
+void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
   // Initialize internal download state
   info->curl_handle = handle;
   info->error_code = kFailOk;
@@ -517,12 +636,16 @@ static void InitializeRequest(JobInfo *info, CURL *handle) {
   info->num_used_hosts = 1;
   info->num_retries = 0;
   info->backoff_ms = 0;
+  info->headers = header_lists_->DuplicateList(default_headers_);
+  if (info->info_header) {
+    header_lists_->AppendHeader(info->headers, info->info_header);
+  }
   if (info->compressed) {
     zlib::DecompressInit(&(info->zstream));
   }
   if (info->expected_hash) {
     assert(info->hash_context.buffer != NULL);
-    hash::Init(info->hash_context);
+    shash::Init(info->hash_context);
   }
 
   if ((info->destination == kDestinationMem) &&
@@ -537,7 +660,7 @@ static void InitializeRequest(JobInfo *info, CURL *handle) {
   curl_easy_setopt(handle, CURLOPT_WRITEHEADER,
                    static_cast<void *>(info));
   curl_easy_setopt(handle, CURLOPT_WRITEDATA, static_cast<void *>(info));
-  curl_easy_setopt(handle, CURLOPT_HTTPHEADER, http_headers_);
+  curl_easy_setopt(handle, CURLOPT_HTTPHEADER, info->headers);
   if (info->head_request)
     curl_easy_setopt(handle, CURLOPT_NOBODY, 1);
   else
@@ -550,11 +673,11 @@ static void InitializeRequest(JobInfo *info, CURL *handle) {
 /**
  * Sets the URL specific options such as host to use and timeout.
  */
-static void SetUrlOptions(JobInfo *info) {
+void DownloadManager::SetUrlOptions(JobInfo *info) {
   CURL *curl_handle = info->curl_handle;
   string url_prefix;
 
-  pthread_mutex_lock(&lock_options_);
+  pthread_mutex_lock(lock_options_);
   // Check if proxy group needs to be reset from backup to primary
   if (opt_timestamp_backup_proxies_ > 0) {
     const time_t now = time(NULL);
@@ -631,7 +754,7 @@ static void SetUrlOptions(JobInfo *info) {
 
   if (info->probe_hosts && opt_host_chain_)
     url_prefix = (*opt_host_chain_)[opt_host_chain_current_];
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 
   curl_easy_setopt(curl_handle, CURLOPT_URL,
                    EscapeUrl((url_prefix + *(info->url))).c_str());
@@ -643,7 +766,7 @@ static void SetUrlOptions(JobInfo *info) {
 /**
  * Adds transfer time and downloaded bytes to the global counters.
  */
-static void UpdateStatistics(CURL *handle) {
+void DownloadManager::UpdateStatistics(CURL *handle) {
   double val;
 
   if (curl_easy_getinfo(handle, CURLINFO_SIZE_DOWNLOAD, &val) == CURLE_OK)
@@ -654,10 +777,10 @@ static void UpdateStatistics(CURL *handle) {
 /**
  * Retry if possible if not on no-cache and if not already done too often.
  */
-static bool CanRetry(const JobInfo *info) {
-  pthread_mutex_lock(&lock_options_);
+bool DownloadManager::CanRetry(const JobInfo *info) {
+  pthread_mutex_lock(lock_options_);
   unsigned max_retries = opt_max_retries_;
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 
   return !info->nocache && (info->num_retries < max_retries) &&
     ((info->error_code == kFailProxyConnection) ||
@@ -672,16 +795,16 @@ static bool CanRetry(const JobInfo *info) {
  *
  * \return true if backoff has been performed, false otherwise
  */
-static void Backoff(JobInfo *info) {
-  pthread_mutex_lock(&lock_options_);
+void DownloadManager::Backoff(JobInfo *info) {
+  pthread_mutex_lock(lock_options_);
   unsigned backoff_init_ms = opt_backoff_init_ms_;
   unsigned backoff_max_ms = opt_backoff_max_ms_;
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 
   info->num_retries++;
   statistics_->num_retries++;
   if (info->backoff_ms == 0) {
-    info->backoff_ms = random() % backoff_init_ms + 1;  // Must be != 0
+    info->backoff_ms = prng_.Next(backoff_init_ms + 1);  // Must be != 0
   } else {
     info->backoff_ms *= 2;
   }
@@ -699,9 +822,9 @@ static void Backoff(JobInfo *info) {
  *
  * \return true if another download should be performed, false otherwise
  */
-static bool VerifyAndFinalize(const int curl_error, JobInfo *info) {
-  //LogCvmfs(kLogDownload, kLogDebug, "Verify Download (curl error %d)",
-  //         curl_error);
+bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
+  LogCvmfs(kLogDownload, kLogDebug, "Verify downloaded url %s (curl error %d)",
+           info->url->c_str(), curl_error);
   UpdateStatistics(info->curl_handle);
 
   // Verification and error classification
@@ -709,8 +832,8 @@ static bool VerifyAndFinalize(const int curl_error, JobInfo *info) {
     case CURLE_OK:
       // Verify content hash
       if (info->expected_hash) {
-        hash::Any match_hash;
-        hash::Final(info->hash_context, &match_hash);
+        shash::Any match_hash;
+        shash::Final(info->hash_context, &match_hash);
         if (match_hash != *(info->expected_hash)) {
           LogCvmfs(kLogDownload, kLogDebug,
                    "hash verification of %s failed (expected %s, got %s)",
@@ -777,7 +900,7 @@ static bool VerifyAndFinalize(const int curl_error, JobInfo *info) {
   bool try_again = false;
   bool same_url_retry = CanRetry(info);
   if (info->error_code != kFailOk) {
-    pthread_mutex_lock(&lock_options_);
+    pthread_mutex_lock(lock_options_);
     if ((info->error_code) == kFailBadData && !info->nocache)
       try_again = true;
     if ( same_url_retry || (
@@ -804,18 +927,23 @@ static bool VerifyAndFinalize(const int curl_error, JobInfo *info) {
             opt_host_chain_ &&
             (info->num_used_hosts < opt_host_chain_->size()))
         {
-          // reset proxy group
-          string old_proxy;
-          if (opt_proxy_groups_)
-            old_proxy = (*opt_proxy_groups_)[opt_proxy_groups_current_][0];
-          opt_proxy_groups_current_ = 0;
-          RebalanceProxiesUnlocked();
-          opt_timestamp_backup_proxies_ = 0;
+          // reset proxy group if not already performed by other handle
           if (opt_proxy_groups_) {
-            LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
-                     "switching proxy from %s to %s "
-                     "(reset proxies for host failover)",
-                     old_proxy.c_str(), (*opt_proxy_groups_)[0][0].c_str());
+            if ((opt_proxy_groups_current_ > 0) ||
+                (opt_proxy_groups_current_burned_ > 1))
+            {
+              string old_proxy;
+              old_proxy = (*opt_proxy_groups_)[opt_proxy_groups_current_][0];
+              opt_proxy_groups_current_ = 0;
+              RebalanceProxiesUnlocked();
+              opt_timestamp_backup_proxies_ = 0;
+              if (opt_proxy_groups_) {
+                LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
+                         "switching proxy from %s to %s "
+                         "(reset proxies for host failover)",
+                         old_proxy.c_str(), (*opt_proxy_groups_)[0][0].c_str());
+              }
+            }
           }
 
           // Make it a host failure
@@ -826,7 +954,7 @@ static bool VerifyAndFinalize(const int curl_error, JobInfo *info) {
         }
       }  // Make a proxy failure a host failure
     }  // Proxy failure assumed
-    pthread_mutex_unlock(&lock_options_);
+    pthread_mutex_unlock(lock_options_);
   }
 
   if (try_again) {
@@ -852,7 +980,7 @@ static bool VerifyAndFinalize(const int curl_error, JobInfo *info) {
       rewind(info->destination_file);
     }
     if (info->expected_hash)
-      hash::Init(info->hash_context);
+      shash::Init(info->hash_context);
     if (info->compressed)
       zlib::DecompressInit(&info->zstream);
 
@@ -861,8 +989,9 @@ static bool VerifyAndFinalize(const int curl_error, JobInfo *info) {
     bool switch_host = false;
     switch (info->error_code) {
       case kFailBadData:
-        curl_easy_setopt(info->curl_handle, CURLOPT_HTTPHEADER,
-                         http_headers_nocache_);
+        header_lists_->AppendHeader(info->headers, "Pragma: no-cache");
+        header_lists_->AppendHeader(info->headers, "Cache-Control: no-cache");
+        curl_easy_setopt(info->curl_handle, CURLOPT_HTTPHEADER, info->headers);
         info->nocache = true;
         break;
       case kFailProxyResolve:
@@ -919,286 +1048,106 @@ static bool VerifyAndFinalize(const int curl_error, JobInfo *info) {
   if (info->compressed)
     zlib::DecompressFini(&info->zstream);
 
+  if (info->headers) {
+    header_lists_->PutList(info->headers);
+    info->headers = NULL;
+  }
+
   return false;  // stop transfer and return to Fetch()
 }
 
 
-static Failures PrepareDownloadDestination(JobInfo *info) {
-  info->destination_mem.size = 0;
-  info->destination_mem.pos = 0;
-  info->destination_mem.data = NULL;
+DownloadManager::DownloadManager() {
+  pool_handles_idle_ = NULL;
+  pool_handles_inuse_ = NULL;
+  pool_max_handles_ = 0;
+  curl_multi_ = NULL;
+  default_headers_ = NULL;
 
-  if (info->destination == kDestinationFile)
-    assert(info->destination_file != NULL);
+  atomic_init32(&multi_threaded_);
+  pipe_terminate_[0] = pipe_terminate_[1] = -1;
 
-  if (info->destination == kDestinationPath) {
-    assert(info->destination_path != NULL);
-    info->destination_file = fopen(info->destination_path->c_str(), "w");
-    if (info->destination_file == NULL)
-      return kFailLocalIO;
-  }
+  pipe_jobs_[0] = pipe_jobs_[1] = -1;
+  watch_fds_ = NULL;
+  watch_fds_size_ = 0;
+  watch_fds_inuse_ = 0;
+  watch_fds_max_ = 0;
 
-  return kFailOk;
+  lock_options_ =
+  reinterpret_cast<pthread_mutex_t *>(smalloc(sizeof(pthread_mutex_t)));
+  int retval = pthread_mutex_init(lock_options_, NULL);
+  assert(retval == 0);
+  lock_synchronous_mode_ =
+  reinterpret_cast<pthread_mutex_t *>(smalloc(sizeof(pthread_mutex_t)));
+  retval = pthread_mutex_init(lock_synchronous_mode_, NULL);
+  assert(retval == 0);
+
+  opt_dns_server_ = NULL;
+  opt_timeout_proxy_ = 0;
+  opt_timeout_direct_ = 0;
+  opt_host_chain_ = NULL;
+  opt_host_chain_rtt_ = NULL;
+  opt_host_chain_current_ = 0;
+  opt_proxy_groups_ = NULL;
+  opt_proxy_groups_current_ = 0;
+  opt_proxy_groups_current_burned_ = 0;
+  opt_num_proxies_ = 0;
+  opt_max_retries_ = 0;
+  opt_backoff_init_ms_ = 0;
+  opt_backoff_max_ms_ = 0;
+  enable_info_header_ = false;
+  opt_ipv4_only_ = false;
+
+  opt_timestamp_backup_proxies_ = 0;
+  opt_timestamp_failover_proxies_ = 0;
+  opt_proxy_groups_reset_after_ = 0;
+  opt_timestamp_backup_host_ = 0;
+  opt_host_reset_after_ = 0;
+
+  statistics_ = NULL;
 }
 
 
-/**
- * Downloads data from an unsecure outside channel (currently HTTP or file).
- */
-Failures Fetch(JobInfo *info) {
-  assert(info != NULL);
-  assert(info->url != NULL);
+DownloadManager::~DownloadManager() {
+  pthread_mutex_destroy(lock_options_);
+  pthread_mutex_destroy(lock_synchronous_mode_);
+  free(lock_options_);
+  free(lock_synchronous_mode_);
+}
 
-  Failures result;
-  result = PrepareDownloadDestination(info);
-  if (result != kFailOk)
-    return result;
-
-  if (info->expected_hash) {
-    const hash::Algorithms algorithm = info->expected_hash->algorithm;
-    info->hash_context.algorithm = algorithm;
-    info->hash_context.size = hash::GetContextSize(algorithm);
-    info->hash_context.buffer = alloca(info->hash_context.size);
+void DownloadManager::InitHeaders() {
+  // User-Agent
+  string cernvm_id = "User-Agent: cvmfs ";
+#ifdef CVMFS_LIBCVMFS
+  cernvm_id += "libcvmfs ";
+#else
+  cernvm_id += "Fuse ";
+#endif
+  cernvm_id += string(VERSION);
+  if (getenv("CERNVM_UUID") != NULL) {
+    cernvm_id += " " +
+    sanitizer::InputSanitizer("az AZ 09 -").Filter(getenv("CERNVM_UUID"));
   }
+  user_agent_ = strdup(cernvm_id.c_str());
 
-  if (atomic_xadd32(&multi_threaded_, 0) == 1) {
-    if (info->wait_at[0] == -1) {
-      MakePipe(info->wait_at);
-    }
+  header_lists_ = new HeaderLists();
 
-    //LogCvmfs(kLogDownload, kLogDebug, "send job to thread, pipe %d %d",
-    //         info->wait_at[0], info->wait_at[1]);
-    WritePipe(pipe_jobs_[1], &info, sizeof(info));
-    ReadPipe(info->wait_at[0], &result, sizeof(result));
-    //LogCvmfs(kLogDownload, kLogDebug, "got result %d", result);
-  } else {
-    pthread_mutex_lock(&lock_synchronous_mode_);
-    CURL *handle = AcquireCurlHandle();
-    InitializeRequest(info, handle);
-    SetUrlOptions(info);
-    //curl_easy_setopt(handle, CURLOPT_VERBOSE, 1);
-    int retval;
-    do {
-      retval = curl_easy_perform(handle);
-      statistics_->num_requests++;
-      double elapsed;
-      if (curl_easy_getinfo(handle, CURLINFO_TOTAL_TIME, &elapsed) == CURLE_OK)
-        statistics_->transfer_time += elapsed;
-    } while (VerifyAndFinalize(retval, info));
-    result = info->error_code;
-    ReleaseCurlHandle(info->curl_handle);
-    pthread_mutex_unlock(&lock_synchronous_mode_);
-  }
-
-  if (result != kFailOk) {
-    LogCvmfs(kLogDownload, kLogDebug, "download failed (error %d)", result);
-
-    if (info->destination == kDestinationPath)
-      unlink(info->destination_path->c_str());
-
-    if (info->destination_mem.data) {
-      free(info->destination_mem.data);
-      info->destination_mem.data = NULL;
-      info->destination_mem.size = 0;
-    }
-  }
-
-  return result;
+  default_headers_ = header_lists_->GetList("Connection: Keep-Alive");
+  header_lists_->AppendHeader(default_headers_, "Pragma:");
+  header_lists_->AppendHeader(default_headers_, user_agent_);
 }
 
 
-/**
- * Called when new curl sockets arrive or existing curl sockets depart.
- */
-static int CallbackCurlSocket(CURL *easy, curl_socket_t s, int action,
-                              void *userp, void *socketp)
+void DownloadManager::FiniHeaders() {
+  delete header_lists_;
+  header_lists_ = NULL;
+  default_headers_ = NULL;
+}
+
+
+void DownloadManager::Init(const unsigned max_pool_handles,
+                           const bool use_system_proxy)
 {
-  //LogCvmfs(kLogDownload, kLogDebug, "CallbackCurlSocket called with easy "
-  //         "handle %p, socket %d, action %d", easy, s, action);
-  if (action == CURL_POLL_NONE)
-    return 0;
-
-  // Find s in watch_fds_
-  unsigned index;
-  for (index = 0; index < watch_fds_inuse_; ++index) {
-    if (watch_fds_[index].fd == s)
-      break;
-  }
-  // Or create newly
-  if (index == watch_fds_inuse_) {
-    // Extend array if necessary
-    if (watch_fds_inuse_ == watch_fds_size_) {
-      watch_fds_size_ *= 2;
-      //LogCvmfs(kLogDownload, kLogDebug, "extending watch_fds_ (%d)", watch_fds_size_);
-      watch_fds_ = static_cast<struct pollfd *>(
-                   srealloc(watch_fds_, watch_fds_size_*sizeof(struct pollfd)));
-      //LogCvmfs(kLogDownload, kLogDebug, "extending watch_fds_ done (%d)", watch_fds_size_);
-    }
-    watch_fds_[watch_fds_inuse_].fd = s;
-    watch_fds_[watch_fds_inuse_].events = 0;
-    watch_fds_[watch_fds_inuse_].revents = 0;
-    watch_fds_inuse_++;
-  }
-
-  switch (action) {
-    case CURL_POLL_IN:
-      watch_fds_[index].events |= POLLIN | POLLPRI;
-      break;
-    case CURL_POLL_OUT:
-      watch_fds_[index].events |= POLLOUT | POLLWRBAND;
-      break;
-    case CURL_POLL_INOUT:
-      watch_fds_[index].events |= POLLIN | POLLPRI | POLLOUT | POLLWRBAND;
-      break;
-    case CURL_POLL_REMOVE:
-      if (index < watch_fds_inuse_-1)
-        watch_fds_[index] = watch_fds_[watch_fds_inuse_-1];
-      watch_fds_inuse_--;
-      // Shrink array if necessary
-      if ((watch_fds_inuse_ > watch_fds_max_) &&
-          (watch_fds_inuse_ < watch_fds_size_/2))
-      {
-        watch_fds_size_ /= 2;
-        //LogCvmfs(kLogDownload, kLogDebug, "shrinking watch_fds_ (%d)",
-        //         watch_fds_size_);
-        watch_fds_ = static_cast<struct pollfd *>(
-                   srealloc(watch_fds_, watch_fds_size_*sizeof(struct pollfd)));
-        //LogCvmfs(kLogDownload, kLogDebug, "shrinking watch_fds_ done",
-        //         watch_fds_size_);
-      }
-      break;
-    default:
-      break;
-  }
-
-  return 0;
-}
-
-
-/**
- * Worker thread event loop.  Waits on new JobInfo structs on a pipe.
- */
-static void *MainDownload(void *data __attribute__((unused))) {
-  LogCvmfs(kLogDownload, kLogDebug, "download I/O thread started");
-
-  watch_fds_ = static_cast<struct pollfd *>(smalloc(2 * sizeof(struct pollfd)));
-  watch_fds_size_ = 2;
-  watch_fds_[0].fd = pipe_terminate_[0];
-  watch_fds_[0].events = POLLIN | POLLPRI;
-  watch_fds_[0].revents = 0;
-  watch_fds_[1].fd = pipe_jobs_[0];
-  watch_fds_[1].events = POLLIN | POLLPRI;
-  watch_fds_[1].revents = 0;
-  watch_fds_inuse_ = 2;
-
-  int still_running = 0;
-  struct timeval timeval_start, timeval_stop;
-  gettimeofday(&timeval_start, NULL);
-  while (true) {
-    int timeout;
-    if (still_running) {
-      timeout = 1;
-    } else {
-      timeout = -1;
-      gettimeofday(&timeval_stop, NULL);
-      statistics_->transfer_time +=
-        DiffTimeSeconds(timeval_start, timeval_stop);
-    }
-    int retval = poll(watch_fds_, watch_fds_inuse_, timeout);
-    if (retval < 0) {
-      continue;
-    }
-
-    // Handle timeout
-    if (retval == 0) {
-      retval = curl_multi_socket_action(curl_multi_, CURL_SOCKET_TIMEOUT, 0,
-                                        &still_running);
-    }
-
-    // Terminate I/O thread
-    if (watch_fds_[0].revents)
-      break;
-
-    // New job arrives
-    if (watch_fds_[1].revents) {
-      watch_fds_[1].revents = 0;
-      JobInfo *info;
-      ReadPipe(pipe_jobs_[0], &info, sizeof(info));
-      //LogCvmfs(kLogDownload, kLogDebug, "IO thread, got job: url %s, compressed %d, nocache %d, destination %d, file %p, expected hash %p, wait at %d", info->url->c_str(), info->compressed, info->nocache,
-      //         info->destination, info->destination_file, info->expected_hash, info->wait_at[1]);
-
-      if (!still_running)
-        gettimeofday(&timeval_start, NULL);
-      CURL *handle = AcquireCurlHandle();
-      InitializeRequest(info, handle);
-      SetUrlOptions(info);
-      curl_multi_add_handle(curl_multi_, handle);
-      retval = curl_multi_socket_action(curl_multi_, CURL_SOCKET_TIMEOUT, 0,
-                                        &still_running);
-      //LogCvmfs(kLogDownload, kLogDebug, "socket action returned with %d, still_running %d", retval, still_running);
-    }
-
-    // Activity on curl sockets
-    for (unsigned i = 2; i < watch_fds_inuse_; ++i) {
-      if (watch_fds_[i].revents) {
-        int ev_bitmask = 0;
-        if (watch_fds_[i].revents & (POLLIN | POLLPRI))
-          ev_bitmask |= CURL_CSELECT_IN;
-        if (watch_fds_[i].revents & (POLLOUT | POLLWRBAND))
-          ev_bitmask |= CURL_CSELECT_IN;
-        if (watch_fds_[i].revents & (POLLERR | POLLHUP | POLLNVAL))
-          ev_bitmask |= CURL_CSELECT_ERR;
-        watch_fds_[i].revents = 0;
-
-        retval = curl_multi_socket_action(curl_multi_, watch_fds_[i].fd,
-                                          ev_bitmask, &still_running);
-        //LogCvmfs(kLogDownload, kLogDebug, "socket action on socket %d, returned with %d, still_running %d", watch_fds_[i].fd, retval, still_running);
-      }
-    }
-
-    // Check if transfers are completed
-    CURLMsg *curl_msg;
-    int msgs_in_queue;
-    while ((curl_msg = curl_multi_info_read(curl_multi_, &msgs_in_queue))) {
-      if (curl_msg->msg == CURLMSG_DONE) {
-        statistics_->num_requests++;
-        JobInfo *info;
-        CURL *easy_handle = curl_msg->easy_handle;
-        int curl_error = curl_msg->data.result;
-        curl_easy_getinfo(easy_handle, CURLINFO_PRIVATE, &info);
-        //LogCvmfs(kLogDownload, kLogDebug, "Done message for %s", info->url->c_str());
-
-        curl_multi_remove_handle(curl_multi_, easy_handle);
-        if (VerifyAndFinalize(curl_error, info)) {
-          curl_multi_add_handle(curl_multi_, easy_handle);
-          retval = curl_multi_socket_action(curl_multi_, CURL_SOCKET_TIMEOUT, 0,
-                                            &still_running);
-        } else {
-          // Return easy handle into pool and write result back
-          ReleaseCurlHandle(easy_handle);
-
-          WritePipe(info->wait_at[1], &info->error_code,
-                    sizeof(info->error_code));
-        }
-      }
-    }
-  }
-
-  for (set<CURL *>::iterator i = pool_handles_inuse_->begin(),
-       iEnd = pool_handles_inuse_->end(); i != iEnd; ++i)
-  {
-    curl_multi_remove_handle(curl_multi_, *i);
-    curl_easy_cleanup(*i);
-  }
-  pool_handles_inuse_->clear();
-  free(watch_fds_);
-
-  LogCvmfs(kLogDownload, kLogDebug, "download I/O thread terminated");
-  return NULL;
-}
-
-
-void Init(const unsigned max_pool_handles, const bool use_system_proxy) {
   atomic_init32(&multi_threaded_);
   int retval = curl_global_init(CURL_GLOBAL_ALL);
   assert(retval == CURLE_OK);
@@ -1216,34 +1165,20 @@ void Init(const unsigned max_pool_handles, const bool use_system_proxy) {
 
   statistics_ = new Statistics();
 
-  // Prepare HTTP headers
-  string custom_header;
-  if (getenv("CERNVM_UUID") != NULL) {
-    custom_header = "X-CVMFS2 " + string(VERSION) + " " +
-    string(getenv("CERNVM_UUID"));
-  } else {
-    custom_header = "X-CVMFS2 " + string(VERSION) + " anonymous";
-  }
-  http_headers_ = curl_slist_append(http_headers_, "Connection: Keep-Alive");
-  http_headers_ = curl_slist_append(http_headers_, "Pragma:");
-  http_headers_ = curl_slist_append(http_headers_, custom_header.c_str());
-  http_headers_nocache_ = curl_slist_append(http_headers_nocache_,
-                                            "Pragma: no-cache");
-  http_headers_nocache_ = curl_slist_append(http_headers_nocache_,
-                                            "Cache-Control: no-cache");
-  http_headers_nocache_ = curl_slist_append(http_headers_nocache_,
-                                            custom_header.c_str());
+  user_agent_ = NULL;
+  InitHeaders();
 
   curl_multi_ = curl_multi_init();
   assert(curl_multi_ != NULL);
   curl_multi_setopt(curl_multi_, CURLMOPT_SOCKETFUNCTION, CallbackCurlSocket);
+  curl_multi_setopt(curl_multi_, CURLMOPT_SOCKETDATA,
+                    static_cast<void *>(this));
   curl_multi_setopt(curl_multi_, CURLMOPT_MAXCONNECTS, watch_fds_max_);
+  curl_multi_setopt(curl_multi_, CURLMOPT_MAX_TOTAL_CONNECTIONS,
+                    pool_max_handles_);
   //curl_multi_setopt(curl_multi_, CURLMOPT_PIPELINING, 1);
 
-  // Initialize random number engine with system time
-  struct timeval tv_now;
-  gettimeofday(&tv_now, NULL);
-  srandom(tv_now.tv_usec);
+  prng_.InitLocaltime();
 
   // Parsing environment variables
   if (use_system_proxy) {
@@ -1261,7 +1196,7 @@ void Init(const unsigned max_pool_handles, const bool use_system_proxy) {
 }
 
 
-void Fini() {
+void DownloadManager::Fini() {
   if (atomic_xadd32(&multi_threaded_, 0) == 1) {
     // Shutdown I/O thread
     char buf = 'T';
@@ -1281,14 +1216,15 @@ void Fini() {
   }
   delete pool_handles_idle_;
   delete pool_handles_inuse_;
-  curl_slist_free_all(http_headers_);
-  curl_slist_free_all(http_headers_nocache_);
   curl_multi_cleanup(curl_multi_);
   pool_handles_idle_ = NULL;
   pool_handles_inuse_ = NULL;
-  http_headers_ = NULL;
-  http_headers_nocache_ = NULL;
   curl_multi_ = NULL;
+
+  FiniHeaders();
+  if (user_agent_)
+    free(user_agent_);
+  user_agent_ = NULL;
 
   delete statistics_;
   statistics_ = NULL;
@@ -1308,11 +1244,12 @@ void Fini() {
  * Spawns the I/O worker thread and switches the module in multi-threaded mode.
  * No way back except Fini(); Init();
  */
-void Spawn() {
+void DownloadManager::Spawn() {
   MakePipe(pipe_terminate_);
   MakePipe(pipe_jobs_);
 
-  int retval = pthread_create(&thread_download_, NULL, MainDownload, NULL);
+  int retval = pthread_create(&thread_download_, NULL, MainDownload,
+                              static_cast<void *>(this));
   assert(retval == 0);
 
   atomic_inc32(&multi_threaded_);
@@ -1320,18 +1257,98 @@ void Spawn() {
 
 
 /**
+ * Downloads data from an unsecure outside channel (currently HTTP or file).
+ */
+Failures DownloadManager::Fetch(JobInfo *info) {
+  assert(info != NULL);
+  assert(info->url != NULL);
+
+  Failures result;
+  result = PrepareDownloadDestination(info);
+  if (result != kFailOk)
+    return result;
+
+  if (info->expected_hash) {
+    const shash::Algorithms algorithm = info->expected_hash->algorithm;
+    info->hash_context.algorithm = algorithm;
+    info->hash_context.size = shash::GetContextSize(algorithm);
+    info->hash_context.buffer = alloca(info->hash_context.size);
+  }
+
+  // Prepare cvmfs-info: header, allocate string on the stack
+  info->info_header = NULL;
+  if (enable_info_header_ && info->extra_info) {
+    const char *header_name = "cvmfs-info: ";
+    const size_t header_name_len = strlen(header_name);
+    const unsigned header_size = 1 + header_name_len +
+      EscapeHeader(*(info->extra_info), NULL, 0);
+    info->info_header = static_cast<char *>(alloca(header_size));
+    memcpy(info->info_header, header_name, header_name_len);
+    EscapeHeader(*(info->extra_info), info->info_header + header_name_len,
+                 header_size - header_name_len);
+    info->info_header[header_size-1] = '\0';
+  }
+
+  if (atomic_xadd32(&multi_threaded_, 0) == 1) {
+    if (info->wait_at[0] == -1) {
+      MakePipe(info->wait_at);
+    }
+
+    //LogCvmfs(kLogDownload, kLogDebug, "send job to thread, pipe %d %d",
+    //         info->wait_at[0], info->wait_at[1]);
+    WritePipe(pipe_jobs_[1], &info, sizeof(info));
+    ReadPipe(info->wait_at[0], &result, sizeof(result));
+    //LogCvmfs(kLogDownload, kLogDebug, "got result %d", result);
+  } else {
+    pthread_mutex_lock(lock_synchronous_mode_);
+    CURL *handle = AcquireCurlHandle();
+    InitializeRequest(info, handle);
+    SetUrlOptions(info);
+    //curl_easy_setopt(handle, CURLOPT_VERBOSE, 1);
+    int retval;
+    do {
+      retval = curl_easy_perform(handle);
+      statistics_->num_requests++;
+      double elapsed;
+      if (curl_easy_getinfo(handle, CURLINFO_TOTAL_TIME, &elapsed) == CURLE_OK)
+        statistics_->transfer_time += elapsed;
+    } while (VerifyAndFinalize(retval, info));
+    result = info->error_code;
+    ReleaseCurlHandle(info->curl_handle);
+    pthread_mutex_unlock(lock_synchronous_mode_);
+  }
+
+  if (result != kFailOk) {
+    LogCvmfs(kLogDownload, kLogDebug, "download failed (error %d - %s)", result,
+             Code2Ascii(result));
+
+    if (info->destination == kDestinationPath)
+      unlink(info->destination_path->c_str());
+
+    if (info->destination_mem.data) {
+      free(info->destination_mem.data);
+      info->destination_mem.data = NULL;
+      info->destination_mem.size = 0;
+    }
+  }
+
+  return result;
+}
+
+
+/**
  * Sets a DNS server.  Only for testing as it cannot be reverted to the system
  * default.
  */
-void SetDnsServer(const string &address) {
-  pthread_mutex_lock(&lock_options_);
+void DownloadManager::SetDnsServer(const string &address) {
+  pthread_mutex_lock(lock_options_);
   if (opt_dns_server_)
     free(opt_dns_server_);
   if (address != "") {
     opt_dns_server_ = strdup(address.c_str());
     assert(opt_dns_server_);
   }
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
   LogCvmfs(kLogDownload, kLogSyslog, "set nameserver to %s", address.c_str());
 }
 
@@ -1341,26 +1358,30 @@ void SetDnsServer(const string &address) {
  * The timeout counts for all sorts of connection phases,
  * DNS, HTTP connect, etc.
  */
-void SetTimeout(const unsigned seconds_proxy, const unsigned seconds_direct) {
-  pthread_mutex_lock(&lock_options_);
+void DownloadManager::SetTimeout(const unsigned seconds_proxy,
+                                 const unsigned seconds_direct)
+{
+  pthread_mutex_lock(lock_options_);
   opt_timeout_proxy_ = seconds_proxy;
   opt_timeout_direct_ = seconds_direct;
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 }
 
 
 /**
  * Receives the currently active timeout values.
  */
-void GetTimeout(unsigned *seconds_proxy, unsigned *seconds_direct) {
-  pthread_mutex_lock(&lock_options_);
+void DownloadManager::GetTimeout(unsigned *seconds_proxy,
+                                 unsigned *seconds_direct)
+{
+  pthread_mutex_lock(lock_options_);
   *seconds_proxy = opt_timeout_proxy_;
   *seconds_direct = opt_timeout_direct_;
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 }
 
 
-const Statistics &GetStatistics() {
+const Statistics &DownloadManager::GetStatistics() {
   return *statistics_;
 }
 
@@ -1369,8 +1390,8 @@ const Statistics &GetStatistics() {
  * Parses a list of ';'-separated hosts for the host chain.  The empty string
  * removes the host list.
  */
-void SetHostChain(const string &host_list) {
-  pthread_mutex_lock(&lock_options_);
+void DownloadManager::SetHostChain(const string &host_list) {
+  pthread_mutex_lock(lock_options_);
   opt_timestamp_backup_host_ = 0;
   delete opt_host_chain_;
   delete opt_host_chain_rtt_;
@@ -1379,7 +1400,7 @@ void SetHostChain(const string &host_list) {
   if (host_list == "") {
     opt_host_chain_ = NULL;
     opt_host_chain_rtt_ = NULL;
-    pthread_mutex_unlock(&lock_options_);
+    pthread_mutex_unlock(lock_options_);
     return;
   }
 
@@ -1389,7 +1410,7 @@ void SetHostChain(const string &host_list) {
   //         (*opt_host_chain_)[0].c_str());
   for (unsigned i = 0, s = opt_host_chain_->size(); i < s; ++i)
     opt_host_chain_rtt_->push_back(-1);
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 }
 
 
@@ -1397,80 +1418,160 @@ void SetHostChain(const string &host_list) {
  * Retrieves the currently set chain of hosts, their round trip times, and the
  * currently used host.
  */
-void GetHostInfo(std::vector<std::string> *host_chain,
-                 std::vector<int> *rtt, unsigned *current_host)
+void DownloadManager::GetHostInfo(vector<string> *host_chain, vector<int> *rtt,
+                                  unsigned *current_host)
 {
-  pthread_mutex_lock(&lock_options_);
+  pthread_mutex_lock(lock_options_);
   if (opt_host_chain_) {
     *current_host = opt_host_chain_current_;
     *host_chain = *opt_host_chain_;
     *rtt = *opt_host_chain_rtt_;
   }
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 }
 
 
 /**
- * Parses a list of ';'- and '|'-separated proxy servers for the proxy groups.
- * The empty string removes the proxy chain.
+ * Jumps to the next proxy in the ring of forward proxy servers.
+ * Selects one randomly from a load-balancing group.
+ *
+ * If info is set, switch only if the current proxy is identical to the one used
+ * by info, otherwise another transfer has already done the switch.
  */
-void SetProxyChain(const std::string &proxy_list) {
-  pthread_mutex_lock(&lock_options_);
-
-  opt_timestamp_backup_proxies_ = 0;
-  opt_timestamp_failover_proxies_ = 0;
-  delete opt_proxy_groups_;
-  if (proxy_list == "") {
-    opt_proxy_groups_ = NULL;
-    opt_proxy_groups_current_ = 0;
-    opt_proxy_groups_current_burned_ = 0;
-    opt_num_proxies_ = 0;
-    pthread_mutex_unlock(&lock_options_);
-    return;
-  }
-
-  vector<string> proxy_groups = SplitString(proxy_list, ';');
-  opt_proxy_groups_ = new vector< vector<string> >();
-  opt_num_proxies_ = 0;
-  for (unsigned i = 0; i < proxy_groups.size(); ++i) {
-    opt_proxy_groups_->push_back(SplitString(proxy_groups[i], '|'));
-    opt_num_proxies_ += (*opt_proxy_groups_)[i].size();
-  }
-  opt_proxy_groups_current_ = 0;
-  opt_proxy_groups_current_burned_ = 1;
-
-  /* Select random start proxy from the first group */
-  if ((*opt_proxy_groups_)[0].size() > 1) {
-    int random_index = random() % (*opt_proxy_groups_)[0].size();
-    string tmp = (*opt_proxy_groups_)[0][0];
-    (*opt_proxy_groups_)[0][0] = (*opt_proxy_groups_)[0][random_index];
-    (*opt_proxy_groups_)[0][random_index] = tmp;
-  }
-  //LogCvmfs(kLogDownload, kLogSyslog, "using proxy %s",
-  //         (*opt_proxy_groups_)[0][0].c_str());
-  pthread_mutex_unlock(&lock_options_);
-}
-
-
-/**
- * Retrieves the proxy chain and the currently active load-balancing group.
- */
-void GetProxyInfo(vector< vector<string> > *proxy_chain,
-                  unsigned *current_group)
-{
-  pthread_mutex_lock(&lock_options_);
+void DownloadManager::SwitchProxy(JobInfo *info) {
+  pthread_mutex_lock(lock_options_);
 
   if (!opt_proxy_groups_) {
-    pthread_mutex_unlock(&lock_options_);
-    proxy_chain = NULL;
-    current_group = NULL;
+    pthread_mutex_unlock(lock_options_);
+    return;
+  }
+  if (info &&
+      ((*opt_proxy_groups_)[opt_proxy_groups_current_][0] != info->proxy))
+  {
+    pthread_mutex_unlock(lock_options_);
     return;
   }
 
-  *proxy_chain = *opt_proxy_groups_;
-  *current_group = opt_proxy_groups_current_;
+  statistics_->num_proxy_failover++;
+  string old_proxy = (*opt_proxy_groups_)[opt_proxy_groups_current_][0];
 
-  pthread_mutex_unlock(&lock_options_);
+  // If all proxies from the current load-balancing group are burned, switch to
+  // another group
+  if (opt_proxy_groups_current_burned_ ==
+      (*opt_proxy_groups_)[opt_proxy_groups_current_].size())
+  {
+    opt_proxy_groups_current_burned_ = 0;
+    if (opt_proxy_groups_->size() > 1) {
+      opt_proxy_groups_current_ = (opt_proxy_groups_current_ + 1) %
+      opt_proxy_groups_->size();
+      // Remeber the timestamp of switching to backup proxies
+      if (opt_proxy_groups_reset_after_ > 0) {
+        if (opt_proxy_groups_current_ > 0) {
+          if (opt_timestamp_backup_proxies_ == 0)
+            opt_timestamp_backup_proxies_ = time(NULL);
+          //LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
+          //         "switched to (another) backup proxy group");
+        } else {
+          opt_timestamp_backup_proxies_ = 0;
+          //LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
+          //         "switched back to primary proxy group");
+        }
+        opt_timestamp_failover_proxies_ = 0;
+      }
+    }
+  } else {
+    // failover within the same group
+    if (opt_proxy_groups_reset_after_ > 0) {
+      if (opt_timestamp_failover_proxies_ == 0)
+        opt_timestamp_failover_proxies_ = time(NULL);
+    }
+  }
+
+  vector<string> *group = &((*opt_proxy_groups_)[opt_proxy_groups_current_]);
+  const unsigned group_size = group->size();
+
+  // Move active proxy to the back
+  if (opt_proxy_groups_current_burned_) {
+    const string swap = (*group)[0];
+    (*group)[0] = (*group)[group_size - opt_proxy_groups_current_burned_];
+    (*group)[group_size - opt_proxy_groups_current_burned_] = swap;
+  }
+  opt_proxy_groups_current_burned_++;
+
+  // Select new one
+  if ((group_size - opt_proxy_groups_current_burned_) > 0) {
+    int select = prng_.Next(group_size - opt_proxy_groups_current_burned_ + 1);
+
+    // Move selected proxy to front
+    const string swap = (*group)[select];
+    (*group)[select] = (*group)[0];
+    (*group)[0] = swap;
+  }
+
+  LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
+           "switching proxy from %s to %s",
+           old_proxy.c_str(), (*group)[0].c_str());
+  LogCvmfs(kLogDownload, kLogDebug, "%d proxies remain in group",
+           group_size - opt_proxy_groups_current_burned_);
+
+  pthread_mutex_unlock(lock_options_);
+}
+
+
+/**
+ * Switches to the next host in the chain.  If info is set, switch only if the
+ * current host is identical to the one used by info, otherwise another transfer
+ * has already done the switch.
+ */
+void DownloadManager::SwitchHost(JobInfo *info) {
+  bool do_switch = true;
+
+  pthread_mutex_lock(lock_options_);
+  if (!opt_host_chain_ || (opt_host_chain_->size() == 1)) {
+    pthread_mutex_unlock(lock_options_);
+    return;
+  }
+
+  if (info) {
+    char *effective_url;
+    curl_easy_getinfo(info->curl_handle, CURLINFO_EFFECTIVE_URL,
+                      &effective_url);
+    if (!HasPrefix(string(effective_url) + "/",
+                   (*opt_host_chain_)[opt_host_chain_current_] + "/",
+                   true))
+    {
+      do_switch = false;
+      LogCvmfs(kLogDownload, kLogDebug, "don't switch host, "
+               "effective url: %s, current host: %s", effective_url,
+               (*opt_host_chain_)[opt_host_chain_current_].c_str());
+    }
+  }
+
+  if (do_switch) {
+    string old_host = (*opt_host_chain_)[opt_host_chain_current_];
+    opt_host_chain_current_ = (opt_host_chain_current_+1) %
+    opt_host_chain_->size();
+    statistics_->num_host_failover++;
+    LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
+             "switching host from %s to %s", old_host.c_str(),
+             (*opt_host_chain_)[opt_host_chain_current_].c_str());
+
+    // Remeber the timestamp of switching to backup host
+    if (opt_host_reset_after_ > 0) {
+      if (opt_host_chain_current_ != 0) {
+        if (opt_timestamp_backup_host_ == 0)
+          opt_timestamp_backup_host_ = time(NULL);
+      } else {
+        opt_timestamp_backup_host_ = 0;
+      }
+    }
+  }
+  pthread_mutex_unlock(lock_options_);
+}
+
+
+void DownloadManager::SwitchHost() {
+  SwitchHost(NULL);
 }
 
 
@@ -1480,7 +1581,7 @@ void GetProxyInfo(vector< vector<string> > *proxy_chain,
  * If you change the host list in between by SetHostChain(), it will be
  * overwritten by this function.
  */
-void ProbeHosts() {
+void DownloadManager::ProbeHosts() {
   vector<string> host_chain;
   vector<int> host_rtt;
   unsigned current_host;
@@ -1502,12 +1603,12 @@ void ProbeHosts() {
       if (info.destination_mem.data)
         free(info.destination_mem.data);
       if (result == kFailOk) {
-        host_rtt[i] = int(DiffTimeSeconds(tv_start, tv_end));
+        host_rtt[i] = int(DiffTimeSeconds(tv_start, tv_end) * 1000);
         LogCvmfs(kLogDownload, kLogDebug, "probing host %s had %dms rtt",
                  url.c_str(), host_rtt[i]);
       } else {
-        LogCvmfs(kLogDownload, kLogDebug, "error while probing host %s: %d",
-                 url.c_str(), result);
+        LogCvmfs(kLogDownload, kLogDebug, "error while probing host %s: %d - %s",
+                 url.c_str(), result, Code2Ascii(result));
         host_rtt[i] = INT_MAX;
       }
     }
@@ -1529,71 +1630,208 @@ void ProbeHosts() {
     if (host_rtt[i] == INT_MAX) host_rtt[i] = -2;
   }
 
-  pthread_mutex_lock(&lock_options_);
+  pthread_mutex_lock(lock_options_);
   delete opt_host_chain_;
   delete opt_host_chain_rtt_;
   opt_host_chain_ = new vector<string>(host_chain);
   opt_host_chain_rtt_ = new vector<int>(host_rtt);
   opt_host_chain_current_ = 0;
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 }
 
 
-void SetProxyGroupResetDelay(const unsigned seconds) {
-  pthread_mutex_lock(&lock_options_);
+/**
+ * Parses a list of ';'- and '|'-separated proxy servers for the proxy groups.
+ * The empty string removes the proxy chain.
+ */
+void DownloadManager::SetProxyChain(const string &proxy_list) {
+  pthread_mutex_lock(lock_options_);
+
+  opt_timestamp_backup_proxies_ = 0;
+  opt_timestamp_failover_proxies_ = 0;
+  delete opt_proxy_groups_;
+  if (proxy_list == "") {
+    opt_proxy_groups_ = NULL;
+    opt_proxy_groups_current_ = 0;
+    opt_proxy_groups_current_burned_ = 0;
+    opt_num_proxies_ = 0;
+    pthread_mutex_unlock(lock_options_);
+    return;
+  }
+
+  vector<string> proxy_groups = SplitString(proxy_list, ';');
+  opt_proxy_groups_ = new vector< vector<string> >();
+  opt_num_proxies_ = 0;
+  for (unsigned i = 0; i < proxy_groups.size(); ++i) {
+    opt_proxy_groups_->push_back(SplitString(proxy_groups[i], '|'));
+    opt_num_proxies_ += (*opt_proxy_groups_)[i].size();
+  }
+  opt_proxy_groups_current_ = 0;
+  opt_proxy_groups_current_burned_ = 1;
+
+  /* Select random start proxy from the first group */
+  if ((*opt_proxy_groups_)[0].size() > 1) {
+    int random_index = prng_.Next((*opt_proxy_groups_)[0].size());
+    string tmp = (*opt_proxy_groups_)[0][0];
+    (*opt_proxy_groups_)[0][0] = (*opt_proxy_groups_)[0][random_index];
+    (*opt_proxy_groups_)[0][random_index] = tmp;
+  }
+  //LogCvmfs(kLogDownload, kLogSyslog, "using proxy %s",
+  //         (*opt_proxy_groups_)[0][0].c_str());
+  pthread_mutex_unlock(lock_options_);
+}
+
+
+/**
+ * Retrieves the proxy chain and the currently active load-balancing group.
+ */
+void DownloadManager::GetProxyInfo(vector< vector<string> > *proxy_chain,
+                                   unsigned *current_group)
+{
+  pthread_mutex_lock(lock_options_);
+
+  if (!opt_proxy_groups_) {
+    pthread_mutex_unlock(lock_options_);
+    proxy_chain = NULL;
+    current_group = NULL;
+    return;
+  }
+
+  *proxy_chain = *opt_proxy_groups_;
+  *current_group = opt_proxy_groups_current_;
+
+  pthread_mutex_unlock(lock_options_);
+}
+
+
+/**
+ * Selects a new random proxy in the current load-balancing group.  Resets the
+ * "burned" counter.
+ */
+void DownloadManager::RebalanceProxiesUnlocked() {
+  if (!opt_proxy_groups_)
+    return;
+
+  opt_timestamp_failover_proxies_ = 0;
+  opt_proxy_groups_current_burned_ = 1;
+  vector<string> *group = &((*opt_proxy_groups_)[opt_proxy_groups_current_]);
+  int select = prng_.Next(group->size());
+  const string swap = (*group)[select];
+  (*group)[select] = (*group)[0];
+  (*group)[0] = swap;
+  //LogCvmfs(kLogDownload, kLogDebug | kLogSyslog,
+  //         "switching proxy from %s to %s (rebalance)",
+  //         (*group)[select].c_str(), swap.c_str());
+}
+
+
+void DownloadManager::RebalanceProxies() {
+  pthread_mutex_lock(lock_options_);
+  RebalanceProxiesUnlocked();
+  pthread_mutex_unlock(lock_options_);
+}
+
+
+/**
+ * Switches to the next load-balancing group of proxy servers.
+ */
+void DownloadManager::SwitchProxyGroup() {
+  pthread_mutex_lock(lock_options_);
+
+  if (!opt_proxy_groups_ || (opt_proxy_groups_->size() < 2)) {
+    pthread_mutex_unlock(lock_options_);
+    return;
+  }
+
+  string old_proxy = (*opt_proxy_groups_)[opt_proxy_groups_current_][0];
+  opt_proxy_groups_current_ = (opt_proxy_groups_current_ + 1) %
+  opt_proxy_groups_->size();
+  opt_proxy_groups_current_burned_ = 1;
+  opt_timestamp_backup_proxies_ = time(NULL);
+  opt_timestamp_failover_proxies_ = 0;
+  //LogCvmfs(kLogDownload, kLogDebug | kLogSyslog,
+  //         "switching proxy from %s to %s (manual group change)",
+  //         old_proxy.c_str(),
+  //         (*opt_proxy_groups_)[opt_proxy_groups_current_][0].c_str());
+
+  pthread_mutex_unlock(lock_options_);
+}
+
+
+void DownloadManager::SetProxyGroupResetDelay(const unsigned seconds) {
+  pthread_mutex_lock(lock_options_);
   opt_proxy_groups_reset_after_ = seconds;
   if (opt_proxy_groups_reset_after_ == 0) {
     opt_timestamp_backup_proxies_ = 0;
     opt_timestamp_failover_proxies_ = 0;
   }
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 }
 
 
-void GetProxyBackupInfo(unsigned *reset_delay, time_t *timestamp_failover) {
-  pthread_mutex_lock(&lock_options_);
+void DownloadManager::GetProxyBackupInfo(unsigned *reset_delay,
+                                         time_t *timestamp_failover)
+{
+  pthread_mutex_lock(lock_options_);
   *reset_delay = opt_proxy_groups_reset_after_;
   *timestamp_failover = opt_timestamp_backup_proxies_;
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 }
 
 
-void SetHostResetDelay(const unsigned seconds) {
-  pthread_mutex_lock(&lock_options_);
+void DownloadManager::SetHostResetDelay(const unsigned seconds)
+{
+  pthread_mutex_lock(lock_options_);
   opt_host_reset_after_ = seconds;
   if (opt_host_reset_after_ == 0)
     opt_timestamp_backup_host_ = 0;
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 }
 
 
-void GetHostBackupInfo(unsigned *reset_delay, time_t *timestamp_failover) {
-  pthread_mutex_lock(&lock_options_);
+void DownloadManager::GetHostBackupInfo(unsigned *reset_delay,
+                                        time_t *timestamp_failover)
+{
+  pthread_mutex_lock(lock_options_);
   *reset_delay = opt_host_reset_after_;
   *timestamp_failover = opt_timestamp_backup_host_;
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 }
 
 
-void SetRetryParameters(const unsigned max_retries,
-                        const unsigned backoff_init_ms,
-                        const unsigned backoff_max_ms)
+void DownloadManager::SetRetryParameters(const unsigned max_retries,
+                                         const unsigned backoff_init_ms,
+                                         const unsigned backoff_max_ms)
 {
-  pthread_mutex_lock(&lock_options_);
+  pthread_mutex_lock(lock_options_);
   opt_max_retries_ = max_retries;
   opt_backoff_init_ms_ = backoff_init_ms;
   opt_backoff_max_ms_ = backoff_max_ms;
-  pthread_mutex_unlock(&lock_options_);
+  pthread_mutex_unlock(lock_options_);
 }
 
 
-void ActivatePipelining() {
+void DownloadManager::EnableInfoHeader() {
+  enable_info_header_ = true;
+}
+
+
+void DownloadManager::EnablePipelining() {
   curl_multi_setopt(curl_multi_, CURLMOPT_PIPELINING, 1);
 }
 
 
-void RestartNetwork() {
-  // TODO: transfer special job
+//------------------------------------------------------------------------------
+
+
+string Statistics::Print() const {
+  return
+  "Transferred Bytes: " + StringifyInt(uint64_t(transferred_bytes)) + "\n" +
+  "Transfer duration: " + StringifyInt(uint64_t(transfer_time)) + " s\n" +
+  "Number of requests: " + StringifyInt(num_requests) + "\n" +
+  "Number of retries: " + StringifyInt(num_retries) + "\n" +
+  "Number of proxy failovers: " + StringifyInt(num_proxy_failover) + "\n" +
+  "Number of host failovers: " + StringifyInt(num_host_failover) + "\n";
 }
 
 }  // namespace download

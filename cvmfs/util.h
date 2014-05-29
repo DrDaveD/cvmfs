@@ -19,6 +19,7 @@
 #include <map>
 #include <vector>
 #include <set>
+#include <gtest/gtest_prod.h>
 
 #include "murmur.h"
 #include "platform.h"
@@ -64,6 +65,7 @@ std::string GetParentPath(const std::string &path);
 PathString GetParentPath(const PathString &path);
 std::string GetFileName(const std::string &path);
 NameString GetFileName(const PathString &path);
+bool IsAbsolutePath(const std::string &path);
 
 void CreateFile(const std::string &path, const int mode);
 int MakeSocket(const std::string &path, const int mode);
@@ -129,6 +131,7 @@ bool SwitchCredentials(const uid_t uid, const gid_t gid,
 bool FileExists(const std::string &path);
 int64_t GetFileSize(const std::string &path);
 bool DirectoryExists(const std::string &path);
+bool SymlinkExists(const std::string &path);
 bool MkdirDeep(const std::string &path, const mode_t mode);
 bool MakeCacheDirectories(const std::string &path, const mode_t mode);
 FILE *CreateTempFile(const std::string &path_prefix, const int mode,
@@ -140,6 +143,9 @@ void UnlockFile(const int filedes);
 bool RemoveTree(const std::string &path);
 std::vector<std::string> FindFiles(const std::string &dir,
                                    const std::string &suffix);
+bool GetUidOf(const std::string &username, uid_t *uid, gid_t *main_gid);
+bool GetGidOf(const std::string &groupname, gid_t *gid);
+bool AddGroup2Persona(const gid_t gid);
 
 std::string StringifyBool(const bool value);
 std::string StringifyInt(const int64_t value);
@@ -290,8 +296,10 @@ class MemoryMappedFile : SingleCopy {
  *                          polymorphically constructed by this factory
  * @param ParameterT        the type of the parameter that is used to figure out
  *                          which class should be instanciated at runtime
+ * @param InfoT             wrapper type for introspection data of registered
+ *                          plugins
  */
-template <class AbstractProductT, typename ParameterT>
+template <class AbstractProductT, typename ParameterT, typename InfoT>
 class AbstractFactory {
  public:
   AbstractFactory() {}
@@ -299,12 +307,13 @@ class AbstractFactory {
 
   virtual bool WillHandle(const ParameterT &param) const = 0;
   virtual AbstractProductT* Construct(const ParameterT &param) const = 0;
+  virtual InfoT Introspect() const = 0;
 };
 
 
 /**
- * Concrete (but templated) implementation of the AbstractFactory template to
- * wrap the creation of a specific class instance. Namely ConcreteProductT.
+ * Implementation of the AbstractFactory template to wrap the creation of a
+ * specific class instance. Namely ConcreteProductT. (Note: still abstract)
  * See the description of PolymorphicCreation for more details
  *
  * @param ConcreteProductT  the class that will be instanciated by this factory
@@ -312,9 +321,17 @@ class AbstractFactory {
  * @param AbstractProductT  the base class of all used ConcreteProductT classes
  * @param ParameterT        the type of the parameter that is used to poly-
  *                          morphically create a specific ConcreteProductT
+ * @param InfoT             wrapper type for introspection data of registered
+ *                          plugins
  */
-template <class ConcreteProductT, class AbstractProductT, typename ParameterT>
-class AbstractFactoryImpl : public AbstractFactory<AbstractProductT, ParameterT> {
+template <class ConcreteProductT,
+          class AbstractProductT,
+          typename ParameterT,
+          typename InfoT>
+class AbstractFactoryImpl2 : public AbstractFactory<AbstractProductT,
+                                                    ParameterT,
+                                                    InfoT>
+{
  public:
   inline bool WillHandle(const ParameterT &param) const {
     return ConcreteProductT::WillHandle(param);
@@ -325,6 +342,46 @@ class AbstractFactoryImpl : public AbstractFactory<AbstractProductT, ParameterT>
   }
 };
 
+
+/**
+ * Template to add an implementation of Introspect() based on the type of InfoT.
+ * Generally Introspect() will call ConcreteProductT::GetInfo() and return it's
+ * result. However if InfoT = void, this method still needs to be stubbed.
+ * (See also the template specialization for InfoT = void below)
+ */
+template <class ConcreteProductT,
+          class AbstractProductT,
+          typename ParameterT,
+          typename InfoT>
+class AbstractFactoryImpl :
+  public AbstractFactoryImpl2<ConcreteProductT,
+                              AbstractProductT,
+                              ParameterT,
+                              InfoT>
+{
+  inline InfoT Introspect() const {
+    return ConcreteProductT::GetInfo();
+  }
+};
+
+/**
+ * Template specialization for InfoT = void that only stubs the abstract method
+ * Introspect().
+ */
+template <class ConcreteProductT,
+          class AbstractProductT,
+          typename ParameterT>
+class AbstractFactoryImpl<ConcreteProductT,
+                          AbstractProductT,
+                          ParameterT,
+                          void> :
+  public AbstractFactoryImpl2<ConcreteProductT,
+                              AbstractProductT,
+                              ParameterT,
+                              void>
+{
+  inline void Introspect() const {}
+};
 
 /**
  * Template to simplify the polymorphic creation of a number of concrete classes
@@ -345,6 +402,9 @@ class AbstractFactoryImpl : public AbstractFactory<AbstractProductT, ParameterT>
  *     virtual method `bool Initialize()` which will be called directly after
  *     creation of a ConcreteProductT. If it returns false, the constructed in-
  *     stance is deleted and the list of plugins is traversed further.
+ *  5. (OPTIONAL) The ConcreteProductTs can implement a `static InfoT GetInfo()`
+ *     that can be used for run-time introspection of registered plugins using
+ *     PolymorphicConstruction<AbstractProductT, ParameterT, InfoT>::Introspect()
  *
  * A possible class hierarchy could look like this:
  *
@@ -382,22 +442,21 @@ class AbstractFactoryImpl : public AbstractFactory<AbstractProductT, ParameterT>
  * @param ParameterT        the type of the parameter that is used to poly-
  *                          morphically instantiate one of the subclasses of
  *                          AbstractProductT
+ * @param InfoT             (optional) wrapper type for introspection data of
+ *                          registered plugins. InfoT AbstractProductT::GetInfo()
+ *                          needs to be implemented for each plugin
  */
-template <class AbstractProductT, typename ParameterT>
-class PolymorphicConstruction {
- private:
-  typedef AbstractFactory<AbstractProductT, ParameterT> Factory;
+template <class AbstractProductT, typename ParameterT, typename InfoT>
+class PolymorphicConstructionImpl {
+ protected:
+  typedef AbstractFactory<AbstractProductT, ParameterT, InfoT> Factory;
   typedef std::vector<Factory*> RegisteredPlugins;
 
  public:
-  virtual ~PolymorphicConstruction() {};
+  virtual ~PolymorphicConstructionImpl() {};
 
   static AbstractProductT* Construct(const ParameterT &param) {
-    // lazy registration of plugins
-    if (registered_plugins_.empty()) {
-      AbstractProductT::RegisterPlugins();
-    }
-    assert (!registered_plugins_.empty());
+    LazilyRegisterPlugins();
 
     // select and initialize the correct plugin at runtime
     // (polymorphic construction)
@@ -420,27 +479,237 @@ class PolymorphicConstruction {
   }
 
  protected:
+  static void LazilyRegisterPlugins() {
+    // Thread Safety Note:
+    //   Double Checked Locking with atomics!
+    //   Simply double checking registered_plugins_.empty() is _not_ thread safe
+    //   since a second thread might find a registered_plugins_ list that is
+    //   currently under construction and therefore _not_ empty but also _not_
+    //   fully initialized!
+    // See StackOverflow: http://stackoverflow.com/questions/8097439/lazy-initialized-caching-how-do-i-make-it-thread-safe
+    if(atomic_read32(&needs_init_)) {
+      pthread_mutex_lock(&init_mutex_);
+      if(atomic_read32(&needs_init_)) {
+        AbstractProductT::RegisterPlugins();
+        atomic_dec32(&needs_init_);
+      }
+      pthread_mutex_unlock(&init_mutex_);
+    }
+
+    assert (!registered_plugins_.empty());
+  }
+
+  /**
+   * Friend class for testability (see test/unittests/testutil.h)
+   */
+  friend class PolymorphicConstructionUnittestAdapter;
+
+  /**
+   * Registers a plugin that is polymorphically constructable afterwards.
+   * Warning: Multiple registrations of the same ConcreteProductT might lead to
+   *          undefined behaviour!
+   *
+   * @param ConcreteProductT  the concrete implementation of AbstractProductT
+   *                          that should be registered as constructable.
+   *
+   * Note: You shall not need to use this method anywhere in your code
+   *       except in AbstractProductT::RegisterPlugins().
+   */
   template <class ConcreteProductT>
   static void RegisterPlugin() {
     registered_plugins_.push_back(
       new AbstractFactoryImpl<ConcreteProductT,
                               AbstractProductT,
-                              ParameterT>()
+                              ParameterT,
+                              InfoT>()
     );
   }
 
   virtual bool Initialize() { return true; };
 
  private:
+  /**
+   * This method clears the list of registered plugins.
+   * Note: A user of PolymorphicConstruction is _not_ supposed to use this! The
+   *       method is meant to be used solely for testing purposes! In particular
+   *       a unit test registering a mocked plugin is supposed to clear up after
+   *       _each_ unit test! see: gtest: SetUp() / TearDown() and
+   *                              PolymorphicConstructionUnittestAdapter
+   *
+   *       DO NOT USE THIS OUTSIDE UNIT TESTS!!
+   *       -> Global state is nasty!
+   */
+  static void UnregisterAllPlugins() {
+    registered_plugins_.clear();
+    needs_init_ = 1;
+  }
+
+ protected:
   static RegisteredPlugins registered_plugins_;
+
+ private:
+  static atomic_int32      needs_init_;
+  static pthread_mutex_t   init_mutex_;
 };
 
-// init the static member registered_plugins_ inside the PolymorphicConstruction
-// template... whoa, what ugly code :o)
-template <class AbstractProductT, typename ParameterT>
-typename PolymorphicConstruction<AbstractProductT, ParameterT>::RegisteredPlugins
-PolymorphicConstruction<AbstractProductT, ParameterT>::registered_plugins_;
 
+/**
+ * Interface template for PolymorphicConstruction.
+ * This adds the static method Introspect() to each PolymorphicConstruction type
+ * implementation if (and only if) InfoT is not void.
+ * Backward compatibility: if InfoT is not defined (i.e. is void), Introspect()
+ *                         is not defined at all! (see template specialization)
+ */
+template <class AbstractProductT, typename ParameterT, typename InfoT = void>
+class PolymorphicConstruction :
+       public PolymorphicConstructionImpl<AbstractProductT, ParameterT, InfoT> {
+ private:
+  typedef PolymorphicConstructionImpl<AbstractProductT, ParameterT, InfoT> T;
+  typedef typename T::RegisteredPlugins RegisteredPlugins;
+
+ public:
+  typedef std::vector<InfoT> IntrospectionData;
+
+  static IntrospectionData Introspect() {
+    IntrospectionData introspection_data;
+    introspection_data.reserve(T::registered_plugins_.size());
+    const RegisteredPlugins &plugins = T::registered_plugins_;
+
+    T::LazilyRegisterPlugins();
+    typename RegisteredPlugins::const_iterator i    = plugins.begin();
+    typename RegisteredPlugins::const_iterator iend = plugins.end();
+    for (; i != iend; ++i) {
+      introspection_data.push_back((*i)->Introspect());
+    }
+
+    return introspection_data;
+  }
+};
+
+/**
+ * Template specialization for backward compatibility that _does not_ implement
+ * a static Introspect() method when the InfoT parameter is not given or is void
+ */
+template <class AbstractProductT, typename ParameterT>
+class PolymorphicConstruction<AbstractProductT, ParameterT, void> :
+      public PolymorphicConstructionImpl<AbstractProductT, ParameterT, void> {};
+
+
+
+template <class AbstractProductT, typename ParameterT, typename InfoT>
+atomic_int32
+PolymorphicConstructionImpl<AbstractProductT, ParameterT, InfoT>::needs_init_ = 1;
+
+template <class AbstractProductT, typename ParameterT, typename InfoT>
+pthread_mutex_t
+PolymorphicConstructionImpl<AbstractProductT, ParameterT, InfoT>::init_mutex_ =
+                                                      PTHREAD_MUTEX_INITIALIZER;
+
+// init the static member registered_plugins_ inside the PolymorphicConstructionImpl
+// template... whoa, what ugly code :o)
+template <class AbstractProductT, typename ParameterT, typename InfoT>
+typename PolymorphicConstructionImpl<AbstractProductT, ParameterT, InfoT>::RegisteredPlugins
+PolymorphicConstructionImpl<AbstractProductT, ParameterT, InfoT>::registered_plugins_;
+
+
+/**
+ * Wrapper function to bind an arbitrary this* to a method call in a C-style
+ * spawned thread function.
+ * The method called by the ThreadProxy template is meant to look like this:
+ *   void foo();
+ */
+template <class DelegateT>
+void ThreadProxy(DelegateT        *delegate,
+                 void (DelegateT::*method)()) {
+  (*delegate.*method)();
+}
+
+
+template<typename T, class A = std::allocator<T> >
+class Buffer {
+ public:
+  typedef typename A::pointer pointer_t;
+
+  Buffer() : used_(0), size_(0), buffer_(NULL), initialized_(false) {}
+
+  Buffer(const size_t size) : used_(0), size_(0), buffer_(NULL),
+                              initialized_(false)
+  {
+    Allocate(size);
+  }
+
+  virtual ~Buffer() {
+    Deallocate();
+  }
+
+  void Allocate(const size_t size) {
+    assert (!IsInitialized());
+    size_        = size;
+    buffer_      = allocator_.allocate(size_bytes());
+    initialized_ = true;
+  }
+
+  bool IsInitialized() const { return initialized_; }
+
+  typename A::pointer ptr() {
+    assert (IsInitialized());
+    return buffer_;
+  }
+  const typename A::pointer ptr() const {
+    assert (IsInitialized());
+    return buffer_;
+  }
+
+  typename A::pointer free_space_ptr() {
+    assert (IsInitialized());
+    return buffer_ + used();
+  }
+
+  const typename A::pointer free_space_ptr() const {
+    assert (IsInitialized());
+    return buffer_ + used();
+  }
+
+  void SetUsed(const size_t items) {
+    assert (items <= size());
+    used_ = items;
+  }
+
+  void SetUsedBytes(const size_t bytes) {
+    assert (bytes <= size_bytes());
+    assert (bytes % sizeof(T) == 0);
+    used_ = bytes / sizeof(T);
+  }
+
+  size_t size()        const { return size_;              }
+  size_t size_bytes()  const { return size_ * sizeof(T);  }
+  size_t used()        const { return used_;              }
+  size_t used_bytes()  const { return used_ * sizeof(T);  }
+  size_t free()        const { return size_ - used_;      }
+  size_t free_bytes()  const { return free() * sizeof(T); }
+
+ private:
+  Buffer(const Buffer &other) { assert (false); } // no copy!
+  Buffer& operator=(const Buffer& other) { assert (false); }
+
+  void Deallocate() {
+    if (size_ == 0) {
+      return;
+    }
+    allocator_.deallocate(buffer_, size_bytes());
+    buffer_      = NULL;
+    size_        = 0;
+    used_        = 0;
+    initialized_ = false;
+  }
+
+ private:
+  A                    allocator_;
+  size_t               used_;
+  size_t               size_;
+  typename A::pointer  buffer_;
+  bool                 initialized_;
+};
 
 #ifdef CVMFS_NAMESPACE_GUARD
 }

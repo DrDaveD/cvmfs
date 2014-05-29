@@ -50,6 +50,46 @@ class Lockable : SingleCopy {
 // -----------------------------------------------------------------------------
 //
 
+/**
+ * Used to allow for static polymorphism in the RAII template to statically
+ * decide which 'lock' functions to use, if we have more than one possiblity.
+ * (I.e. Read/Write locks)
+ * Note: Static Polymorphism - Strategy Pattern
+ *
+ * TODO: eventually replace this by C++11 typed enum
+ */
+struct _RAII_Polymorphism {
+  enum T {
+    None,
+    ReadLock,
+    WriteLock
+  };
+};
+
+
+/**
+ * Basic template wrapper class for any kind of RAII-like behavior.
+ * The user is supposed to provide a template specialization of Enter() and
+ * Leave(). On creation of the RAII object it will call Enter() respectively
+ * Leave() on destruction. The gold standard example is a LockGard (see below).
+ *
+ * Note: Resource Acquisition Is Initialization (Bjarne Stroustrup)
+ */
+template <typename T, _RAII_Polymorphism::T P = _RAII_Polymorphism::None>
+class RAII : SingleCopy {
+ public:
+  inline RAII(T &object) : ref_(object)  { Enter(); }
+  inline RAII(T *object) : ref_(*object) { Enter(); }
+  inline ~RAII()                         { Leave(); }
+
+ protected:
+  inline void Enter() { ref_.Lock();   }
+  inline void Leave() { ref_.Unlock(); }
+
+ private:
+  T &ref_;
+};
+
 
 /**
  * This is a simple scoped lock implementation. Every object that provides the
@@ -60,95 +100,45 @@ class Lockable : SingleCopy {
  * the LockGuard runs out of scope it will automatically release the lock. This
  * ensures a clean unlock in a lot of situations!
  *
- * Note: Resource Acquisition Is Initialization (Bjarne Stroustrup)
+ * TODO: C++11 replace this by a type alias to RAII
  */
 template <typename LockableT>
-class LockGuard : SingleCopy {
+class LockGuard : public RAII<LockableT> {
  public:
-  inline LockGuard(const LockableT &lock) :
-    ref_(lock) { ref_.Lock(); }
-  inline LockGuard(const LockableT *lock) :
-    ref_(*lock) { ref_.Lock(); }
-  inline ~LockGuard() { ref_.Unlock(); }
-
- private:
-  const LockableT &ref_;
+  inline LockGuard(LockableT &object) : RAII<LockableT>(object) {}
+  inline LockGuard(LockableT *object) : RAII<LockableT>(object) {}
 };
 
-/**
- * Used to allow for static polymorphism in the LockGuardAdapter to statically
- * decide which lock functions to use, if we have more than one possiblity.
- * (I.e. Read/Write locks)
- *
- * TODO: eventually replace this by C++11 typed enum
- */
-struct _LGA_Polymorphism {
-  enum T {
-    None,
-    ReadLock,
-    WriteLock
-  };
-};
 
-/**
- * Wraps lockable objects that do not conform to the Lock()/Unlock() interface
- * but use something different. For example pthread_mutex_t can be used with our
- * LockGuard template by the help of this little adapter template
- *
- * Additionally this adapter allows for static (say: compile time) polymorphism
- * to allow the use locks with multiple lock functions (i.e. pthread_rwlock_t)
- *
- * In order to implement new locking capabilities simply specialize the template
- * for your lock type and provide the needed adapter.
- */
-template <typename T,
-          _LGA_Polymorphism::T polymorph = _LGA_Polymorphism::None>
-class LockGuardAdapter : SingleCopy {
- public:
-  inline LockGuardAdapter(T &lock) : ref_(&lock) {};
-  inline LockGuardAdapter(T *lock) : ref_(lock)  {};
-  inline void Lock() const;
-  inline void Unlock() const;
+template <>
+inline void RAII<pthread_mutex_t>::Enter() { pthread_mutex_lock(&ref_);   }
+template <>
+inline void RAII<pthread_mutex_t>::Leave() { pthread_mutex_unlock(&ref_); }
+typedef RAII<pthread_mutex_t> MutexLockGuard;
 
- private:
-  mutable T *ref_;
-};
 
-template <> /// Locks a pthread_mutex_t
-inline void LockGuardAdapter<pthread_mutex_t>::Lock() const {
-  pthread_mutex_lock(ref_);
+template <>
+inline void RAII<pthread_rwlock_t,
+                 _RAII_Polymorphism::ReadLock>::Enter() {
+  pthread_rwlock_rdlock(&ref_);
 }
-template <> /// Unlocks a pthread_mutex_t
-inline void LockGuardAdapter<pthread_mutex_t>::Unlock() const {
-  pthread_mutex_unlock(ref_);
+template <>
+inline void RAII<pthread_rwlock_t,
+                 _RAII_Polymorphism::ReadLock>::Leave() {
+  pthread_rwlock_unlock(&ref_);
 }
-template <> /// Read-Locks a pthread_rwlock_t
-inline void LockGuardAdapter<pthread_rwlock_t,
-                             _LGA_Polymorphism::ReadLock>::Lock() const {
-  pthread_rwlock_rdlock(ref_);
+template <>
+inline void RAII<pthread_rwlock_t,
+                 _RAII_Polymorphism::WriteLock>::Enter() {
+  pthread_rwlock_wrlock(&ref_);
 }
-template <> /// Read-Unlocks a pthread_rwlock_t
-inline void LockGuardAdapter<pthread_rwlock_t,
-                             _LGA_Polymorphism::ReadLock>::Unlock() const {
-  pthread_rwlock_unlock(ref_);
+template <>
+inline void RAII<pthread_rwlock_t,
+                 _RAII_Polymorphism::WriteLock>::Leave() {
+  pthread_rwlock_unlock(&ref_);
 }
-template <> /// Write-Locks a pthread_rwlock_t
-inline void LockGuardAdapter<pthread_rwlock_t,
-                             _LGA_Polymorphism::WriteLock>::Lock() const {
-  pthread_rwlock_wrlock(ref_);
-}
-template <> /// Read-Unlocks a pthread_rwlock_t
-inline void LockGuardAdapter<pthread_rwlock_t,
-                             _LGA_Polymorphism::WriteLock>::Unlock() const {
-  pthread_rwlock_unlock(ref_);
-}
-
-// convenience typedefs to use special locks with the LockGuard template
-typedef LockGuard<LockGuardAdapter<pthread_mutex_t> > MutexLockGuard;
-typedef LockGuard<LockGuardAdapter<pthread_rwlock_t,
-                                   _LGA_Polymorphism::ReadLock> > ReadLockGuard;
-typedef LockGuard<LockGuardAdapter<pthread_rwlock_t,
-                                   _LGA_Polymorphism::WriteLock> > WriteLockGuard;
+typedef RAII<pthread_rwlock_t, _RAII_Polymorphism::ReadLock>  ReadLockGuard;
+typedef RAII<pthread_rwlock_t, _RAII_Polymorphism::WriteLock> WriteLockGuard;
 
 
 //
@@ -197,6 +187,97 @@ class Future : SingleCopy {
   mutable pthread_mutex_t mutex_;
   mutable pthread_cond_t  object_set_;
   bool                    object_was_set_;
+};
+
+
+//
+// -----------------------------------------------------------------------------
+//
+
+
+/**
+ * This counter can be counted up and down using the usual increment/decrement
+ * operators. It allows threads to wait for it to become zero as well as to
+ * block when a specified maximal value would be exceeded by an increment.
+ *
+ * Note: If a maximal value is specified on creation, the SynchronizingCounter
+ *       is assumed to never leave the interval [0, maximal_value]! Otherwise
+ *       the numerical limits of the specified template parameter define this
+ *       interval and an increment _never_ blocks.
+ *
+ * Caveat: This implementation uses a simple mutex mechanism and therefore might
+ *         become a scalability bottle neck!
+ */
+template <typename T>
+class SynchronizingCounter : SingleCopy {
+ public:
+  SynchronizingCounter() :
+    value_(T(0)), maximal_value_(T(0)) { Initialize(); }
+
+  SynchronizingCounter(const T maximal_value) :
+    value_(T(0)), maximal_value_(maximal_value)
+  {
+    assert (maximal_value > T(0));
+    Initialize();
+  }
+
+  ~SynchronizingCounter() { Destroy(); }
+
+  T Increment() {
+    MutexLockGuard l(mutex_);
+    WaitForFreeSlotUnprotected();
+    SetValueUnprotected(value_ + T(1));
+    return value_;
+  }
+
+  T Decrement() {
+    MutexLockGuard l(mutex_);
+    SetValueUnprotected(value_ - T(1));
+    return value_;
+  }
+
+  void WaitForZero() const {
+    MutexLockGuard l(mutex_);
+    while (value_ != T(0)) {
+      pthread_cond_wait(&became_zero_, &mutex_);
+    }
+    assert (value_ == T(0));
+  }
+
+  bool HasMaximalValue() const { return maximal_value_ != T(0); }
+  T      maximal_value() const { return maximal_value_;         }
+
+  T operator++()    { return Increment();        }
+  T operator++(int) { return Increment() - T(1); }
+  T operator--()    { return Decrement();        }
+  T operator--(int) { return Decrement() + T(1); }
+
+  operator T() const {
+    MutexLockGuard l(mutex_);
+    return value_;
+  }
+
+  SynchronizingCounter<T>& operator=(const T &other) {
+    MutexLockGuard l(mutex_);
+    SetValueUnprotected(other);
+    return *this;
+  }
+
+ protected:
+  void SetValueUnprotected(const T new_value);
+  void WaitForFreeSlotUnprotected();
+
+ private:
+  void Initialize();
+  void Destroy();
+
+ private:
+        T                 value_;
+  const T                 maximal_value_;
+
+  mutable pthread_mutex_t mutex_;
+  mutable pthread_cond_t  became_zero_;
+          pthread_cond_t  free_slot_;
 };
 
 
@@ -280,6 +361,50 @@ class BoundCallback : public CallbackBase<ParamT> {
 };
 
 
+/**
+ * A BoundClosure works exactly the same as a BoundCallback (see above) but,
+ * allows for an opaque enclosure of an arbitrary chunk of user data on
+ * creation. When the closure is invoked the provided user data chunk is
+ * passed as a second argument to the specified callback method.
+ *
+ * Note: delegate must be still around when the closure is invoked!
+ *
+ * @param ParamT        the type of the parameter to be passed to the callback
+ * @param DelegateT     the <class name> of the object the member <member name>
+ *                      should be invoked in
+ * @param ClosureDataT  the type of the user data chunk to be passed on invoke
+ */
+template <typename ParamT, class DelegateT, typename ClosureDataT>
+class BoundClosure : public CallbackBase<ParamT> {
+ public:
+  typedef void (DelegateT::*CallbackMethod)(const ParamT        &value,
+                                            const ClosureDataT   closure_data);
+
+ public:
+  BoundClosure(CallbackMethod  method,
+               DelegateT      *delegate,
+               ClosureDataT    data) :
+    delegate_(delegate),
+    method_(method),
+    closure_data_(data) {}
+  BoundClosure(CallbackMethod  method,
+               DelegateT      &delegate,
+               ClosureDataT    data) :
+    delegate_(&delegate),
+    method_(method),
+    closure_data_(data) {}
+
+  void operator()(const ParamT &value) const {
+    (delegate_->*method_)(value, closure_data_);
+  }
+
+ private:
+  DelegateT*          delegate_;
+  CallbackMethod      method_;
+  const ClosureDataT  closure_data_;
+};
+
+
 template <class ParamT>
 class Callbackable {
  public:
@@ -287,6 +412,15 @@ class Callbackable {
 
  public:
   // replace this stuff by C++11 lambdas!
+  template <class DelegateT, typename ClosureDataT>
+  static callback_t* MakeClosure(
+      typename BoundClosure<ParamT, DelegateT, ClosureDataT>::CallbackMethod method,
+      DelegateT           *delegate,
+      const ClosureDataT  &closure_data) {
+    return new BoundClosure<ParamT, DelegateT, ClosureDataT>(method,
+                                                             delegate,
+                                                             closure_data);
+  }
   template <class DelegateT>
   static callback_t* MakeCallback(
         typename BoundCallback<ParamT, DelegateT>::CallbackMethod method,

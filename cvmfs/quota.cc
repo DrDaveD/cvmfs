@@ -29,6 +29,7 @@
 #include <inttypes.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <dirent.h>
 
 #include <cassert>
 #include <cstdlib>
@@ -54,6 +55,7 @@ using namespace std;  // NOLINT
 namespace quota {
 
 const uint32_t kProtocolRevision = 1;  // Start of keeping revisions
+const uint64_t kVolatileFlag = 1ULL << 63;
 
 static void GetLimits(uint64_t *limit, uint64_t *cleanup_threshold);
 
@@ -83,15 +85,54 @@ enum CommandType {
   kRegisterBackChannel,
   kUnregisterBackChannel,
   kGetProtocolRevision,
+  kInsertVolatile,
 };
 
+/**
+ * That could be done in more elegant way.  However, we might have a situation
+ * with old cache manager serving new clients (or vice versa) and we don't want
+ * to change the memory layout of LruCommand.
+ */
 struct LruCommand {
   CommandType command_type;
-  uint64_t size;
+  uint64_t size;    // Careful! Last 3 bits store hash algorithm
   int return_pipe;  // For cleanup, listing, and reservations
-  unsigned char digest[hash::kMaxDigestSize];
+  unsigned char digest[shash::kMaxDigestSize];
   uint16_t path_length;  // Maximum 512-sizeof(LruCommand) in order to guarantee
                          // atomic pipe operations
+
+  LruCommand() : command_type(static_cast<CommandType>(0)),
+                 size(0), return_pipe(-1), path_length(0)
+  {
+    memset(digest, 0, shash::kMaxDigestSize);
+  }
+
+  void SetSize(const uint64_t new_size) {
+    uint64_t mask = 7;
+    mask = ~(mask << (64-3));
+    size = (new_size & mask) | size;
+  }
+
+  uint64_t GetSize() const {
+    uint64_t mask = 7;
+    mask = ~(mask << (64-3));
+    return size & mask;
+  }
+
+  void StoreHash(const shash::Any &hash) {
+    memcpy(digest, hash.digest, hash.GetDigestSize());
+    // Exclude MD5
+    uint64_t algo_flags = hash.algorithm - 1;
+    algo_flags = algo_flags << (64-3);
+    size |= algo_flags;
+  }
+
+  shash::Any RetrieveHash() const {
+    uint64_t algo_flags = size >> (64-3);
+    shash::Any result(static_cast<shash::Algorithms>(algo_flags+1));
+    memcpy(result.digest, digest, result.GetDigestSize());
+    return result;
+  }
 };
 
 /**
@@ -110,7 +151,7 @@ int pipe_lru_[2];
 bool shared_;
 bool spawned_;
 bool initialized_ = false;
-map<hash::Any, uint64_t> *pinned_chunks_ = NULL;
+map<shash::Any, uint64_t> *pinned_chunks_ = NULL;
 int fd_lock_cachedb_;
 uint32_t protocol_revision_ = 0;
 
@@ -124,11 +165,13 @@ uint64_t seq_;  /**< Current access sequence number.  Gets increased on every
                      access/insert operation. */
 string *cache_dir_ = NULL;
 /// Maps Md5 over channel id to writeable file descriptor.
-map<hash::Md5, int> *back_channels_ = NULL;
+map<shash::Md5, int> *back_channels_ = NULL;
 
 sqlite3 *db_ = NULL;
 sqlite3_stmt *stmt_touch_ = NULL;
 sqlite3_stmt *stmt_unpin_ = NULL;
+sqlite3_stmt *stmt_block_ = NULL;
+sqlite3_stmt *stmt_unblock_ = NULL;
 sqlite3_stmt *stmt_new_ = NULL;
 sqlite3_stmt *stmt_lru_ = NULL;
 sqlite3_stmt *stmt_size_ = NULL;
@@ -204,7 +247,7 @@ static void CloseReturnPipe(int pipe[2]) {
 static void BroadcastBackchannels(const string &message) {
   assert(message.length() > 0);
 
-  for (map<hash::Md5, int>::iterator i = back_channels_->begin(),
+  for (map<shash::Md5, int>::iterator i = back_channels_->begin(),
        iend = back_channels_->end(); i != iend; )
   {
     LogCvmfs(kLogQuota, kLogDebug, "broadcasting %s to %s",
@@ -219,7 +262,7 @@ static void BroadcastBackchannels(const string &message) {
       if (remove_backchannel) {
         LogCvmfs(kLogQuota, kLogDebug | kLogSyslogWarn,
                  "removing back channel %s", i->first.ToString().c_str());
-        map<hash::Md5, int>::iterator remove_me = i;
+        map<shash::Md5, int>::iterator remove_me = i;
         ++i;
         back_channels_->erase(remove_me);
       } else {
@@ -255,30 +298,41 @@ static bool DoCleanup(const uint64_t leave_size) {
     hash_str = string(reinterpret_cast<const char *>(
                       sqlite3_column_text(stmt_lru_, 0)));
     LogCvmfs(kLogQuota, kLogDebug, "removing %s", hash_str.c_str());
-    hash::Any hash(hash::kSha1, hash::HexPtr(
-      hash_str.substr(0, 2*hash::kDigestSizes[hash::kSha1])));
+    shash::Any hash = shash::MkFromHexPtr(shash::HexPtr(hash_str));
 
     // That's a critical condition.  We must not delete a not yet inserted
     // pinned file as it is already reserved (but will be inserted later).
-    // However, we must remove it temporarily from the cache database in order
-    // to not run into an endless loop
+    // Instead, set the pin bit in the db to not run into an endless loop
     if (pinned_chunks_->find(hash) == pinned_chunks_->end()) {
       trash.push_back((*cache_dir_) + hash.MakePath(1, 2));
       gauge_ -= sqlite3_column_int64(stmt_lru_, 1);
       LogCvmfs(kLogQuota, kLogDebug, "lru cleanup %s, new gauge %"PRIu64,
                hash_str.c_str(), gauge_);
-    }
 
-    sqlite3_bind_text(stmt_rm_, 1, &hash_str[0], hash_str.length(),
-                      SQLITE_STATIC);
-    result = (sqlite3_step(stmt_rm_) == SQLITE_DONE);
-    sqlite3_reset(stmt_rm_);
+      sqlite3_bind_text(stmt_rm_, 1, &hash_str[0], hash_str.length(),
+                        SQLITE_STATIC);
+      result = (sqlite3_step(stmt_rm_) == SQLITE_DONE);
+      sqlite3_reset(stmt_rm_);
 
-    if (!result) {
-      LogCvmfs(kLogQuota, kLogDebug, "could not remove lru-entry");
-      return false;
+      if (!result) {
+        LogCvmfs(kLogQuota, kLogDebug | kLogSyslogErr,
+                 "failed to find %s in cache database (%d). "
+                 "Cache database is out of sync.  Restart cvmfs with clean cache.",
+                 hash_str.c_str(), result);
+        return false;
+      }
+    } else {
+      sqlite3_bind_text(stmt_block_, 1, &hash_str[0], hash_str.length(),
+                        SQLITE_STATIC);
+      result = (sqlite3_step(stmt_block_) == SQLITE_DONE);
+      sqlite3_reset(stmt_block_);
+      assert(result);
     }
   } while (gauge_ > leave_size);
+
+  result = (sqlite3_step(stmt_unblock_) == SQLITE_DONE);
+  sqlite3_reset(stmt_unblock_);
+  assert(result);
 
   // Double fork avoids zombie, forked removal process must not flush file
   // buffers
@@ -302,7 +356,13 @@ static bool DoCleanup(const uint64_t leave_size) {
     }
   }
 
-  return gauge_ <= leave_size;
+  if (gauge_ > leave_size) {
+    LogCvmfs(kLogQuota, kLogDebug | kLogSyslogWarn,
+             "request to clean until %"PRIu64", but effective gauge is %"PRIu64,
+             leave_size, gauge_);
+    return false;
+  }
+  return true;
 }
 
 
@@ -339,10 +399,9 @@ static void ProcessCommandBunch(const unsigned num,
   assert(retval == SQLITE_OK);
 
   for (unsigned i = 0; i < num; ++i) {
-    const hash::Any hash(hash::kSha1, commands[i].digest,
-                         sizeof(commands[i].digest));
+    const shash::Any hash = commands[i].RetrieveHash();
     const string hash_str = hash.ToString();
-    const unsigned size = commands[i].size;
+    const unsigned size = commands[i].GetSize();
     LogCvmfs(kLogQuota, kLogDebug, "processing %s (%d)",
              hash_str.c_str(), commands[i].command_type);
 
@@ -380,6 +439,7 @@ static void ProcessCommandBunch(const unsigned num,
       case kPin:
       case kPinRegular:
       case kInsert:
+      case kInsertVolatile:
         // It could already be in, check
         exists = Contains(hash_str);
 
@@ -395,7 +455,11 @@ static void ProcessCommandBunch(const unsigned num,
         sqlite3_bind_text(stmt_new_, 1, &hash_str[0], hash_str.length(),
                           SQLITE_STATIC);
         sqlite3_bind_int64(stmt_new_, 2, size);
-        sqlite3_bind_int64(stmt_new_, 3, seq_++);
+        if (commands[i].command_type == kInsertVolatile) {
+          sqlite3_bind_int64(stmt_new_, 3, (seq_++) | kVolatileFlag);
+        } else {
+          sqlite3_bind_int64(stmt_new_, 3, seq_++);
+        }
         sqlite3_bind_text(stmt_new_, 4, &paths[i*kMaxCvmfsPath],
                           commands[i].path_length, SQLITE_STATIC);
         sqlite3_bind_int64(stmt_new_, 5, (commands[i].command_type == kPin) ?
@@ -404,7 +468,7 @@ static void ProcessCommandBunch(const unsigned num,
           ((commands[i].command_type == kPin) ||
            (commands[i].command_type == kPinRegular)) ? 1 : 0);
         retval = sqlite3_step(stmt_new_);
-        LogCvmfs(kLogQuota, kLogDebug, "insert or replace %s, pin %d: %d",
+        LogCvmfs(kLogQuota, kLogDebug, "insert or replace %s, method %d: %d",
                  hash_str.c_str(), commands[i].command_type, retval);
         if ((retval != SQLITE_DONE) && (retval != SQLITE_OK)) {
           LogCvmfs(kLogQuota, kLogSyslogErr,
@@ -422,7 +486,11 @@ static void ProcessCommandBunch(const unsigned num,
   }
 
   retval = sqlite3_exec(db_, "COMMIT", NULL, NULL, NULL);
-  assert(retval == SQLITE_OK);
+  if (retval != SQLITE_OK) {
+    LogCvmfs(kLogQuota, kLogSyslogErr,
+             "failed to commit to cachedb, error %d", retval);
+    abort();
+  }
 }
 
 
@@ -434,7 +502,7 @@ static void *MainCommandServer(void *data __attribute__((unused))) {
   LogCvmfs(kLogQuota, kLogDebug, "starting cache manager");
   sqlite3_soft_heap_limit(kSqliteMemPerThread);
 
-  back_channels_ = new map<hash::Md5, int>;
+  back_channels_ = new map<shash::Md5, int>;
   LruCommand command_buffer[kCommandBufferSize];
   char path_buffer[kCommandBufferSize*kMaxCvmfsPath];
   unsigned num_commands = 0;
@@ -444,11 +512,11 @@ static void *MainCommandServer(void *data __attribute__((unused))) {
   {
     const CommandType command_type = command_buffer[num_commands].command_type;
     LogCvmfs(kLogQuota, kLogDebug, "received command %d", command_type);
-    const uint64_t size = command_buffer[num_commands].size;
+    const uint64_t size = command_buffer[num_commands].GetSize();
 
     // Inserts and pins come with a cvmfs path
-    if ((command_type == kInsert) || (command_type == kPin) ||
-        (command_type == kPinRegular))
+    if ((command_type == kInsert) || (command_type == kInsertVolatile) ||
+        (command_type == kPin) || (command_type == kPinRegular))
     {
       const int path_length = command_buffer[num_commands].path_length;
       ReadPipe(pipe_lru_[0], &path_buffer[kMaxCvmfsPath*num_commands],
@@ -474,8 +542,7 @@ static void *MainCommandServer(void *data __attribute__((unused))) {
       if (return_pipe < 0)
         continue;
 
-      const hash::Any hash(hash::kSha1, command_buffer[num_commands].digest,
-                           sizeof(command_buffer[num_commands].digest));
+      const shash::Any hash = command_buffer[num_commands].RetrieveHash();
       const string hash_str(hash.ToString());
       LogCvmfs(kLogQuota, kLogDebug, "reserve %d bytes for %s",
                size, hash_str.c_str());
@@ -506,10 +573,10 @@ static void *MainCommandServer(void *data __attribute__((unused))) {
 
       UnlinkReturnPipe(command_buffer[num_commands].return_pipe);
       Block2Nonblock(return_pipe);  // back channels are opportunistic
-      hash::Md5 hash;
+      shash::Md5 hash;
       memcpy(hash.digest, command_buffer[num_commands].digest,
-             hash::kDigestSizes[hash::kMd5]);
-      map<hash::Md5, int>::const_iterator iter = back_channels_->find(hash);
+             shash::kDigestSizes[shash::kMd5]);
+      map<shash::Md5, int>::const_iterator iter = back_channels_->find(hash);
       if (iter != back_channels_->end()) {
         LogCvmfs(kLogQuota, kLogDebug | kLogSyslogWarn,
                  "closing left-over back channel %s", hash.ToString().c_str());
@@ -525,10 +592,10 @@ static void *MainCommandServer(void *data __attribute__((unused))) {
     }
 
     if (command_type == kUnregisterBackChannel) {
-      hash::Md5 hash;
+      shash::Md5 hash;
       memcpy(hash.digest, command_buffer[num_commands].digest,
-             hash::kDigestSizes[hash::kMd5]);
-      map<hash::Md5, int>::iterator iter = back_channels_->find(hash);
+             shash::kDigestSizes[shash::kMd5]);
+      map<shash::Md5, int>::iterator iter = back_channels_->find(hash);
       if (iter != back_channels_->end()) {
         LogCvmfs(kLogQuota, kLogDebug,
                  "closing back channel %s", hash.ToString().c_str());
@@ -543,11 +610,10 @@ static void *MainCommandServer(void *data __attribute__((unused))) {
 
     // Unpinnings are also handled immediately with respect to the pinned gauge
     if (command_type == kUnpin) {
-      const hash::Any hash(hash::kSha1, command_buffer[num_commands].digest,
-                           sizeof(command_buffer[num_commands].digest));
+      const shash::Any hash = command_buffer[num_commands].RetrieveHash();
       const string hash_str(hash.ToString());
 
-      map<hash::Any, uint64_t>::iterator iter = pinned_chunks_->find(hash);
+      map<shash::Any, uint64_t>::iterator iter = pinned_chunks_->find(hash);
       if (iter != pinned_chunks_->end()) {
         pinned_ -= iter->second;
         pinned_chunks_->erase(iter);
@@ -583,8 +649,7 @@ static void *MainCommandServer(void *data __attribute__((unused))) {
       sqlite3_stmt *this_stmt_list = NULL;
       switch (command_type) {
         case kRemove: {
-          const hash::Any hash(hash::kSha1, command_buffer[num_commands].digest,
-                               sizeof(command_buffer[num_commands].digest));
+          const shash::Any hash = command_buffer[num_commands].RetrieveHash();
           const string hash_str = hash.ToString();
           LogCvmfs(kLogQuota, kLogDebug, "manually removing %s",
                    hash_str.c_str());
@@ -608,8 +673,8 @@ static void *MainCommandServer(void *data __attribute__((unused))) {
                 pinned_ -= size;
               }
             } else {
-              LogCvmfs(kLogQuota, kLogDebug, "could not delete %s, error %d",
-                       hash_str.c_str(), retval);
+              LogCvmfs(kLogQuota, kLogDebug | kLogSyslogErr,
+                       "failed to delete %s (%d)", hash_str.c_str(), retval);
             }
             sqlite3_reset(stmt_rm_);
           } else {
@@ -677,10 +742,10 @@ static void *MainCommandServer(void *data __attribute__((unused))) {
 
   // Unpin
   command_buffer[0].command_type = kTouch;
-  for (map<hash::Any, uint64_t>::const_iterator i = pinned_chunks_->begin(),
+  for (map<shash::Any, uint64_t>::const_iterator i = pinned_chunks_->begin(),
        iEnd = pinned_chunks_->end(); i != iEnd; ++i)
   {
-    memcpy(command_buffer[0].digest, i->first.digest, i->first.GetDigestSize());
+    command_buffer[0].StoreHash(i->first);
     ProcessCommandBunch(1, command_buffer, path_buffer);
   }
   delete back_channels_;
@@ -698,12 +763,13 @@ void RegisterBackChannel(int back_channel[2], const string &channel_id) {
   assert(initialized_);
 
   if ((limit_ != 0) && (protocol_revision_ >= 1)) {
-    hash::Md5 hash = hash::Md5(hash::AsciiPtr(channel_id));
+    shash::Md5 hash = shash::Md5(shash::AsciiPtr(channel_id));
     MakeReturnPipe(back_channel);
 
     LruCommand cmd;
     cmd.command_type = kRegisterBackChannel;
     cmd.return_pipe = back_channel[1];
+    // Not StoreHash().  This is an MD5 hash.
     memcpy(cmd.digest, hash.digest, hash.GetDigestSize());
     WritePipe(pipe_lru_[1], &cmd, sizeof(cmd));
 
@@ -729,10 +795,11 @@ void UnregisterBackChannel(int back_channel[2], const string &channel_id) {
   assert(initialized_);
 
   if ((limit_ != 0) && (protocol_revision_ >= 1)) {
-    hash::Md5 hash = hash::Md5(hash::AsciiPtr(channel_id));
+    shash::Md5 hash = shash::Md5(shash::AsciiPtr(channel_id));
 
     LruCommand cmd;
     cmd.command_type = kUnregisterBackChannel;
+    // Not StoreHash().  This is an MD5 hash.
     memcpy(cmd.digest, hash.digest, hash.GetDigestSize());
     WritePipe(pipe_lru_[1], &cmd, sizeof(cmd));
 
@@ -782,7 +849,6 @@ bool RebuildDatabase() {
   platform_dirent64 *d;
   DIR *dirp = NULL;
   string path;
-  set<string> catalogs;
 
   LogCvmfs(kLogQuota, kLogSyslog | kLogDebug, "re-building cache-database");
 
@@ -795,31 +861,6 @@ bool RebuildDatabase() {
   }
 
   gauge_ = 0;
-
-  // Gather file catalog hash values
-  // TODO: distiction does not exist anymore
-  if ((dirp = opendir(cache_dir_->c_str())) == NULL) {
-    LogCvmfs(kLogQuota, kLogDebug, "failed to open directory %s", path.c_str());
-    goto build_return;
-  }
-  while ((d = platform_readdir(dirp)) != NULL) {
-    if (d->d_type != DT_REG) continue;
-
-    const string name = d->d_name;
-    if (name.substr(0, 14) == "cvmfs.checksum") {
-      FILE *f = fopen(((*cache_dir_) + "/" + name).c_str(), "r");
-      if (f != NULL) {
-        char sha1[40];
-        if (fread(sha1, 1, 40, f) == 40) {
-          LogCvmfs(kLogQuota, kLogDebug, "added %s to catalog list",
-                   string(sha1, 40).c_str());
-          catalogs.insert(string(sha1, 40).c_str());
-        }
-        fclose(f);
-      }
-    }
-  }
-  closedir(dirp);
 
   // Insert files from cache sub-directories 00 - ff
   sqlite3_prepare_v2(db_, "INSERT INTO fscache (sha1, size, actime) "
@@ -838,8 +879,8 @@ bool RebuildDatabase() {
       if (d->d_type != DT_REG) continue;
 
       if (stat((path + "/" + string(d->d_name)).c_str(), &info) == 0) {
-        string sha1 = string(hex) + string(d->d_name);
-        sqlite3_bind_text(stmt_insert, 1, sha1.c_str(), sha1.length(),
+        string hash = string(hex) + string(d->d_name);
+        sqlite3_bind_text(stmt_insert, 1, hash.data(), hash.length(),
                           SQLITE_STATIC);
         sqlite3_bind_int64(stmt_insert, 2, info.st_size);
         sqlite3_bind_int64(stmt_insert, 3, info.st_atime);
@@ -869,15 +910,13 @@ bool RebuildDatabase() {
     "VALUES (:sha1, :s, :seq, 'unknown (automatic rebuild)', :t, 0);",
     -1, &stmt_insert, NULL);
   while (sqlite3_step(stmt_select) == SQLITE_ROW) {
-    const string sha1 = string(
+    const string hash = string(
       reinterpret_cast<const char *>(sqlite3_column_text(stmt_select, 0)));
-    sqlite3_bind_text(stmt_insert, 1, &sha1[0], sha1.length(), SQLITE_STATIC);
+    sqlite3_bind_text(stmt_insert, 1, &hash[0], hash.length(), SQLITE_STATIC);
     sqlite3_bind_int64(stmt_insert, 2, sqlite3_column_int64(stmt_select, 1));
     sqlite3_bind_int64(stmt_insert, 3, seq++);
-    if (catalogs.find(sha1) != catalogs.end())
-      sqlite3_bind_int64(stmt_insert, 4, kFileCatalog);
-    else
-      sqlite3_bind_int64(stmt_insert, 4, kFileRegular);
+    sqlite3_bind_int64(stmt_insert, 4, kFileRegular); // might also be a catalog
+                                                      // (information is lost)
 
     if (sqlite3_step(stmt_insert) != SQLITE_DONE) {
       LogCvmfs(kLogQuota, kLogDebug, "could not insert into cache catalog");
@@ -1035,7 +1074,7 @@ init_recover:
   sqlite3_finalize(stmt);
 
   // Highest seq-no?
-  sql = "SELECT coalesce(max(acseq), 0) FROM cache_catalog;";
+  sql = "SELECT coalesce(max(acseq & (~(1<<63))), 0) FROM cache_catalog;";
   sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, NULL);
   if (sqlite3_step(stmt) == SQLITE_ROW) {
     seq_ = sqlite3_column_int64(stmt, 0)+1;
@@ -1047,26 +1086,34 @@ init_recover:
   sqlite3_finalize(stmt);
 
   // Prepare touch, new, remove statements
-  sqlite3_prepare_v2(db_, "UPDATE cache_catalog SET acseq=:seq "
+  sqlite3_prepare_v2(db_,
+                     "UPDATE cache_catalog SET acseq=:seq | (acseq&(1<<63)) "
                      "WHERE sha1=:sha1;", -1, &stmt_touch_, NULL);
   sqlite3_prepare_v2(db_, "UPDATE cache_catalog SET pinned=0 "
                      "WHERE sha1=:sha1;", -1, &stmt_unpin_, NULL);
+  sqlite3_prepare_v2(db_, "UPDATE cache_catalog SET pinned=2 "
+                     "WHERE sha1=:sha1;", -1, &stmt_block_, NULL);
+  sqlite3_prepare_v2(db_, "UPDATE cache_catalog SET pinned=1 "
+                     "WHERE pinned=2;", -1, &stmt_unblock_, NULL);
   sqlite3_prepare_v2(db_,
                      "INSERT OR REPLACE INTO cache_catalog "
                      "(sha1, size, acseq, path, type, pinned) "
-                     "VALUES (:sha1, :s, :seq, :p, :t, :pin);", -1, &stmt_new_, NULL);
+                     "VALUES (:sha1, :s, :seq, :p, :t, :pin);",
+                     -1, &stmt_new_, NULL);
   sqlite3_prepare_v2(db_,
                      "SELECT size, pinned FROM cache_catalog WHERE sha1=:sha1;",
                      -1, &stmt_size_, NULL);
   sqlite3_prepare_v2(db_, "DELETE FROM cache_catalog WHERE sha1=:sha1;",
                      -1, &stmt_rm_, NULL);
   sqlite3_prepare_v2(db_,
-                     "SELECT sha1, size FROM cache_catalog WHERE acseq=(SELECT min(acseq) "
-                     "FROM cache_catalog WHERE pinned=0);", -1, &stmt_lru_, NULL);
+                     "SELECT sha1, size FROM cache_catalog WHERE "
+                     "acseq=(SELECT min(acseq) "
+                     "FROM cache_catalog WHERE pinned<>2);",
+                     -1, &stmt_lru_, NULL);
   sqlite3_prepare_v2(db_,
                      ("SELECT path FROM cache_catalog WHERE type=" + StringifyInt(kFileRegular) +
                       ";").c_str(), -1, &stmt_list_, NULL);
-  sqlite3_prepare_v2(db_, "SELECT path FROM cache_catalog WHERE pinned=1;",
+  sqlite3_prepare_v2(db_, "SELECT path FROM cache_catalog WHERE pinned<>0;",
                      -1, &stmt_list_pinned_, NULL);
   sqlite3_prepare_v2(db_,
                      ("SELECT path FROM cache_catalog WHERE type=" + StringifyInt(kFileCatalog) +
@@ -1089,6 +1136,8 @@ static void CloseDatabase() {
   if (stmt_size_) sqlite3_finalize(stmt_size_);
   if (stmt_touch_) sqlite3_finalize(stmt_touch_);
   if (stmt_unpin_) sqlite3_finalize(stmt_unpin_);
+  if (stmt_block_) sqlite3_finalize(stmt_block_);
+  if (stmt_unblock_) sqlite3_finalize(stmt_unblock_);
   if (stmt_new_) sqlite3_finalize(stmt_new_);
   if (db_) sqlite3_close(db_);
   UnlockFile(fd_lock_cachedb_);
@@ -1099,6 +1148,9 @@ static void CloseDatabase() {
   stmt_rm_ = NULL;
   stmt_size_ = NULL;
   stmt_touch_ = NULL;
+  stmt_unpin_ = NULL;
+  stmt_block_ = NULL;
+  stmt_unblock_ = NULL;
   stmt_new_ = NULL;
   db_ = NULL;
 
@@ -1255,6 +1307,30 @@ bool InitShared(const std::string &exe_path, const std::string &cache_dir,
 }
 
 
+static void CleanupPipes(const string &cache_dir) {
+  DIR *dirp = opendir(cache_dir.c_str());
+  assert(dirp != NULL);
+
+  platform_dirent64 *dent;
+  bool found_leftovers = false;
+  while ((dent = platform_readdir(dirp)) != NULL) {
+    const string name = dent->d_name;
+    const string path = cache_dir + "/" + name;
+    platform_stat64 info;
+    platform_stat(path.c_str(), &info);
+    if (S_ISFIFO(info.st_mode) && (name.substr(0, 4) == "pipe")) {
+      if (!found_leftovers) {
+        LogCvmfs(kLogCvmfs, kLogDebug | kLogSyslogWarn,
+                 "removing left-over FIFOs from cache directory");
+      }
+      found_leftovers = true;
+      unlink(path.c_str());
+    }
+  }
+  closedir(dirp);
+}
+
+
 /**
  * Entry point for the shared cache manager process
  */
@@ -1269,7 +1345,7 @@ int MainCacheManager(int argc, char **argv) {
   shared_ = true;
   spawned_ = true;
   pinned_ = 0;
-  pinned_chunks_ = new map<hash::Any, uint64_t>();
+  pinned_chunks_ = new map<shash::Any, uint64_t>();
 
   // Process command line arguments
   cache_dir_ = new string(argv[2]);
@@ -1292,6 +1368,8 @@ int MainCacheManager(int argc, char **argv) {
   if (!foreground)
     Daemonize();
 
+  back_channels_ = new map<shash::Md5, int>;
+
   // Initialize pipe, open non-blocking as cvmfs is not yet connected
   const int fd_lockfile_fifo = LockFile(*cache_dir_ + "/lock_cachemgr.fifo");
   if (fd_lockfile_fifo < 0) {
@@ -1309,6 +1387,16 @@ int MainCacheManager(int argc, char **argv) {
     return 1;
   }
   close(retval);
+
+  // Redirect SQlite temp directory to cache (global variable)
+  const string tmp_dir = *cache_dir_ + "/txn";
+  sqlite3_temp_directory =
+    static_cast<char *>(sqlite3_malloc(tmp_dir.length() + 1));
+  strcpy(sqlite3_temp_directory, tmp_dir.c_str());
+
+  // Cleanup leftover named pipes
+  CleanupPipes(*cache_dir_);
+
   if (!InitDatabase(rebuild)) {
     UnlockFile(fd_lockfile_fifo);
     return 1;
@@ -1356,6 +1444,8 @@ int MainCacheManager(int argc, char **argv) {
 
   // Ensure that broken pipes from clients do not kill the cache manager
   signal(SIGPIPE, SIG_IGN);
+  // Don't let Ctrl-C ungracefully kill interactive session
+  signal(SIGINT, SIG_IGN);
 
   MainCommandServer(NULL);
   unlink(fifo_path.c_str());
@@ -1363,6 +1453,11 @@ int MainCacheManager(int argc, char **argv) {
   CloseDatabase();
   unlink(crash_guard.c_str());
   UnlockFile(fd_lockfile_fifo);
+
+  if (sqlite3_temp_directory) {
+    sqlite3_free(sqlite3_temp_directory);
+    sqlite3_temp_directory = NULL;
+  }
 
   monitor::Fini();
 
@@ -1392,15 +1487,18 @@ bool Init(const string &cache_dir, const uint64_t limit,
   shared_ = false;
   spawned_ = false;
 
+  protocol_revision_ = kProtocolRevision;
   limit_ = limit;
   pinned_ = 0;
   cleanup_threshold_ = cleanup_threshold;
   cache_dir_ = new string(cache_dir);
-  pinned_chunks_ = new map<hash::Any, uint64_t>();
+  pinned_chunks_ = new map<shash::Any, uint64_t>();
 
   // Initialize cache catalog
   if (!InitDatabase(rebuild_database))
     return false;
+
+  back_channels_ = new map<shash::Md5, int>;
 
   MakePipe(pipe_lru_);
   initialized_ = true;
@@ -1453,6 +1551,11 @@ void Fini() {
   CloseDatabase();
   initialized_ = false;
   protocol_revision_ = 0;
+
+  if (back_channels_) {
+    delete back_channels_;
+    back_channels_ = NULL;
+  }
 }
 
 
@@ -1486,20 +1589,21 @@ bool Cleanup(const uint64_t leave_size) {
 }
 
 
-static void DoInsert(const hash::Any &hash, const uint64_t size,
+static void DoInsert(const shash::Any &hash, const uint64_t size,
                      const string &cvmfs_path, const CommandType command_type)
 {
   const string hash_str = hash.ToString();
-  LogCvmfs(kLogQuota, kLogDebug, "insert into lru %s, path %s",
-           hash_str.c_str(), cvmfs_path.c_str());
+  LogCvmfs(kLogQuota, kLogDebug, "insert into lru %s, path %s, method %d",
+           hash_str.c_str(), cvmfs_path.c_str(), command_type);
   const unsigned path_length = (cvmfs_path.length() > kMaxCvmfsPath) ?
     kMaxCvmfsPath : cvmfs_path.length();
 
   LruCommand *cmd = reinterpret_cast<LruCommand *>(
                       alloca(sizeof(LruCommand) + path_length));
+  new (cmd) LruCommand;
   cmd->command_type = command_type;
-  cmd->size = size;
-  memcpy(cmd->digest, hash.digest, hash.GetDigestSize());
+  cmd->SetSize(size);
+  cmd->StoreHash(hash);
   cmd->path_length = path_length;
   memcpy(reinterpret_cast<char *>(cmd)+sizeof(LruCommand),
          &cvmfs_path[0], path_length);
@@ -1511,7 +1615,7 @@ static void DoInsert(const hash::Any &hash, const uint64_t size,
  * Inserts a new file into cache catalog.  This file gets a new,
  * highest sequence number. Does cache cleanup if necessary.
  */
-void Insert(const hash::Any &any_hash, const uint64_t size,
+void Insert(const shash::Any &any_hash, const uint64_t size,
             const string &cvmfs_path)
 {
   assert(initialized_);
@@ -1521,12 +1625,26 @@ void Insert(const hash::Any &any_hash, const uint64_t size,
 
 
 /**
+ * Inserts a new file into cache catalog.  This file is marked as volatile
+ * and gets a new highest sequence number with the first bit set.  Cache cleanup
+ * treats these files with priority.
+ */
+void InsertVolatile(const shash::Any &any_hash, const uint64_t size,
+                    const string &cvmfs_path)
+{
+  assert(initialized_);
+  if (limit_ == 0) return;
+  DoInsert(any_hash, size, cvmfs_path, kInsertVolatile);
+ }
+
+
+/**
  * Immediately inserts a new pinned catalog.
  * Does cache cleanup if necessary.
  *
  * \return True on success, false otherwise
  */
-bool Pin(const hash::Any &hash, const uint64_t size,
+bool Pin(const shash::Any &hash, const uint64_t size,
          const string &cvmfs_path, const bool is_catalog)
 {
   assert(initialized_);
@@ -1577,8 +1695,8 @@ bool Pin(const hash::Any &hash, const uint64_t size,
 
   LruCommand cmd;
   cmd.command_type = kReserve;
-  cmd.size = size;
-  memcpy(cmd.digest, hash.digest, hash.GetDigestSize());
+  cmd.SetSize(size);
+  cmd.StoreHash(hash);
   cmd.return_pipe = pipe_reserve[1];
   WritePipe(pipe_lru_[1], &cmd, sizeof(cmd));
   bool result;
@@ -1592,13 +1710,13 @@ bool Pin(const hash::Any &hash, const uint64_t size,
 }
 
 
-void Unpin(const hash::Any &hash) {
+void Unpin(const shash::Any &hash) {
   if (limit_ == 0) return;
   LogCvmfs(kLogQuota, kLogDebug, "Unpin %s", hash.ToString().c_str());
 
   LruCommand cmd;
   cmd.command_type = kUnpin;
-  memcpy(cmd.digest, hash.digest, hash.GetDigestSize());
+  cmd.StoreHash(hash);
   WritePipe(pipe_lru_[1], &cmd, sizeof(cmd));
 }
 
@@ -1606,13 +1724,13 @@ void Unpin(const hash::Any &hash) {
 /**
  * Updates the sequence number of the file specified by the hash.
  */
-void Touch(const hash::Any &hash) {
+void Touch(const shash::Any &hash) {
   assert(initialized_);
   if (limit_ == 0) return;
 
   LruCommand cmd;
   cmd.command_type = kTouch;
-  memcpy(cmd.digest, hash.digest, hash.GetDigestSize());
+  cmd.StoreHash(hash);
   WritePipe(pipe_lru_[1], &cmd, sizeof(cmd));
 }
 
@@ -1620,7 +1738,7 @@ void Touch(const hash::Any &hash) {
 /**
  * Removes a chunk from cache, if it exists.
  */
-void Remove(const hash::Any &hash) {
+void Remove(const shash::Any &hash) {
   assert(initialized_);
   string hash_str = hash.ToString();
 
@@ -1631,7 +1749,7 @@ void Remove(const hash::Any &hash) {
     LruCommand cmd;
     cmd.command_type = kRemove;
     cmd.return_pipe = pipe_remove[1];
-    memcpy(cmd.digest, hash.digest, hash.GetDigestSize());
+    cmd.StoreHash(hash);
     WritePipe(pipe_lru_[1], &cmd, sizeof(cmd));
 
     bool success;

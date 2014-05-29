@@ -180,13 +180,14 @@ static void *MainCheck(void *data __attribute__((unused))) {
     platform_disable_kcache(fd_src);
 
     // Compress every file and calculate SHA-1 of stream
-    hash::Any hash(hash::kSha1);
+    shash::Any expected_hash = shash::MkFromHexPtr(shash::HexPtr(hash_name));
+    shash::Any hash(expected_hash.algorithm);
     if (!zlib::CompressFd2Null(fd_src, &hash)) {
       LogCvmfs(kLogCvmfs, kLogStdout, "Error: could not compress %s",
                path.c_str());
       atomic_inc32(&g_num_err_operational);
     } else {
-      if (hash.ToString() != hash_name) {
+      if (hash != expected_hash) {
         if (g_fix_errors) {
           const string quarantaine_path = "./quarantaine/" + hash_name;
           bool fixed = false;
@@ -239,7 +240,7 @@ int main(int argc, char **argv) {
   atomic_init32(&g_modified_cache);
   g_current_dir = new string();
 
-  char c;
+  int c;
   while ((c = getopt(argc, argv, "hvpfj:")) != -1) {
     switch (c) {
       case 'h':

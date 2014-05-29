@@ -21,6 +21,7 @@
 #include <gtest/gtest_prod.h>
 
 #include "smalloc.h"
+#include "prng.h"
 #include "atomic.h"
 #include "murmur.h"
 
@@ -45,6 +46,11 @@ class SmallHashBase {
     bytes_allocated_ = 0;
     num_collisions_ = 0;
     max_collisions_ = 0;
+
+    // Properly initialized by Init()
+    capacity_ = 0;
+    initial_capacity_ = 0;
+    size_ = 0;
   }
 
   ~SmallHashBase() {
@@ -120,6 +126,12 @@ class SmallHashBase {
     *num_collisions = num_collisions_;
     *max_collisions = max_collisions_;
   }
+
+  // Careful with the direct access TODO: iterator
+  uint32_t capacity() const { return capacity_; }
+  Key empty_key() const { return empty_key_; }
+  Key *keys() const { return keys_; }
+  Value *values() const { return values_; }
 
  protected:
   uint32_t ScaleHash(const Key &key) const {
@@ -235,6 +247,10 @@ class SmallHashDynamic :
 
   SmallHashDynamic() : Base() {
     num_migrates_ = 0;
+
+    // Properly set by Init
+    threshold_grow_ = 0;
+    threshold_shrink_ = 0;
   }
 
   explicit SmallHashDynamic(const SmallHashDynamic<Key, Value> &other) : Base()
@@ -296,7 +312,7 @@ class SmallHashDynamic :
       shuffled[i] = i;
     // Shuffle (no shuffling for the last element)
     for (unsigned i = 0; i < N-1; ++i) {
-      const uint32_t swap_idx = i + random() % (N - i);
+      const uint32_t swap_idx = i + g_prng.Next(N - i);
       uint32_t tmp = shuffled[i];
       shuffled[i] = shuffled[swap_idx];
       shuffled[swap_idx]  = tmp;
@@ -347,6 +363,7 @@ class SmallHashDynamic :
   uint32_t num_migrates_;
   uint32_t threshold_grow_;
   uint32_t threshold_shrink_;
+  static Prng g_prng;
 };
 
 
@@ -461,6 +478,9 @@ class MultiHash {
 
 
 // initialize the static fields
+template<class Key, class Value>
+Prng SmallHashDynamic<Key, Value>::g_prng;
+
 template<class Key, class Value, class Derived>
 const double SmallHashBase<Key, Value, Derived>::kLoadFactor = 0.75;
 

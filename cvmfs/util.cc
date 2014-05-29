@@ -27,6 +27,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
+#include <pwd.h>
+#include <grp.h>
 
 #include <cctype>
 #include <cstdlib>
@@ -34,6 +36,7 @@
 #include <cstring>
 #include <cassert>
 
+#include <algorithm>
 #include <string>
 #include <map>
 #include <set>
@@ -121,6 +124,11 @@ NameString GetFileName(const PathString &path) {
   }
 
   return name;
+}
+
+
+bool IsAbsolutePath(const std::string &path) {
+  return (! path.empty() && path[0] == '/');
 }
 
 
@@ -358,6 +366,16 @@ bool DirectoryExists(const std::string &path) {
 
 
 /**
+ * Checks if the symlink file path exists.
+ */
+bool SymlinkExists(const string &path) {
+  platform_stat64 info;
+  return ((platform_lstat(path.c_str(), &info) == 0) &&
+          S_ISLNK(info.st_mode));
+}
+
+
+/**
  * The mkdir -p command.
  */
 bool MkdirDeep(const std::string &path, const mode_t mode) {
@@ -535,9 +553,9 @@ class RemoveTreeHelper {
  */
 bool RemoveTree(const string &path) {
   platform_stat64 info;
-  platform_lstat(path.c_str(), &info);
-  if (errno == ENOENT)
-    return true;
+  int retval = platform_lstat(path.c_str(), &info);
+  if (retval != 0)
+    return errno == ENOENT;
   if (!S_ISDIR(info.st_mode))
     return false;
 
@@ -574,7 +592,61 @@ vector<string> FindFiles(const string &dir, const string &suffix) {
     }
   }
   closedir(dirp);
+  sort(result.begin(), result.end());
   return result;
+}
+
+
+/**
+ * Name -> UID from passwd database
+ */
+bool GetUidOf(const std::string &username, uid_t *uid, gid_t *main_gid) {
+  struct passwd *result;
+  result = getpwnam(username.c_str());
+  if (result == NULL)
+    return false;
+  *uid = result->pw_uid;
+  *main_gid = result->pw_gid;
+  return true;
+}
+
+
+/**
+ * Name -> GID from groups database
+ */
+bool GetGidOf(const std::string &groupname, gid_t *gid) {
+  struct group *result;
+  result = getgrnam(groupname.c_str());
+  if (result == NULL)
+    return false;
+  *gid = result->gr_gid;
+  return true;
+}
+
+
+/**
+ * Adds gid to the list of supplementary groups
+ */
+bool AddGroup2Persona(const gid_t gid) {
+  int ngroups = getgroups(0, NULL);
+  if (ngroups < 0)
+    return false;
+  gid_t *groups = static_cast<gid_t *>(smalloc((ngroups+1) * sizeof(gid_t)));
+  int retval = getgroups(ngroups, groups);
+  if (retval < 0) {
+    free(groups);
+    return false;
+  }
+  for (int i = 0; i < ngroups; ++i) {
+    if (groups[i] == gid) {
+      free(groups);
+      return true;
+    }
+  }
+  groups[ngroups] = gid;
+  retval = setgroups(ngroups+1, groups);
+  free(groups);
+  return retval == 0;
 }
 
 
@@ -783,7 +855,7 @@ bool GetLineFile(FILE *f, std::string *line) {
       break;
     line->push_back(c);
   }
-  return retval != EOF;
+  return (retval != EOF) || !line->empty();
 }
 
 
@@ -796,7 +868,7 @@ bool GetLineFd(const int fd, std::string *line) {
       break;
     line->push_back(c);
   }
-  return retval == 1;
+  return (retval == 1) || !line->empty();
 }
 
 
@@ -911,7 +983,8 @@ bool ExecuteBinary(      int                       *fd_stdin,
                    const std::string               &binary_path,
                    const std::vector<std::string>  &argv,
                    const bool                       double_fork,
-                         pid_t                     *child_pid) {
+                         pid_t                     *child_pid)
+{
   int pipe_stdin[2];
   int pipe_stdout[2];
   int pipe_stderr[2];
@@ -936,7 +1009,8 @@ bool ExecuteBinary(      int                       *fd_stdin,
                    map_fildes,
                    true,
                    double_fork,
-                   child_pid)) {
+                   child_pid))
+  {
     ClosePipe(pipe_stdin);
     ClosePipe(pipe_stdout);
     ClosePipe(pipe_stderr);
@@ -1017,7 +1091,8 @@ bool ManagedExec(const vector<string>  &command_line,
                  const map<int, int>   &map_fildes,
                  const bool             drop_credentials,
                  const bool             double_fork,
-                       pid_t           *child_pid) {
+                       pid_t           *child_pid)
+{
   assert(command_line.size() >= 1);
 
   Pipe pipe_fork;

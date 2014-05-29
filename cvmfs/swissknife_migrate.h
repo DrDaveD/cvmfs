@@ -14,6 +14,7 @@
 #include "hash.h"
 #include "util.h"
 #include "util_concurrency.h"
+#include "catalog_traversal.h"
 #include "catalog.h"
 #include "upload.h"
 #include "atomic.h"
@@ -64,8 +65,8 @@ class CommandMigrate : public Command {
     inline const std::string root_path() const {
       return old_catalog->path().ToString();
     }
-    inline const bool IsRoot() const { return old_catalog->IsRoot(); }
-    inline const bool HasNew() const { return new_catalog != NULL;   }
+    inline bool IsRoot() const { return old_catalog->IsRoot(); }
+    inline bool HasNew() const { return new_catalog != NULL;   }
 
     bool                              success;
 
@@ -78,7 +79,8 @@ class CommandMigrate : public Command {
 
     CatalogStatistics                 statistics;
 
-    Future<hash::Any>                 new_catalog_hash;
+    Future<shash::Any>                new_catalog_hash;
+    Future<size_t>                    new_catalog_size;
   };
 
   class PendingCatalogMap : public std::map<std::string, const PendingCatalog*>,
@@ -180,6 +182,7 @@ class CommandMigrate : public Command {
     bool CheckDatabaseSchemaCompatibility (PendingCatalog *data) const;
     bool StartDatabaseTransaction         (PendingCatalog *data) const;
     bool GenerateNewStatisticsCounters    (PendingCatalog *data) const;
+    bool UpdateCatalogSchema              (PendingCatalog *data) const;
     bool CommitDatabaseTransaction        (PendingCatalog *data) const;
 
     catalog::WritableCatalog* GetWritable(const catalog::Catalog *catalog) const;
@@ -203,9 +206,7 @@ class CommandMigrate : public Command {
   static const catalog::DirectoryEntry& GetNestedCatalogMarkerDirent();
 
  protected:
-  void CatalogCallback(const catalog::Catalog* catalog,
-                       const hash::Any&        catalog_hash,
-                       const unsigned          tree_level);
+  void CatalogCallback(const CatalogTraversalData &data);
   void MigrationCallback(PendingCatalog *const &data);
   void UploadCallback(const upload::SpoolerResult &result);
 
@@ -220,7 +221,7 @@ class CommandMigrate : public Command {
   void AnalyzeCatalogStatistics() const;
 
   bool GenerateNestedCatalogMarkerChunk();
-  void CreateNestedCatalogMarkerDirent(const hash::Any &content_hash);
+  void CreateNestedCatalogMarkerDirent(const shash::Any &content_hash);
 
  private:
   unsigned int           file_descriptor_limit_;

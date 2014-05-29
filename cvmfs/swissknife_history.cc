@@ -6,6 +6,7 @@
 #include "swissknife_history.h"
 
 #include <ctime>
+#include <cassert>
 
 #include "hash.h"
 #include "util.h"
@@ -17,6 +18,7 @@
 #include "upload.h"
 
 using namespace std;  // NOLINT
+using namespace swissknife;  // NOLINT
 
 /**
  * Checks if the given path looks like a remote path
@@ -32,22 +34,26 @@ static bool IsRemote(const string &repository)
  */
 static bool GetHistoryDbHash(const string &repository_url,
                              const string &repository_name,
-                             const hash::Any &expected_root_hash,
-                             hash::Any *historydb_hash)
+                             const shash::Any &expected_root_hash,
+                             shash::Any *historydb_hash)
 {
   manifest::ManifestEnsemble manifest_ensemble;
   manifest::Manifest *manifest = NULL;
+  bool free_manifest = false;
   if (IsRemote(repository_url)) {
     manifest::Failures retval;
     retval = manifest::Fetch(repository_url, repository_name, 0, NULL,
+                             g_signature_manager, g_download_manager,
                              &manifest_ensemble);
     if (retval != manifest::kFailOk) {
-      LogCvmfs(kLogCvmfs, kLogStderr, "failed to fetch repository manifest (%d)",
-               retval);
+      LogCvmfs(kLogCvmfs, kLogStderr, "failed to fetch repository manifest "
+                                      "(%d - %s)",
+               retval, manifest::Code2Ascii(retval));
     }
     manifest = manifest_ensemble.manifest;
   } else {
     manifest = manifest::Manifest::LoadFile(repository_url + "/.cvmfspublished");
+    free_manifest = true;
   }
   if (!manifest) {
     LogCvmfs(kLogCvmfs, kLogStderr, "failed to load repository manifest");
@@ -61,30 +67,34 @@ static bool GetHistoryDbHash(const string &repository_url,
              "wrong manifest, expected catalog %s, found catalog %s",
              expected_root_hash.ToString().c_str(),
              manifest->catalog_hash().ToString().c_str());
+    if (free_manifest) delete manifest;
     return false;
   }
 
   *historydb_hash = manifest->history();
+  if (free_manifest) delete manifest;
   return true;
 }
 
 
 static bool FetchTagList(const string &repository_url,
-                         const hash::Any &history_hash,
+                         const shash::Any &history_hash,
                          const std::string tmp_path,
                          history::Database *history_db,
                          history::TagList *tag_list)
 {
   int retval;
+  download::Failures dl_retval;
+
   if (!history_hash.IsNull()) {
     const string url = repository_url + "/data" +
       history_hash.MakePath(1, 2) + "H";
     download::JobInfo download_history(&url, true, false, &tmp_path,
                                        &history_hash);
-    retval = download::Fetch(&download_history);
-    if (retval != download::kFailOk) {
-      LogCvmfs(kLogCvmfs, kLogStderr, "failed to download history (%d)",
-               retval);
+    dl_retval = g_download_manager->Fetch(&download_history);
+    if (dl_retval != download::kFailOk) {
+      LogCvmfs(kLogCvmfs, kLogStderr, "failed to download history (%d - %s)",
+               dl_retval, download::Code2Ascii(dl_retval));
       return false;
     }
   }
@@ -101,22 +111,30 @@ int swissknife::CommandTag::Main(const swissknife::ArgumentList &args) {
   const string repository_name = *args.find('n')->second;
   const string repository_key_path = *args.find('k')->second;
   const string history_path = *args.find('o')->second;
-  const hash::Any base_hash(hash::kSha1, hash::HexPtr(*args.find('b')->second));
-  const hash::Any trunk_hash(hash::kSha1, hash::HexPtr(*args.find('t')->second));
+  const shash::Any base_hash =
+    shash::MkFromHexPtr(shash::HexPtr(*args.find('b')->second));
+  const shash::Any trunk_hash =
+    shash::MkFromHexPtr(shash::HexPtr(*args.find('t')->second));
+  const uint64_t trunk_catalog_size = String2Uint64(*args.find('s')->second);
   const unsigned trunk_revision = String2Uint64(*args.find('i')->second);
-  hash::Any tag_hash = trunk_hash;
+  shash::Any tag_hash = trunk_hash;
   string delete_tag;
+  string trusted_certs;
   if (args.find('d') != args.end()) {
     delete_tag = *args.find('d')->second;
   }
   if (args.find('h') != args.end()) {
-    tag_hash = hash::Any(hash::kSha1, hash::HexPtr(*args.find('h')->second));
+    tag_hash = shash::MkFromHexPtr(shash::HexPtr(*args.find('h')->second));
+  }
+  if (args.find('z') != args.end()) {
+    trusted_certs = *args.find('z')->second;
   }
   history::Tag new_tag;
   if (args.find('a') != args.end()) {
     vector<string> fields = SplitString(*args.find('a')->second, '@');
     new_tag.name = fields[0];
     new_tag.root_hash = trunk_hash;  // might be changed later
+    new_tag.size = trunk_catalog_size;  // might be changed later
     new_tag.revision = trunk_revision;  // might be changed later
     new_tag.timestamp = time(NULL);
     if (fields.size() > 1) {
@@ -129,20 +147,27 @@ int swissknife::CommandTag::Main(const swissknife::ArgumentList &args) {
   bool list_only = false;
   if (args.find('l') != args.end())
     list_only = true;
-  hash::Any history_hash;
+  shash::Any history_hash;
   history::Database tag_db;
   history::TagList tag_list;
   int retval;
 
   // Download & verify manifest
-  signature::Init();
-  retval = signature::LoadPublicRsaKeys(repository_key_path);
+  g_signature_manager->Init();
+  retval = g_signature_manager->LoadPublicRsaKeys(repository_key_path);
   if (!retval) {
     LogCvmfs(kLogCvmfs, kLogStderr, "failed to load public repository key %s",
              repository_key_path.c_str());
     return 1;
   }
-  download::Init(1, true);
+  if (trusted_certs != "") {
+    retval = g_signature_manager->LoadTrustedCaCrl(trusted_certs);
+    if (!retval) {
+      LogCvmfs(kLogCvmfs, kLogStderr, "failed to load trusted certificates");
+      return 1;
+    }
+  }
+  g_download_manager->Init(1, true);
   int result = 1;
 
   retval = GetHistoryDbHash(repository_url, repository_name, base_hash,
@@ -204,7 +229,8 @@ int swissknife::CommandTag::Main(const swissknife::ArgumentList &args) {
     tag_list.Remove("trunk-previous");
     tag_list.Remove("trunk");
     history::Tag tag_trunk(
-      "trunk", trunk_hash, trunk_revision, time(NULL), history::kChannelTrunk,
+      "trunk", trunk_hash, trunk_catalog_size, trunk_revision, time(NULL),
+      history::kChannelTrunk,
       "latest published snapshot, automatically updated");
     retval = tag_list.Insert(tag_trunk);
     assert(retval == history::TagList::kFailOk);
@@ -223,27 +249,30 @@ int swissknife::CommandTag::Main(const swissknife::ArgumentList &args) {
   result = 0;
 
  tag_fini:
-  signature::Fini();
-  download::Fini();
+  g_signature_manager->Fini();
+  g_download_manager->Fini();
   return result;
 }
 
 
 int swissknife::CommandRollback::Main(const swissknife::ArgumentList &args) {
   const string spooler_definition = *args.find('r')->second;
-  const upload::SpoolerDefinition sd(spooler_definition);
-  upload::Spooler *spooler = upload::Spooler::Construct(sd);
-  assert(spooler);
-
   const string repository_url = MakeCanonicalPath(*args.find('u')->second);
   const string repository_name = *args.find('n')->second;
   const string repository_key_path = *args.find('k')->second;
   const string history_path = *args.find('o')->second;
-  const hash::Any base_hash(hash::kSha1, hash::HexPtr(*args.find('b')->second));
+  const shash::Any base_hash(
+    shash::MkFromHexPtr(shash::HexPtr(*args.find('b')->second)));
   const string target_tag_name = *args.find('t')->second;
   const string manifest_path = *args.find('m')->second;
   const string temp_dir = *args.find('d')->second;
-  hash::Any history_hash;
+  string trusted_certs;
+  if (args.find('z') != args.end()) {
+    trusted_certs = *args.find('z')->second;
+  }
+
+  upload::Spooler *spooler = NULL;
+  shash::Any history_hash;
   history::Database tag_db;
   history::TagList tag_list;
   history::Tag target_tag;
@@ -251,18 +280,27 @@ int swissknife::CommandRollback::Main(const swissknife::ArgumentList &args) {
   string catalog_path;
   catalog::WritableCatalog *catalog = NULL;
   manifest::Manifest *manifest = NULL;
-  hash::Any hash_republished_catalog(hash::kSha1);
+  shash::Any hash_republished_catalog;
+  int64_t size_republished_catalog = 0;
   int retval;
+  download::Failures dl_retval;
 
   // Download & verify manifest & history database
-  signature::Init();
-  retval = signature::LoadPublicRsaKeys(repository_key_path);
+  g_signature_manager->Init();
+  retval = g_signature_manager->LoadPublicRsaKeys(repository_key_path);
   if (!retval) {
     LogCvmfs(kLogCvmfs, kLogStderr, "failed to load public repository key %s",
              repository_key_path.c_str());
     return 1;
   }
-  download::Init(1, true);
+  if (trusted_certs != "") {
+    retval = g_signature_manager->LoadTrustedCaCrl(trusted_certs);
+    if (!retval) {
+      LogCvmfs(kLogCvmfs, kLogStderr, "failed to load trusted certificates");
+      return 1;
+    }
+  }
+  g_download_manager->Init(1, true);
   int result = 1;
 
   retval = GetHistoryDbHash(repository_url, repository_name, base_hash,
@@ -303,10 +341,10 @@ int swissknife::CommandRollback::Main(const swissknife::ArgumentList &args) {
       target_tag.root_hash.MakePath(1, 2) + "C";
     download::JobInfo download_catalog(&catalog_url, true, false, &catalog_path,
                                        &target_tag.root_hash);
-    retval = download::Fetch(&download_catalog);
-    if (retval != download::kFailOk) {
-      LogCvmfs(kLogCvmfs, kLogStderr, "failed to download catalog (%d)",
-               retval);
+    dl_retval = g_download_manager->Fetch(&download_catalog);
+    if (dl_retval != download::kFailOk) {
+      LogCvmfs(kLogCvmfs, kLogStderr, "failed to download catalog (%d - %s)",
+               dl_retval, download::Code2Ascii(dl_retval));
       goto rollback_fini;
     }
   }
@@ -320,11 +358,19 @@ int swissknife::CommandRollback::Main(const swissknife::ArgumentList &args) {
   catalog->SetRevision(trunk_tag.revision + 1);
 
   // Upload catalog
+  size_republished_catalog = GetFileSize(catalog->database_path());
+  assert(size_republished_catalog > 0);
+  spooler = upload::Spooler::Construct(
+    upload::SpoolerDefinition(spooler_definition,
+                              target_tag.root_hash.algorithm));
+  assert(spooler);
+
+  hash_republished_catalog.algorithm = target_tag.root_hash.algorithm;
   if (!zlib::CompressPath2Path(catalog->database_path(),
                                catalog->database_path() + ".compressed",
                                &hash_republished_catalog))
   {
-    LogCvmfs(kLogCvmfs, kLogStderr, "failed to compress catalog (%d)");
+    LogCvmfs(kLogCvmfs, kLogStderr, "failed to compress catalog");
     delete catalog;
     unlink(catalog_path.c_str());
     goto rollback_fini;
@@ -332,9 +378,10 @@ int swissknife::CommandRollback::Main(const swissknife::ArgumentList &args) {
   spooler->Upload(catalog->database_path() + ".compressed",
                   "data" + hash_republished_catalog.MakePath(1, 2) + "C");
   spooler->WaitForUpload();
-  spooler->WaitForTermination();
   unlink((catalog->database_path() + ".compressed").c_str());
-  manifest = new manifest::Manifest(hash_republished_catalog, "");
+  manifest =
+    new manifest::Manifest(hash_republished_catalog, size_republished_catalog,
+                           "");
   manifest->set_ttl(catalog->GetTTL());
   manifest->set_revision(catalog->GetRevision());
   retval = manifest->Export(manifest_path);
@@ -366,7 +413,7 @@ int swissknife::CommandRollback::Main(const swissknife::ArgumentList &args) {
 
  rollback_fini:
   delete spooler;
-  signature::Fini();
-  download::Fini();
+  g_signature_manager->Fini();
+  g_download_manager->Fini();
   return result;
 }

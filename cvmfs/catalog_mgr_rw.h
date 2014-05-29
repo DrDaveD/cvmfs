@@ -41,6 +41,9 @@
 namespace upload {
 class Spooler;
 }
+namespace download {
+class DownloadManager;
+}
 namespace manifest {
 class Manifest;
 }
@@ -49,12 +52,15 @@ namespace catalog {
 
 class WritableCatalogManager : public AbstractCatalogManager {
  public:
-  WritableCatalogManager(const hash::Any   &base_hash,
+  WritableCatalogManager(const shash::Any  &base_hash,
                          const std::string &stratum0,
                          const std::string &dir_temp,
-                         upload::Spooler   *spooler);
+                         upload::Spooler   *spooler,
+                         download::DownloadManager *download_manager,
+                         uint64_t catalog_entry_warn_threshold);
   ~WritableCatalogManager();
   static manifest::Manifest *CreateRepository(const std::string &dir_temp,
+                                              const bool volatile_content,
                                               upload::Spooler   *spooler);
 
   bool Init();
@@ -83,6 +89,7 @@ class WritableCatalogManager : public AbstractCatalogManager {
   // Nested catalog handling
   void CreateNestedCatalog(const std::string &mountpoint);
   void RemoveNestedCatalog(const std::string &mountpoint);
+  bool IsTransitionPoint(const std::string &path);
 
   /**
    * TODO
@@ -95,11 +102,11 @@ class WritableCatalogManager : public AbstractCatalogManager {
   void EnforceSqliteMemLimit() { }
 
   LoadError LoadCatalog(const PathString &mountpoint,
-                        const hash::Any  &hash,
+                        const shash::Any &hash,
                         std::string      *catalog_path,
-                        hash::Any        *catalog_hash);
+                        shash::Any       *catalog_hash);
   Catalog* CreateCatalog(const PathString &mountpoint,
-                         const hash::Any  &catalog_hash,
+                         const shash::Any &catalog_hash,
                          Catalog *parent_catalog);
 
   void AddFile(const DirectoryEntry  &entry,
@@ -131,7 +138,7 @@ class WritableCatalogManager : public AbstractCatalogManager {
   int GetModifiedCatalogsRecursively(const Catalog *catalog,
                                      WritableCatalogList *result) const;
 
-  hash::Any SnapshotCatalog(WritableCatalog *catalog) const;
+  shash::Any SnapshotCatalog(WritableCatalog *catalog) const;
 
  private:
   inline void SyncLock() { pthread_mutex_lock(sync_lock_); }
@@ -140,11 +147,15 @@ class WritableCatalogManager : public AbstractCatalogManager {
   // defined in catalog_mgr_rw.cc
   const static std::string kCatalogFilename;
 
-  pthread_mutex_t  *sync_lock_;  // private lock of WritableCatalogManager
-  hash::Any         base_hash_;
-  std::string       stratum0_;
-  std::string       dir_temp_;
-  upload::Spooler  *spooler_;
+  // private lock of WritableCatalogManager
+  pthread_mutex_t            *sync_lock_;
+  shash::Any                 base_hash_;
+  std::string                stratum0_;
+  std::string                dir_temp_;
+  upload::Spooler            *spooler_;
+  download::DownloadManager  *download_manager_;
+
+  uint64_t                   catalog_entry_warn_threshold_;
 };  // class WritableCatalogManager
 
 }  // namespace catalog

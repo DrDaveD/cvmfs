@@ -4,7 +4,7 @@
  *
  * CernVM-FS shows a remote HTTP directory as local file system.  The client
  * sees all available files.  On first access, a file is downloaded and
- * cached locally.  All downloaded pieces are verified with SHA1.
+ * cached locally.  All downloaded pieces are verified by a cryptographic hash.
  *
  * To do so, a directory hive has to be transformed into a CVMFS2
  * "repository".  This can be done by the CernVM-FS server tools.
@@ -65,6 +65,7 @@
 #include "logging.h"
 #include "tracer.h"
 #include "download.h"
+#include "wpad.h"
 #include "cache.h"
 #include "hash.h"
 #include "monitor.h"
@@ -73,13 +74,13 @@
 #include "util.h"
 #include "atomic.h"
 #include "lru.h"
-#include "peers.h"
 #include "directory_entry.h"
 #include "compression.h"
 #include "duplex_sqlite3.h"
 #include "shortstring.h"
 #include "smalloc.h"
 #include "globals.h"
+#include "backoff.h"
 #include "libcvmfs_int.h"
 
 using namespace std;  // NOLINT
@@ -93,18 +94,6 @@ const unsigned int kShortTermTTL = 180;  /**< If catalog reload fails, try again
                                               in 3 minutes */
 const time_t kIndefiniteDeadline = time_t(-1);
 
-const int kMaxInitIoDelay = 32; /**< Maximum start value for exponential
-                                     backoff */
-const int kMaxIoDelay = 2000; /**< Maximum 2 seconds */
-const int kForgetDos = 10000; /**< Clear DoS memory after 10 seconds */
-/**
- * Prevent DoS attacks on the Squid server
- */
-static struct {
-  time_t timestamp;
-  int delay;
-} previous_io_error_;
-
 bool foreground_ = false;
 string *mountpoint_ = NULL;
 string *cachedir_ = NULL;
@@ -116,6 +105,8 @@ pid_t pid_ = 0;  /**< will be set after deamon() */
 time_t boot_time_;
 pthread_mutex_t lock_max_ttl_ = PTHREAD_MUTEX_INITIALIZER;
 cache::CatalogManager *catalog_manager_;
+signature::SignatureManager *signature_manager_;
+download::DownloadManager *download_manager_;
 lru::Md5PathCache *md5path_cache_ = NULL;
 
 atomic_int64 num_fs_open_;
@@ -131,6 +122,8 @@ atomic_int32 open_dirs_; /**< number of currently open directories */
 unsigned max_open_files_; /**< maximum allowed number of open files */
 const int kNumReservedFd = 512;  /**< Number of reserved file descriptors for
                                       internal use */
+
+BackoffThrottle *backoff_throttle_;
 
 
 unsigned GetMaxTTL() {
@@ -216,7 +209,7 @@ static bool GetDirentForPath(const PathString &path,
     PathString p;
     return GetDirentForPath(p,dirent);
   }
-  hash::Md5 md5path(path.GetChars(), path.GetLength());
+  shash::Md5 md5path(path.GetChars(), path.GetLength());
   if (md5path_cache_->Lookup(md5path, dirent))
     return dirent->GetSpecial() != catalog::kDirentNegative;
 
@@ -227,7 +220,9 @@ static bool GetDirentForPath(const PathString &path,
   }
 
   LogCvmfs(kLogCvmfs, kLogDebug, "GetDirentForPath, no entry");
-  md5path_cache_->InsertNegative(md5path);
+  // Only cache real ENOENT errors, not catalog load errors
+  if (dirent->GetSpecial() == catalog::kDirentNegative)
+    md5path_cache_->InsertNegative(md5path);
   return false;
 }
 
@@ -287,7 +282,6 @@ static void *sqlite_page_cache;
 static bool options_ready;
 static bool download_ready;
 static bool cache_ready;
-static bool peers_ready;
 static bool monitor_ready;
 static bool signature_ready;
 static bool quota_ready;
@@ -308,6 +302,7 @@ int cvmfs_int_init(
   const std::string &cvmfs_opts_mountpoint,
   const std::string &cvmfs_opts_pubkey,
   const std::string &cvmfs_opts_cachedir,
+  const std::string &cvmfs_opts_alien_cachedir,
   bool cvmfs_opts_cd_to_cachedir,
   int64_t cvmfs_opts_quota_limit,
   int64_t cvmfs_opts_quota_threshold,
@@ -334,13 +329,13 @@ int cvmfs_int_init(
   options_ready = false;
   download_ready = false;
   cache_ready = false;
-  peers_ready = false;
   monitor_ready = false;
   signature_ready = false;
   quota_ready = false;
   catalog_ready = false;
   running_created = false;
   enable_async_downloads = cvmfs_opts_enable_async_downloads;
+  string chunk_cachedir;
 
   cvmfs::boot_time_ = time(NULL);
   SetupLibcryptoMt();
@@ -359,6 +354,8 @@ int cvmfs_int_init(
   g_uid = getuid();
   g_gid = getgid();
   options_ready = true;
+
+  cvmfs::backoff_throttle_ = new BackoffThrottle();
 
   // Tune SQlite3 memory
   sqlite_scratch = smalloc(8192*16);  // 8 KB for 8 threads (2 slots per thread)
@@ -381,8 +378,6 @@ int cvmfs_int_init(
   atomic_init64(&cvmfs::num_fs_read_);
   atomic_init64(&cvmfs::num_fs_readlink_);
   atomic_init32(&cvmfs::num_io_error_);
-  cvmfs::previous_io_error_.timestamp = 0;
-  cvmfs::previous_io_error_.delay = 0;
 
   // Logging
   SetLogSyslogLevel(cvmfs_opts_syslog_level);
@@ -414,8 +409,6 @@ int cvmfs_int_init(
     PrintError("cannot create cache directory " + *cvmfs::cachedir_);
     goto cvmfs_cleanup;
   }
-
-  peers_ready = true;
 
   // Try to jump to cache directory.  This tests, if it is accassible.
   // Also, it brings speed later on.
@@ -449,8 +442,17 @@ int cvmfs_int_init(
   close(retval);
   running_created = true;
 
-  // Creates a set of cache directories (256 directories named 00..ff)
-  if (!cache::Init(relative_cachedir)) {
+  // Creates a set of cache directories (256 directories named 00..ff) if not
+  // using alien cachdir
+  chunk_cachedir = relative_cachedir;
+  if (cvmfs_opts_alien_cachedir != "") {
+    if (cvmfs_opts_quota_limit > 0) {
+      PrintError("Quota management and alien cache mutually exclusive");
+      goto cvmfs_cleanup;
+    }
+    chunk_cachedir = cvmfs_opts_alien_cachedir;
+  }
+  if (!cache::Init(chunk_cachedir, cvmfs_opts_alien_cachedir != "")) {
     PrintError("Failed to setup cache in " + *cvmfs::cachedir_ +
                ": " + strerror(errno));
     goto cvmfs_cleanup;
@@ -504,14 +506,20 @@ int cvmfs_int_init(
   atomic_init32(&cvmfs::open_dirs_);
 
   // Network initialization
-  download::Init(16, false);
-  download::SetHostChain(string(cvmfs_opts_hostname));
-  download::SetProxyChain(cvmfs_opts_proxies);
-  download::SetTimeout(cvmfs_opts_timeout, cvmfs_opts_timeout_direct);
+  cvmfs::download_manager_ = new download::DownloadManager();
+  cvmfs::download_manager_->Init(16, false);
+  cvmfs::download_manager_->SetHostChain(string(cvmfs_opts_hostname));
+  cvmfs::download_manager_->SetTimeout(cvmfs_opts_timeout,
+                                       cvmfs_opts_timeout_direct);
+  cvmfs::download_manager_->SetProxyChain(
+    download::ResolveProxyDescription(cvmfs_opts_proxies,
+                                      cvmfs::download_manager_));
+  //cvmfs::download_manager_->EnableInfoHeader();
   download_ready = true;
 
-  signature::Init();
-  if (!signature::LoadPublicRsaKeys(cvmfs_opts_pubkey))
+  cvmfs::signature_manager_ = new signature::SignatureManager();
+  cvmfs::signature_manager_->Init();
+  if (!cvmfs::signature_manager_->LoadPublicRsaKeys(cvmfs_opts_pubkey))
   {
     PrintError("failed to load public key(s)");
     goto cvmfs_cleanup;
@@ -522,7 +530,7 @@ int cvmfs_int_init(
   }
   signature_ready = true;
   if (!cvmfs_opts_blacklist.empty()) {
-    if (!signature::LoadBlacklist(cvmfs_opts_blacklist)) {
+    if (!cvmfs::signature_manager_->LoadBlacklist(cvmfs_opts_blacklist)) {
       LogCvmfs(kLogCvmfs, kLogDebug, "failed to load blacklist");
       goto cvmfs_cleanup;
     }
@@ -531,10 +539,11 @@ int cvmfs_int_init(
   // Load initial file catalog
   cvmfs::catalog_manager_ = new
     cache::CatalogManager(*cvmfs::repository_name_,
-                          cvmfs_opts_ignore_signature);
+                          cvmfs::signature_manager_,
+                          cvmfs::download_manager_);
   if (!cvmfs_opts_root_hash.empty()) {
     retval = cvmfs::catalog_manager_->InitFixed(
-      hash::Any(hash::kSha1, hash::HexPtr(string(cvmfs_opts_root_hash))));
+      shash::MkFromHexPtr(shash::HexPtr(string(cvmfs_opts_root_hash))));
   } else {
     retval = cvmfs::catalog_manager_->Init();
   }
@@ -570,7 +579,7 @@ void cvmfs_int_spawn() {
     monitor::Spawn();
   }
   if (enable_async_downloads)
-    download::Spawn();
+    cvmfs::download_manager_->Spawn();
   quota::Spawn();
 
   if (*tracefile_ != "")
@@ -588,21 +597,28 @@ void cvmfs_int_fini() {
   cvmfs::catalog_manager_ = NULL;
   cvmfs::md5path_cache_ = NULL;
 
-  if (signature_ready) signature::Fini();
-  if (download_ready) download::Fini();
+  if (signature_ready) cvmfs::signature_manager_->Fini();
+  if (download_ready) cvmfs::download_manager_->Fini();
   if (monitor_ready) monitor::Fini();
   if (quota_ready) quota::Fini();
   if (cache_ready) cache::Fini();
   if (running_created) unlink((relative_cachedir + "/running." + *cvmfs::repository_name_).c_str());
   if (fd_lockfile >= 0) UnlockFile(fd_lockfile);
-  if (peers_ready) peers::Fini();
   tracer::Fini();
+
+  delete cvmfs::signature_manager_;
+  delete cvmfs::download_manager_;
+  cvmfs::signature_manager_ = NULL;
+  cvmfs::download_manager_ = NULL;
 
   sqlite3_shutdown();
   free(sqlite_page_cache);
   free(sqlite_scratch);
   sqlite_page_cache = NULL;
   sqlite_scratch = NULL;
+
+  delete cvmfs::backoff_throttle_;
+  cvmfs::backoff_throttle_ = NULL;
 
   CleanupLibcryptoMt();
 }
@@ -622,7 +638,9 @@ int cvmfs_open(const char *c_path)
     return -ENOENT;
   }
 
-  fd = cache::FetchDirent(dirent, string(path.GetChars(), path.GetLength()));
+  const bool volatile_content = false;
+  fd = cache::FetchDirent(dirent, string(path.GetChars(), path.GetLength()),
+                          volatile_content, cvmfs::download_manager_);
   atomic_inc64(&num_fs_open_);
 
   if (fd >= 0) {
@@ -646,17 +664,7 @@ int cvmfs_open(const char *c_path)
   }
 
   // Prevent Squid DoS
-  // TODO: move to download
-  time_t now = time(NULL);
-  if (now - previous_io_error_.timestamp < kForgetDos) {
-    usleep(previous_io_error_.delay*1000);
-    if (previous_io_error_.delay < kMaxIoDelay)
-      previous_io_error_.delay *= 2;
-  } else {
-    // Initial delay
-    previous_io_error_.delay = (random() % (kMaxInitIoDelay-1)) + 2;
-  }
-  previous_io_error_.timestamp = now;
+  backoff_throttle_->Throttle();
 
   atomic_inc32(&num_io_error_);
   return fd;

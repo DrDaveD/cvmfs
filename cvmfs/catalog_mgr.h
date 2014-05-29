@@ -19,6 +19,7 @@
 
 #include "catalog.h"
 #include "directory_entry.h"
+#include "file_chunk.h"
 #include "hash.h"
 #include "atomic.h"
 #include "util.h"
@@ -32,8 +33,9 @@ const unsigned kSqliteMemPerThread = 1*1024*1024;
  * Lookup a directory entry including its parent entry or not.
  */
 enum LookupOptions {
-  kLookupSole = 0,
-  kLookupFull,
+  kLookupSole        = 0x01,
+  kLookupFull        = 0x02,
+  kLookupRawSymlink  = 0x10,
 };
 
 
@@ -46,6 +48,20 @@ enum LoadError {
   kLoadNoSpace,
   kLoadFail,
 };
+
+inline const char *Code2Ascii(const LoadError error) {
+  const int kNumElems = 4;
+  if (error >= kNumElems)
+    return "no text available (internal error)";
+
+  const char *texts[kNumElems];
+  texts[0] = "loaded new catalog";
+  texts[1] = "catalog was up to date";
+  texts[2] = "not enough space to load catalog";
+  texts[3] = "failed to load catalog";
+
+  return texts[error];
+}
 
 
 struct Statistics {
@@ -161,6 +177,10 @@ class AbstractCatalogManager {
   }
   bool ListingStat(const PathString &path, StatEntryList *listing);
 
+  bool ListFileChunks(const PathString &path,
+                      const shash::Algorithms interpret_hashes_as,
+                      FileChunkList *chunks);
+
   void RegisterRemountListener(RemountListener *listener) {
     WriteLock();
     remount_listener_ = listener;
@@ -173,6 +193,7 @@ class AbstractCatalogManager {
     ReadLock(); uint64_t r = inode_gauge_; Unlock(); return r;
   }
   uint64_t GetRevision() const;
+  bool GetVolatileFlag() const;
   uint64_t GetTTL() const;
   int GetNumCatalogs() const;
   std::string PrintHierarchy() const;
@@ -203,9 +224,9 @@ class AbstractCatalogManager {
    * Both the input as well as the output hash can be 0.
    */
   virtual LoadError LoadCatalog(const PathString &mountpoint,
-                                const hash::Any &hash,
-                                std::string *catalog_path,
-                                hash::Any   *catalog_hash) = 0;
+                                const shash::Any &hash,
+                                std::string  *catalog_path,
+                                shash::Any   *catalog_hash) = 0;
   virtual void UnloadCatalog(const Catalog *catalog) { };
   virtual void ActivateCatalog(const Catalog *catalog) { };
 
@@ -218,11 +239,11 @@ class AbstractCatalogManager {
    * @param parent_catalog  the parent of the catalog to create
    * @return a newly created (derived) Catalog
    */
-  virtual Catalog* CreateCatalog(const PathString &mountpoint,
-                                 const hash::Any  &catalog_hash,
+  virtual Catalog* CreateCatalog(const PathString  &mountpoint,
+                                 const shash::Any  &catalog_hash,
                                  Catalog *parent_catalog) = 0;
 
-  Catalog *MountCatalog(const PathString &mountpoint, const hash::Any &hash,
+  Catalog *MountCatalog(const PathString &mountpoint, const shash::Any &hash,
                         Catalog *parent_catalog);
   bool MountSubtree(const PathString &path, const Catalog *entry_point,
                     Catalog **leaf_catalog);
@@ -252,12 +273,15 @@ class AbstractCatalogManager {
   virtual void EnforceSqliteMemLimit();
 
  private:
+  void CheckInodeWatermark();
+
   /**
    * This list is only needed to find a catalog given an inode.
    * This might possibly be done by walking the catalog tree, similar to
    * finding a catalog given the path.
    */
   CatalogList catalogs_;
+  int inode_watermark_status_;  /**< 0: OK, 1: > 32bit */
   uint64_t inode_gauge_;  /**< highest issued inode */
   uint64_t revision_cache_;
   uint64_t incarnation_;  /**< counts how often the inodes have been invalidated */

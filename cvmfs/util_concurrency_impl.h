@@ -14,7 +14,7 @@ namespace CVMFS_NAMESPACE_GUARD {
 
 
 template <typename T>
-Future<T>::Future() : object_was_set_(false) {
+Future<T>::Future() : object_(), object_was_set_(false) {
   const bool init_successful = (pthread_mutex_init(&mutex_, NULL)     == 0   &&
                                 pthread_cond_init(&object_set_, NULL) == 0);
   assert (init_successful);
@@ -59,6 +59,58 @@ template <typename T>
 const T& Future<T>::Get() const {
   Wait();
   return object_;
+}
+
+
+//
+// +----------------------------------------------------------------------------
+// |  SynchronizingCounter
+//
+
+
+template <typename T>
+void SynchronizingCounter<T>::SetValueUnprotected(const T new_value) {
+  // make sure that 0 <= new_value <= maximal_value_ if maximal_value_ != 0
+  assert ( ! HasMaximalValue() ||
+          (new_value >= T(0) && new_value <= maximal_value_));
+
+  value_ = new_value;
+
+  if (value_ == T(0)) {
+    pthread_cond_broadcast(&became_zero_);
+  }
+
+  if (HasMaximalValue() && value_ < maximal_value_) {
+    pthread_cond_broadcast(&free_slot_);
+  }
+}
+
+
+template <typename T>
+void SynchronizingCounter<T>::WaitForFreeSlotUnprotected() {
+  while (HasMaximalValue() && value_ >= maximal_value_) {
+    pthread_cond_wait(&free_slot_, &mutex_);
+  }
+  assert (! HasMaximalValue() || value_ < maximal_value_);
+}
+
+
+template <typename T>
+void SynchronizingCounter<T>::Initialize() {
+  const bool init_successful = (
+    pthread_mutex_init(&mutex_,       NULL) == 0 &&
+    pthread_cond_init (&became_zero_, NULL) == 0 &&
+    pthread_cond_init (&free_slot_,   NULL) == 0
+  );
+  assert (init_successful);
+}
+
+
+template <typename T>
+void SynchronizingCounter<T>::Destroy() {
+  pthread_mutex_destroy(&mutex_);
+  pthread_cond_destroy (&became_zero_);
+  pthread_cond_destroy (&free_slot_);
 }
 
 
@@ -360,10 +412,16 @@ bool ConcurrentWorkers<WorkerT>::SpawnWorkers() {
   }
 
   // spawn the callback processing thread
-  pthread_create(&callback_thread_,
-                 NULL,
-                 &ConcurrentWorkers<WorkerT>::RunCallbackThreadWrapper,
-          (void*)&thread_context_);
+  const int retval =
+    pthread_create(&callback_thread_,
+                    NULL,
+                   &ConcurrentWorkers<WorkerT>::RunCallbackThreadWrapper,
+            (void*)&thread_context_);
+    if (retval != 0) {
+      LogCvmfs(kLogConcurrency, kLogWarning, "Failed to spawn the callback "
+                                             "worker thread");
+      success = false;
+    }
 
   // wait for all workers to report in...
   {

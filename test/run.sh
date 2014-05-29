@@ -4,6 +4,7 @@ usage() {
   echo "$0 <logfile> [<test list> | -x <exclusion list>]"
 }
 
+export LC_ALL=C
 
 # set up a log file
 logfile=$1
@@ -36,6 +37,7 @@ export TEST_ROOT
 
 num_tests=0
 num_skipped=0
+num_passed=0
 num_failures=0
 num_warnings=0
 
@@ -54,6 +56,11 @@ report_warning() {
   local message="$1"
   echo $message
   num_warnings=$(($num_warnings+1))
+}
+report_passed() {
+  local message="$1"
+  echo $message
+  num_passed=$(($num_passed+1))
 }
 report_skipped() {
   local message="$1"
@@ -80,12 +87,17 @@ setup_environment() {
   fi
 
   # configure autofs to the test's needs
-  if $autofs_demand; then
-    if ! autofs_switch on; then
-      echo "failed to switch on autofs"
-      return 103
-    fi
-  else
+  service_switch autofs restart || true
+  local timeout=10 # wait until autofs restarts (possible race >.<)
+  while [ $timeout -gt 0 ] && ! autofs_check; do
+    timeout=$(( $timeout - 1))
+    sleep 1
+  done
+  if [ $timeout -eq 0 ]; then
+    echo "failed to restart autofs"
+    return 103
+  fi
+  if ! $autofs_demand; then
     if ! autofs_switch off; then
       echo "failed to switch off autofs"
       return 104
@@ -123,7 +135,7 @@ do
   fi
 
   # write some status info to the screen
-  echo "-- Testing ${cvmfs_test_name}" >> $logfile
+  echo "-- Testing ${cvmfs_test_name} ($(date) / test number $(basename $t | head -c3))" >> $logfile
   echo -n "Testing ${cvmfs_test_name}... "
 
   # check if test should be skipped
@@ -146,24 +158,24 @@ do
          cd $workdir                            && \
          cvmfs_run_test $logfile $(pwd)/${t}    && \
          retval=\$?                             && \
-         kill_all_perl_services                 && \
          retval=\$(mangle_test_retval \$retval) && \
-         exit \$retval"
+         exit \$retval" >> $logfile 2>&1
   RETVAL=$?
 
   # check the final test result
   case $RETVAL in
     0)
-      rm -rf "$workdir"
+      sudo rm -rf "$workdir" >> $logfile
+      report_passed "Test passed" >> $logfile
       echo "OK"
       ;;
     $CVMFS_MEMORY_WARNING)
-      rm -rf "$workdir"
+      sudo rm -rf "$workdir" >> $logfile
       report_warning "Memory limit exceeded!" >> $logfile
       echo "Memory Warning!"
       ;;
     $CVMFS_TIME_WARNING)
-      rm -rf "$workdir"
+      sudo rm -rf "$workdir" >> $logfile
       report_warning "Time limit exceeded!" >> $logfile
       echo "Time Warning!"
       ;;
@@ -181,7 +193,9 @@ echo "Finished test suite" >> $logfile
 echo ""
 echo "Tests:    $num_tests"
 echo "Skipped:  $num_skipped"
+echo "Passed:   $num_passed"
 echo "Warnings: $num_warnings"
 echo "Failures: $num_failures"
+echo ""
 
 exit $num_failures

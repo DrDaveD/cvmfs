@@ -22,6 +22,8 @@ class CommandPull : public Command {
     result.push_back(Parameter('m', "repository name", false, false));
     result.push_back(Parameter('r', "spooler definition", false, false));
     result.push_back(Parameter('k', "repository master key(s)", false, false));
+    result.push_back(Parameter('y', "trusted certificate directories",
+                               true, false));
     result.push_back(Parameter('x', "directory for temporary files",
                                false, false));
     result.push_back(Parameter('n', "number of download threads", true, false));
@@ -29,6 +31,8 @@ class CommandPull : public Command {
     result.push_back(Parameter('t', "timeout (s)", true, false));
     result.push_back(Parameter('a', "number of retries", true, false));
     result.push_back(Parameter('p', "pull catalog history, too", true, true));
+    result.push_back(Parameter('c', "preload cache instead of stratum 1",
+                               true, true));
     return result;
   }
   int Main(const ArgumentList &args);

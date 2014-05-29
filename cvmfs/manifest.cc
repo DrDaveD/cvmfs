@@ -89,18 +89,18 @@ Manifest *Manifest::Load(const map<char, string> &content) {
   map<char, string>::const_iterator iter;
 
   // Required keys
-  hash::Any catalog_hash;
-  hash::Md5 root_path;
+  shash::Any catalog_hash;
+  shash::Md5 root_path;
   uint32_t ttl;
   uint64_t revision;
 
   iter = content.find('C');
   if ((iter = content.find('C')) == content.end())
     return NULL;
-  catalog_hash = hash::Any(hash::kSha1, hash::HexPtr(iter->second));
+  catalog_hash = MkFromHexPtr(shash::HexPtr(iter->second));
   if ((iter = content.find('R')) == content.end())
     return NULL;
-  root_path = hash::Md5(hash::HexPtr(iter->second));
+  root_path = shash::Md5(shash::HexPtr(iter->second));
   if ((iter = content.find('D')) == content.end())
     return NULL;
   ttl = String2Uint64(iter->second);
@@ -109,20 +109,23 @@ Manifest *Manifest::Load(const map<char, string> &content) {
   revision = String2Uint64(iter->second);
 
   // Optional keys
-  hash::Any micro_catalog_hash;
+  uint64_t catalog_size = 0;
+  shash::Any micro_catalog_hash;
   string repository_name;
-  hash::Any certificate;
-  hash::Any history;
+  shash::Any certificate;
+  shash::Any history;
   uint64_t publish_timestamp = 0;
 
+  if ((iter = content.find('B')) != content.end())
+    catalog_size = String2Uint64(iter->second);
   if ((iter = content.find('L')) != content.end())
-    micro_catalog_hash = hash::Any(hash::kSha1, hash::HexPtr(iter->second));
+    micro_catalog_hash = MkFromHexPtr(shash::HexPtr(iter->second));
   if ((iter = content.find('N')) != content.end())
     repository_name = iter->second;
   if ((iter = content.find('X')) != content.end())
-    certificate = hash::Any(hash::kSha1, hash::HexPtr(iter->second));
+    certificate = MkFromHexPtr(shash::HexPtr(iter->second));
   if ((iter = content.find('H')) != content.end())
-    history = hash::Any(hash::kSha1, hash::HexPtr(iter->second));
+    history = MkFromHexPtr(shash::HexPtr(iter->second));
   if ((iter = content.find('T')) != content.end())
     publish_timestamp = String2Uint64(iter->second);
 
@@ -137,19 +140,23 @@ Manifest *Manifest::Load(const map<char, string> &content) {
       history::UpdateChannel channel =
         static_cast<history::UpdateChannel>(channel_int);
       channel_tops.push_back(history::TagList::ChannelTag(
-        channel, hash::Any(hash::kSha1, hash::HexPtr(elements[i].substr(2)))));
+        channel, MkFromHexPtr(shash::HexPtr(elements[i].substr(2)))));
     }
   }
 
-  return new Manifest(catalog_hash, root_path, ttl, revision,
+  return new Manifest(catalog_hash, catalog_size, root_path, ttl, revision,
                       micro_catalog_hash, repository_name, certificate,
                       history, publish_timestamp, channel_tops);
 }
 
 
-Manifest::Manifest(const hash::Any &catalog_hash, const string &root_path) {
+Manifest::Manifest(const shash::Any &catalog_hash,
+                   const uint64_t catalog_size,
+                   const string &root_path)
+{
   catalog_hash_ = catalog_hash;
-  root_path_ = hash::Md5(hash::AsciiPtr(root_path));
+  catalog_size_ = catalog_size;
+  root_path_ = shash::Md5(shash::AsciiPtr(root_path));
   ttl_ = catalog::Catalog::kDefaultTTL;
   revision_ = 0;
   publish_timestamp_ = 0;
@@ -162,6 +169,7 @@ Manifest::Manifest(const hash::Any &catalog_hash, const string &root_path) {
 string Manifest::ExportString() const {
   string manifest =
     "C" + catalog_hash_.ToString() + "\n" +
+    "B" + StringifyInt(catalog_size_) + "\n" +
     "R" + root_path_.ToString() + "\n" +
     "D" + StringifyInt(ttl_) + "\n" +
     "S" + StringifyInt(revision_) + "\n";
@@ -206,6 +214,34 @@ bool Manifest::Export(const std::string &path) const {
   }
   fclose(fmanifest);
 
+  return true;
+}
+
+
+/**
+ * Writes the cvmfschecksum.$repository file.  Atomic store.
+ */
+bool Manifest::ExportChecksum(const string &directory, const int mode) const {
+  string checksum_path = MakeCanonicalPath(directory) + "/cvmfschecksum." +
+                         repository_name_;
+  string checksum_tmp_path;
+  FILE *fchksum = CreateTempFile(checksum_path, mode, "w", &checksum_tmp_path);
+  if (fchksum == NULL)
+    return false;
+  string cache_checksum = catalog_hash_.ToString() + "T" +
+                          StringifyInt(publish_timestamp_);
+  int written = fwrite(&(cache_checksum[0]), 1, cache_checksum.length(),
+                       fchksum);
+  fclose(fchksum);
+  if (static_cast<unsigned>(written) != cache_checksum.length()) {
+    unlink(checksum_tmp_path.c_str());
+    return false;
+  }
+  int retval = rename(checksum_tmp_path.c_str(), checksum_path.c_str());
+  if (retval != 0) {
+    unlink(checksum_tmp_path.c_str());
+    return false;
+  }
   return true;
 }
 

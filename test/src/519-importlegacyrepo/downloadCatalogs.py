@@ -8,24 +8,17 @@ import shutil
 import tempfile
 from optparse import OptionParser
 
-foundSqlite = False
-foundSqlite3 = False
-
 # figure out which sqlite module to use
-# in Python 2.4 an old version is present
-# which does not allow proper read out of
-# long int and therefore cannot merge catalogs
+# in Python 2.4 there is dbapi2 in pysqlite2 which will become sqlite3
+# in the standard library later on but was not at this time (software archeology)
 try:
-	import sqlite3 as sqlite
-	foundSqlite3 = True
+	import sqlite3
 except:
-	pass
-if not foundSqlite3:
-	try:
-		import sqlite
-		foundSqlite = True
-	except ImportError, e:
-		pass
+	from pysqlite2 import dbapi2 as sqlite3
+
+
+def hash2hex(hash):
+	return "".join(map(lambda c: ("%0.2X" % c).lower(),map(ord,hash)))
 
 
 def doHttpRequest(url):
@@ -57,14 +50,12 @@ def getCatalogFilePath(catalogName, catalogDirectory):
 	return catalogDirectory + "/" + catalogName[0:2] + "/" + catalogName[2:] + "C"
 
 
-def downloadCatalog(repositoryUrl, catalogName, catalogDirectory, beVerbose):
-	# find out some pathes and init the zlib decompressor
-	subdir = catalogName[0:2]
-	filename = catalogName[2:] + "C"
-	url = repositoryUrl + "/data/" + subdir + "/" + filename
-	destDir = catalogDirectory + "/" + subdir + "/"
-	dest = destDir + filename
-	#decoder = zlib.decompressobj()
+def downloadObject(repositoryUrl, objectName, resultDirectory, beVerbose):
+	subdir   = objectName[0:2]
+	filename = objectName[2:]
+	url      = repositoryUrl + "/data/" + subdir + "/" + filename
+	destDir  = resultDirectory + "/" + subdir + "/"
+	dest     = destDir + filename
 
 	# create target directory if not existing and open output file
 	createDirectory(destDir)
@@ -77,14 +68,21 @@ def downloadCatalog(repositoryUrl, catalogName, catalogDirectory, beVerbose):
 		fileSize = int(meta.getheaders("Content-Length")[0])
 
 		if beVerbose:
-			print "retrieving " + catalogName + " - " + str(fileSize) + " bytes"
+			print "retrieving " + objectName + " - " + str(fileSize) + " bytes"
 
-		with open(dest, "wb") as local_file:
+		local_file = open(dest, "wb")
+		try:
 			local_file.write(f.read())
+		finally:
+			local_file.close()
 	except HTTPError, e:
-		printError("HTTP: " + e.code + url)
+		printError("HTTP: " + str(e.code) + " " + url)
 	except URLError, e:
-		printError("URL:" + e.reason + url)
+		printError("URL: " + e.reason +  " " + url)
+
+
+def downloadCatalog(repositoryUrl, catalogName, catalogDirectory, beVerbose):
+	downloadObject(repositoryUrl, catalogName + "C", catalogDirectory, beVerbose)
 
 
 def decompressCatalog(filename, destination):
@@ -95,12 +93,12 @@ def decompressCatalog(filename, destination):
 	f.close()
 
 
-def findNestedCatalogs(catalogName, catalogDirectory):
+def findNestedCatalogs(catalogName, catalogDirectory, repositoryUrl, beVerbose, getDirtab):
 	catalogFile = getCatalogFilePath(catalogName, catalogDirectory)
 	tempFile    = tempfile.NamedTemporaryFile('wb')
 	decompressCatalog(catalogFile, tempFile.name)
 
-	dbHandle = sqlite.connect(tempFile.name)
+	dbHandle = sqlite3.connect(tempFile.name)
 	cursor = dbHandle.cursor()
 	catalogs = []
 
@@ -110,12 +108,22 @@ def findNestedCatalogs(catalogName, catalogDirectory):
 	for catalog in result:
 		catalogs.append(catalog[0])
 
+	# dirtab entry
+	if getDirtab:
+		cursor.execute("SELECT hash FROM catalog WHERE name = '.cvmfsdirtab'")
+		result = cursor.fetchall()
+		for dirtab in result:
+			print "--> found .cvmfsdirtab"
+			sha1 = hash2hex(result[0][0])
+			downloadObject(repositoryUrl, sha1, catalogDirectory, beVerbose)
+
+
 	dbHandle.close()
 	tempFile.close()
 	return catalogs
 
 
-def retrieveCatalogsRecursively(repositoryUrl, catalogName, catalogDirectory, beVerbose):
+def retrieveCatalogsRecursively(repositoryUrl, catalogName, catalogDirectory, beVerbose, getDirtab):
 	catalogs = [catalogName]
 	downloads = 0
 	while catalogs:
@@ -126,7 +134,7 @@ def retrieveCatalogsRecursively(repositoryUrl, catalogName, catalogDirectory, be
 			continue
 
 		downloadCatalog(repositoryUrl, catalog, catalogDirectory, beVerbose)
-		nestedCatalogs = findNestedCatalogs(catalog, catalogDirectory)
+		nestedCatalogs = findNestedCatalogs(catalog, catalogDirectory, repositoryUrl, beVerbose, getDirtab)
 		downloads += 1
 
 		if beVerbose:
@@ -141,6 +149,7 @@ def main():
 	parser = OptionParser(usage)
 	parser.add_option("-d", "--directory", dest="catalogDirectory", default="catalogs", help="the directory to download catalogs to")
 	parser.add_option("-q", "--quiet", action="store_false", dest="verbose", default=True, help="don't print status messages to stdout")
+	parser.add_option("-t", "--get-dirtab", dest="getDirtab", action="store_true", default=False, help="download the data chunk for .cvmfsdirtab")
 	(options, args) = parser.parse_args()
 
 	if len(args) != 1:
@@ -150,6 +159,7 @@ def main():
 	repositoryUrl = args[0]
 	catalogDirectory = options.catalogDirectory
 	verbose = options.verbose
+	getDirtab = options.getDirtab
 
 	# check option consistency
 	if os.path.exists(catalogDirectory) and os.listdir(catalogDirectory) != []:
@@ -157,7 +167,7 @@ def main():
 
 	# do the job
 	rootCatalog = getRootCatalogName(repositoryUrl)
-	numCatalogs = retrieveCatalogsRecursively(repositoryUrl, rootCatalog, catalogDirectory, verbose)
+	numCatalogs = retrieveCatalogsRecursively(repositoryUrl, rootCatalog, catalogDirectory, verbose, getDirtab)
 
 	print "downloaded" , numCatalogs , "catalogs"
 

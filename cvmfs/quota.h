@@ -12,11 +12,13 @@
 #include <string>
 #include <vector>
 
-namespace hash {
+namespace shash {
 struct Any;
 }
 
 namespace quota {
+
+static const std::string checksum_file_prefix = "cvmfschecksum";
 
 bool Init(const std::string &cache_dir, const uint64_t limit,
           const uint64_t cleanup_threshold, const bool rebuild_database);
@@ -30,13 +32,15 @@ int MainCacheManager(int argc, char **argv);
 bool RebuildDatabase();
 bool Cleanup(const uint64_t leave_size);
 
-void Insert(const hash::Any &hash, const uint64_t size,
+void Insert(const shash::Any &hash, const uint64_t size,
             const std::string &cmvfs_path);
-bool Pin(const hash::Any &hash, const uint64_t size,
+void InsertVolatile(const shash::Any &hash, const uint64_t size,
+                    const std::string &cmvfs_path);
+bool Pin(const shash::Any &hash, const uint64_t size,
          const std::string &path_on_cvmfs, const bool is_catalog);
-void Unpin(const hash::Any &hash);
-void Touch(const hash::Any &hash);
-void Remove(const hash::Any &file);
+void Unpin(const shash::Any &hash);
+void Touch(const shash::Any &hash);
+void Remove(const shash::Any &file);
 std::vector<std::string> List();
 std::vector<std::string> ListPinned();
 std::vector<std::string> ListCatalogs();

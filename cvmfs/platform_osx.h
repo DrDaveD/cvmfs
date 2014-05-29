@@ -16,12 +16,16 @@
 #include <alloca.h>
 #include <signal.h>
 #include <mach-o/dyld.h>
+#include <sys/param.h>
+#include <sys/ucred.h>
+#include <sys/mount.h>
 
 #include <cstring>
 #include <cassert>
 #include <cstdlib>
 
 #include <string>
+#include <vector>
 
 #include "smalloc.h"
 
@@ -41,6 +45,24 @@ namespace CVMFS_NAMESPACE_GUARD {
  * HOST_NAME_MAX does on exist on OS X
  */
 #define HOST_NAME_MAX _POSIX_HOST_NAME_MAX
+
+
+inline std::vector<std::string> platform_mountlist() {
+  std::vector<std::string> result;
+  struct statfs *mntbufp;
+  int num_elems = getmntinfo(&mntbufp, MNT_NOWAIT);  // modifies static memory
+  for (int i = 0; i < num_elems; ++i) {
+    result.push_back(mntbufp[i].f_mntonname);
+  }
+  return result;
+}
+
+
+inline bool platform_umount(const char *mountpoint, const bool lazy) {
+  const int flags = lazy ? MNT_FORCE : 0;
+  int retval = unmount(mountpoint, flags);
+  return retval == 0;
+}
 
 
 /**
@@ -126,8 +148,12 @@ inline bool platform_getxattr(const std::string &path, const std::string &name,
     free(buffer);
     return false;
   }
-  value->assign(static_cast<const char *>(buffer), size);
-  free(buffer);
+  if (retval > 0) {
+    value->assign(static_cast<const char *>(buffer), size);
+    free(buffer);
+  } else {
+    value->assign("");
+  }
   return true;
 }
 

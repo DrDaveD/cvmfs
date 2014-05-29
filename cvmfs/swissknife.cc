@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "logging.h"
+#include "download.h"
+#include "signature.h"
 #include "swissknife_zpipe.h"
 #include "swissknife_check.h"
 #include "swissknife_lsrepo.h"
@@ -23,11 +25,14 @@
 #include "swissknife_info.h"
 #include "swissknife_history.h"
 #include "swissknife_migrate.h"
+#include "swissknife_scrub.h"
 
 using namespace std;  // NOLINT
 using namespace swissknife;
 
 vector<swissknife::Command *> command_list;
+download::DownloadManager *swissknife::g_download_manager;
+signature::SignatureManager *swissknife::g_signature_manager;
 
 void swissknife::Usage() {
   LogCvmfs(kLogCvmfs, kLogStdout,
@@ -65,6 +70,9 @@ void swissknife::Usage() {
 
 
 int main(int argc, char **argv) {
+  g_download_manager = new download::DownloadManager();
+  g_signature_manager = new signature::SignatureManager();
+
   command_list.push_back(new swissknife::CommandCreate());
   command_list.push_back(new swissknife::CommandUpload());
   command_list.push_back(new swissknife::CommandRemove());
@@ -80,6 +88,7 @@ int main(int argc, char **argv) {
   command_list.push_back(new swissknife::CommandInfo());
   command_list.push_back(new swissknife::CommandVersion());
   command_list.push_back(new swissknife::CommandMigrate());
+  command_list.push_back(new swissknife::CommandScrub());
 
   if (argc < 2) {
     swissknife::Usage();
@@ -87,8 +96,8 @@ int main(int argc, char **argv) {
   }
   if ((string(argv[1]) == "--help")) {
     swissknife::Usage();
-		return 0;
-	}
+    return 0;
+  }
   if ((string(argv[1]) == "--version")) {
     swissknife::CommandVersion().Main(swissknife::ArgumentList());
     return 0;
@@ -105,7 +114,7 @@ int main(int argc, char **argv) {
         if (!params[j].switch_only())
           option_string.push_back(':');
       }
-      char c;
+      int c;
       while ((c = getopt(argc, argv, option_string.c_str())) != -1) {
         bool valid_option = false;
         for (unsigned j = 0; j < params.size(); ++j) {
@@ -137,6 +146,8 @@ int main(int argc, char **argv) {
     }
   }
 
+  delete g_signature_manager;
+  delete g_download_manager;
   swissknife::Usage();
   return 1;
 }

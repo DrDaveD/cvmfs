@@ -6,6 +6,7 @@ import sys
 import time
 import threading
 import os
+import datetime
 
 def usage():
 	print >> sys.stderr, "This opens a socket on a given port number and waits for connection."
@@ -18,14 +19,14 @@ print_lock = threading.Lock()
 def print_msg(msg):
 	global print_lock
 	print_lock.acquire()
-	print >> sys.stderr, "[Silent Socket]" , msg
+	print "[Silent Socket]" , msg
 	print_lock.release()
-	sys.stderr.flush()
+	sys.stdout.flush()
 
 
 class SilentHandler(SocketServer.BaseRequestHandler):
 	def handle(self):
-		print_msg("incoming connection: " + str(self.client_address))
+		print_msg("(" + str(datetime.datetime.now()) + ") incoming connection: " + str(self.client_address))
 		time.sleep(100000000)
 
 class ThreadedTCPServer(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
@@ -56,8 +57,6 @@ try:
 	else:
 		usage()
 
-	print os.getpid()
-	sys.stdout.flush()
 	print_msg("starting a " + server_protocol + " server on port " + str(server_port))
 	server.serve_forever()
 except socket.error, msg:

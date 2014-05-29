@@ -1,19 +1,27 @@
 
 %{?suse_version:%define dist .suse%suse_version}
-%if 0%{?el6} || 0%{?fc17}
+%if 0%{?el6} || 0%{?fc17} || 0%{?fc18} || 0%{?fc19} || 0%{?fc20}
 %define selinux_cvmfs 1
 %define selinux_variants mls strict targeted
+%endif
+%if 0%{?dist:1}
+%else
+  %define redhat_major %(cat /etc/issue | head -n1 | tr -cd [0-9] | head -c1)
+  %if 0%{?redhat_major} == 4
+    %define el4 1
+    %define dist .el4
+  %endif
 %endif
 
 %define __strip /bin/true
 %define debug_package %{nil}
-%if 0%{?el6} || 0%{?el5}
+%if 0%{?el6} || 0%{?el5} || 0%{?el4}
 %define __os_install_post %{nil}
 %endif
 
 Summary: CernVM File System
 Name: cvmfs
-Version: 2.1.13
+Version: 2.1.19
 Release: 1%{?dist}
 Source0: https://ecsft.cern.ch/dist/cvmfs/%{name}-%{version}.tar.gz
 %if 0%{?selinux_cvmfs}
@@ -23,8 +31,13 @@ Group: Applications/System
 License: BSD
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 
+%if 0%{?el4}
+BuildRequires: gcc4
+BuildRequires: gcc4-c++
+%else
 BuildRequires: gcc
 BuildRequires: gcc-c++
+%endif
 BuildRequires: cmake
 BuildRequires: fuse-devel
 BuildRequires: pkgconfig
@@ -62,7 +75,7 @@ Requires: fuse-libs
 Requires: glibc-common
 Requires: which
 Requires: shadow-utils
-  %if 0%{?el5}
+  %if 0%{?el5} || 0%{?el4}
 Requires: SysVinit
   %else
 Requires: sysvinit-tools
@@ -112,12 +125,16 @@ Requires: attr
 Requires: openssl
 Requires: httpd
 Requires: cvmfs-keys >= 1.2
+
+Conflicts: cvmfs-server < 2.1
+
 %description server
 CernVM-FS tools to maintain Stratum 0/1 repositories
 
 %package unittests
 Summary: CernVM-FS unit tests binary
 Group: Application/System
+Requires: cvmfs-server = %{version}
 %description unittests
 CernVM-FS unit tests binary.  This RPM is not required except for testing.
 
@@ -130,16 +147,23 @@ cp %{SOURCE1} SELinux
 %endif
 
 %build
-%ifarch x86_64
-%else
-export CFLAGS="-march=i686"
-export CXXFLAGS="-march=i686"
+
+%ifarch i386 i686
+export CXXFLAGS="`echo %{optflags}|sed 's/march=i386/march=i686/'`"
+export CFLAGS="`echo %{optflags}|sed 's/march=i386/march=i686/'`"
 %endif
+
+%if 0%{?el4}
+export CC=gcc4
+export CXX=g++4
+%endif
+
 %if 0%{?suse_version}
-cmake -DCMAKE_INSTALL_LIBDIR:PATH=%{_lib} -DBUILD_SERVER=yes -DBUILD_SERVER_DEBUG=yes -DBUILD_LIBCVMFS=yes -DBUILD_UNITTESTS=yes -DCMAKE_INSTALL_PREFIX:PATH=/usr .
+cmake -DCMAKE_INSTALL_LIBDIR:PATH=%{_lib} -DBUILD_SERVER=yes -DBUILD_SERVER_DEBUG=yes -DBUILD_LIBCVMFS=yes -DBUILD_UNITTESTS=yes -DINSTALL_UNITTESTS=yes -DCMAKE_INSTALL_PREFIX:PATH=/usr .
 %else
-%cmake -DCMAKE_INSTALL_LIBDIR:PATH=%{_lib} -DBUILD_SERVER=yes -DBUILD_SERVER_DEBUG=yes -DBUILD_LIBCVMFS=yes -DBUILD_UNITTESTS=yes .
+%cmake -DCMAKE_INSTALL_LIBDIR:PATH=%{_lib} -DBUILD_SERVER=yes -DBUILD_SERVER_DEBUG=yes -DBUILD_LIBCVMFS=yes -DBUILD_UNITTESTS=yes -DINSTALL_UNITTESTS=yes .
 %endif
+
 make %{?_smp_mflags}
 
 %if 0%{?selinux_cvmfs}
@@ -187,11 +211,11 @@ export DONT_STRIP=1
 rm -rf $RPM_BUILD_ROOT
 
 make DESTDIR=$RPM_BUILD_ROOT install
-cp test/unittests/CernVM-FS_test $RPM_BUILD_ROOT/usr/bin/cvmfs_unittests
 mkdir -p $RPM_BUILD_ROOT/var/lib/cvmfs
 mkdir -p $RPM_BUILD_ROOT/cvmfs
 mkdir -p $RPM_BUILD_ROOT/etc/cvmfs/config.d
 mkdir -p $RPM_BUILD_ROOT/etc/cvmfs/repositories.d
+mkdir -p $RPM_BUILD_ROOT/etc/bash_completion.d
 
 # Keys are in cvmfs-keys
 rm -f $RPM_BUILD_ROOT/etc/cvmfs/keys/*
@@ -200,6 +224,11 @@ rm -f $RPM_BUILD_ROOT/etc/cvmfs/keys/*
 %if 0%{?suse_version}
 mkdir -p %RPM_BUILD_ROOT/usr/share/doc/package/%{name}
 mv $RPM_BUILD_ROOT/usr/share/doc/%{name}-%{version} %RPM_BUILD_ROOT/usr/share/doc/package/%{name}
+%endif
+
+# Fix docdir on FC20
+%if 0%{?fc20}
+rm -rf $RPM_BUILD_ROOT/usr/share/doc/%{name}-%{version}
 %endif
 
 %if 0%{?selinux_cvmfs}
@@ -281,8 +310,11 @@ fi
 %dir %{_sysconfdir}/cvmfs/domain.d
 %dir /cvmfs
 %attr(700,cvmfs,cvmfs) %dir /var/lib/cvmfs
+%{_sysconfdir}/cvmfs/default.d/README
 %config %{_sysconfdir}/cvmfs/default.conf
 %config %{_sysconfdir}/cvmfs/domain.d/cern.ch.conf
+%dir %{_sysconfdir}/bash_completion.d
+%config(noreplace) %{_sysconfdir}/bash_completion.d/cvmfs
 %doc COPYING AUTHORS README ChangeLog
 
 %files devel 
@@ -295,8 +327,17 @@ fi
 %defattr(-,root,root)
 %{_bindir}/cvmfs_swissknife
 %{_bindir}/cvmfs_swissknife_debug
-%{_bindir}/cvmfs_server
+%{_bindir}/cvmfs_suid_helper
+%{_bindir}/cvmfs_server 
 %{_sysconfdir}/cvmfs/cvmfs_server_hooks.sh.demo
+%{_libdir}/libtbb_cvmfs.so
+%{_libdir}/libtbb_cvmfs.so.2
+%{_libdir}/libtbbmalloc_cvmfs.so
+%{_libdir}/libtbbmalloc_cvmfs.so.2
+%{_libdir}/libtbb_cvmfs_debug.so
+%{_libdir}/libtbb_cvmfs_debug.so.2
+%{_libdir}/libtbbmalloc_cvmfs_debug.so
+%{_libdir}/libtbbmalloc_cvmfs_debug.so.2
 %dir %{_sysconfdir}/cvmfs/repositories.d
 %doc COPYING AUTHORS README ChangeLog
 
@@ -305,6 +346,18 @@ fi
 %{_bindir}/cvmfs_unittests
 
 %changelog
+* Thu Apr 10 2014 Jakob Blomer <jblomer@cern.ch> - 2.1.18
+- Add /etc/cvmfs/default.d
+* Thu Apr 3 2014 Jakob Blomer <jblomer@cern.ch> - 2.1.18
+- Fix for EL6.5 32bit
+* Tue Feb 11 2014 Jakob Blomer <jblomer@cern.ch> - 2.1.18
+- Fedora 20 compatibility fixes
+* Tue Jan 21 2014 Jakob Blomer <jblomer@cern.ch> - 2.1.17
+- SL4 compatibility fixes
+* Fri Dec 20 2013 Jakob Blomer <jblomer@cern.ch> - 2.1.16
+- Add cvmfs_suid_binary
+* Thu Nov 14 2013 Jakob Blomer <jblomer@cern.ch> - 2.1.16
+- Fixes for ARM builds
 * Tue Jun 04 2013 Jakob Blomer <jblomer@cern.ch> - 2.1.12
 - Add cvmfs_swissknife_debug binary
 - Add cvmfs-unittests package
@@ -325,9 +378,9 @@ fi
 - Compatibility fixes for OpenSuSE
 * Mon Feb 20 2012 Jakob Blomer <jblomer@cern.ch>
 - Brought selinux back into main package
-* Fri Feb 18 2012 Jakob Blomer <jblomer@cern.ch>
+* Sat Feb 18 2012 Jakob Blomer <jblomer@cern.ch>
 - Included Brian's latest changes: group creation bug fixes, selinux as sub package
-* Wed Feb 16 2012 Jakob Blomer <jblomer@cern.ch>
+* Thu Feb 16 2012 Jakob Blomer <jblomer@cern.ch>
 - SuSE compatibility, disabled SELinux for SuSE
 * Wed Feb 15 2012 Jakob Blomer <jblomer@cern.ch>
 - Small adjustments to run with continueous integration

@@ -8,7 +8,10 @@
 #ifndef CVMFS_FS_TRAVERSAL_H_
 #define CVMFS_FS_TRAVERSAL_H_
 
+#include <errno.h>
+
 #include <cassert>
+#include <cstdlib>
 
 #include <string>
 #include <set>
@@ -78,18 +81,18 @@ class FileSystemTraversal {
    */
   FileSystemTraversal(T *delegate,
                       const std::string &relative_to_directory,
-                      const bool recurse)
+                      const bool recurse) :
+    fn_enter_dir(NULL),
+    fn_leave_dir(NULL),
+    fn_new_file(NULL),
+    fn_new_symlink(NULL),
+    fn_ignore_file(NULL),
+    fn_new_dir_prefix(NULL),
+    fn_new_dir_postfix(NULL),
+    delegate_(delegate),
+    relative_to_directory_(relative_to_directory),
+    recurse_(recurse)
   {
-    delegate_ = delegate;
-    relative_to_directory_ = relative_to_directory;
-    recurse_ = recurse;
-    fn_enter_dir = NULL;
-    fn_leave_dir = NULL;
-    fn_new_file = NULL;
-    fn_new_symlink = NULL;
-    fn_ignore_file = NULL;
-    fn_new_dir_prefix = NULL;
-    fn_new_dir_postfix = NULL;
     Init();
   }
 
@@ -125,7 +128,7 @@ class FileSystemTraversal {
 
   void DoRecursion(const std::string &parent_path, const std::string &dir_name)
     const
-	{
+  {
     DIR *dip;
     platform_dirent64 *dit;
     const std::string path = parent_path + ((!dir_name.empty()) ?
@@ -135,16 +138,29 @@ class FileSystemTraversal {
     LogCvmfs(kLogFsTraversal, kLogVerboseMsg, "entering %s (%s -- %s)",
              path.c_str(), parent_path.c_str(), dir_name.c_str());
     dip = opendir(path.c_str());
-    assert(dip);
+    if (!dip) {
+      LogCvmfs(kLogFsTraversal, kLogStderr, "Failed to open %s (%d).\n"
+               "Please check directory permissions.",
+               path.c_str(), errno);
+      abort();
+    }
     Notify(fn_enter_dir, parent_path, dir_name);
 
-    // Walk through the open directory notifying the about contents
+    // Walk through the open directory notifying the user about contents
     while ((dit = platform_readdir(dip)) != NULL) {
-      // Check if filename should be ignored
-      if (std::string(dit->d_name) == "." || std::string(dit->d_name) == ".." ||
-          (fn_ignore_file != NULL && Notify(fn_ignore_file, path, dit->d_name)))
-      {
+      // Check if file should be ignored
+      if (std::string(dit->d_name) == "." || std::string(dit->d_name) == "..") {
         continue;
+      } else if (fn_ignore_file != NULL) {
+        if (Notify(fn_ignore_file, path, dit->d_name)) {
+          LogCvmfs(kLogFsTraversal, kLogVerboseMsg, "ignoring %s/%s",
+                   path.c_str(), dit->d_name);
+          continue;
+        }
+      } else {
+        LogCvmfs(kLogFsTraversal, kLogVerboseMsg,
+                 "not ignoring %s/%s (fn_ignore_file not set)",
+                 path.c_str(), dit->d_name);
       }
 
       // Notify user about found directory entry
