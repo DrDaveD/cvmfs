@@ -7,7 +7,7 @@
 HERE="`dirname $0`"
 cd $HERE
 ME="`basename $0`"
-PKG="`sed -n 's/^Source: //p' $HERE/control`"
+PKG="`sed -n 's/^Source: //p' $HERE/control.in`"
 SPECFILE="../../rpm/${PKG}-universal.spec"
 VERSION="$(grep ^Version: $SPECFILE | awk '{print $2}')"
 RPMREL="$(grep '^%define release_prefix' $SPECFILE | awk '{print $3}')"
@@ -22,7 +22,8 @@ echo "Debtransform-Tar: ${PKG}-${VERSION}.tar.gz"
 echo "Format: 1.0"
 echo "Version: ${VERSION}-${RPMREL}"
 echo "Binary: $PKG"
-cat control
+# this ignores customization done in ../../../ci/cvmfs/deb.sh
+cat control.in
 echo "Files:"
 echo "  ffffffffffffffffffffffffffffffff 99999 file1"
 echo "  ffffffffffffffffffffffffffffffff 99999 file2"

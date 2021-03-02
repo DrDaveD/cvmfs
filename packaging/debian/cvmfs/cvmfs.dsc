@@ -1,8 +1,10 @@
 # created by obsupdate.sh, do not edit by hand
-Debtransform-Tar: cvmfs-2.6.3.tar.gz
+Debtransform-Tar: cvmfs-2.8.0.tar.gz
 Format: 1.0
-Version: 2.6.3-1
+Version: 2.8.0-1
 Binary: cvmfs
+# The file is adjusted in ci/cvmfs/deb.sh
+
 Source: cvmfs
 Section: utils
 Priority: extra
@@ -14,7 +16,7 @@ Homepage: http://cernvm.cern.ch/portal/filesystem
 Package: cvmfs
 Architecture: i386 amd64 armhf arm64
 #Pre-Depends: ${misc:Pre-Depends}   (preparation for multiarch support)
-Depends: cvmfs-config-default | cvmfs-config, gawk, perl, psmisc, autofs, fuse, curl, attr, libfuse2, zlib1g, gdb, uuid-dev, uuid, adduser, ${misc:Depends}
+Depends: cvmfs-config-default | cvmfs-config, gawk, psmisc, autofs, fuse, curl, attr, libfuse2, zlib1g, gdb, uuid-dev, uuid, adduser, ${misc:Depends}
 Recommends: autofs (>= 5.1.2)
 #Multi-Arch: same   (preparation for multiarch support)
 Homepage: http://cernvm.cern.ch
@@ -24,7 +26,8 @@ Description: CernVM File System
 Package: cvmfs-server
 Architecture: i386 amd64 armhf arm64
 #Pre-Depends: ${misc:Pre-Depends}   (preparation for multiarch support)
-Depends: insserv, initscripts, psmisc, curl, attr, openssl, apache2, libcap2, libcap2-bin, lsof, rsync, jq, usbutils, sqlite3, ${misc:Depends}
+Depends: psmisc, curl, attr, openssl, libcap2, libcap2-bin, lsof, rsync, jq, usbutils, sqlite3, ${misc:Depends}
+Recommends: apache2
 Conflicts: cvmfs-server (<< 2.1)
 #Multi-Arch: same   (preparation for multiarch support)
 Homepage: http://cernvm.cern.ch
@@ -57,6 +60,17 @@ Depends: libssl-dev, uuid-dev, ${misc:Depends}
 Homepage: http://cernvm.cern.ch
 Description: CernVM File System Unit Tests
  HTTP File System for Distributing Software to CernVM.
+
+#FUSE3-BEGIN
+Package: cvmfs-fuse3
+Architecture: i386 amd64 armhf arm64
+#Pre-Depends: ${misc:Pre-Depends}   (preparation for multiarch support)
+Depends: fuse3, libfuse3-3
+#Multi-Arch: same   (preparation for multiarch support)
+Homepage: http://cernvm.cern.ch
+Description: CernVM File System fuse3 libraries
+ Shared libraries implementing the CernVM-FS fuse module based on libfuse3
+#FUSE3-END
 Files:
   ffffffffffffffffffffffffffffffff 99999 file1
   ffffffffffffffffffffffffffffffff 99999 file2
