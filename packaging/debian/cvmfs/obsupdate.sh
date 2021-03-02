@@ -23,7 +23,7 @@ echo "Format: 1.0"
 echo "Version: ${VERSION}-${RPMREL}"
 echo "Binary: $PKG"
 # this ignores more customization done in ../../../ci/cvmfs/deb.sh
-cat control.in|awk '/#FUSE3-BEGIN/{flag=1;next}/#FUSE3-END/{flag=0;next} !flag'
+sed '/^$/d' control.in|awk '/#FUSE3-BEGIN/{flag=1;next}/#FUSE3-END/{flag=0;next} !flag'
 echo "Files:"
 echo "  ffffffffffffffffffffffffffffffff 99999 file1"
 echo "  ffffffffffffffffffffffffffffffff 99999 file2"

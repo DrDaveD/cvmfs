@@ -4,7 +4,6 @@ Format: 1.0
 Version: 2.8.0-1
 Binary: cvmfs
 # The file is adjusted in ci/cvmfs/deb.sh
-
 Source: cvmfs
 Section: utils
 Priority: extra
@@ -12,7 +11,6 @@ Maintainer: Jakob Blomer <jblomer@cern.ch>
 Build-Depends: debhelper (>= 9), autotools-dev, cmake, cpio, libcap-dev, libssl-dev, libfuse-dev, pkg-config, libattr1-dev, patch, python-dev, python-setuptools, unzip, uuid-dev, valgrind, libz-dev
 Standards-Version: 3.9.6.1
 Homepage: http://cernvm.cern.ch/portal/filesystem
-
 Package: cvmfs
 Architecture: i386 amd64 armhf arm64
 #Pre-Depends: ${misc:Pre-Depends}   (preparation for multiarch support)
@@ -22,7 +20,6 @@ Recommends: autofs (>= 5.1.2)
 Homepage: http://cernvm.cern.ch
 Description: CernVM File System
  HTTP File System for Distributing Software to CernVM.
-
 Package: cvmfs-server
 Architecture: i386 amd64 armhf arm64
 #Pre-Depends: ${misc:Pre-Depends}   (preparation for multiarch support)
@@ -33,7 +30,6 @@ Conflicts: cvmfs-server (<< 2.1)
 Homepage: http://cernvm.cern.ch
 Description: CernVM-FS server utilities
  HTTP File System Repository Server for Distributing Software to CernVM.
-
 Package: cvmfs-dev
 Architecture: i386 amd64 armhf arm64
 #Pre-Depends: ${misc:Pre-Depends}   (preparation for multiarch support)
@@ -42,7 +38,6 @@ Depends: openssl, ${misc:Depends}
 Homepage: http://cernvm.cern.ch
 Description: CernVM-FS client library
  CernVM-FS static client library
-
 Package: cvmfs-shrinkwrap
 Architecture: i386 amd64 armhf arm64
 #Pre-Depends: ${misc:Pre-Depends}   (preparation for multiarch support)
@@ -51,7 +46,6 @@ Depends: openssl, python, ${misc:Depends}
 Homepage: http://cernvm.cern.ch
 Description: CernVM-FS shrinkwrap utility to export /cvmfs file system trees
  CernVM-FS shrinkwrap utility to export /cvmfs file system trees into container images.
-
 Package: cvmfs-unittests
 Architecture: i386 amd64 armhf arm64
 #Pre-Depends: ${misc:Pre-Depends}   (preparation for multiarch support)
@@ -60,7 +54,6 @@ Depends: libssl-dev, uuid-dev, ${misc:Depends}
 Homepage: http://cernvm.cern.ch
 Description: CernVM File System Unit Tests
  HTTP File System for Distributing Software to CernVM.
-
 Files:
   ffffffffffffffffffffffffffffffff 99999 file1
   ffffffffffffffffffffffffffffffff 99999 file2
