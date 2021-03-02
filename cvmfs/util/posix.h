@@ -31,6 +31,26 @@ const size_t kMaxPathLength = 256;
 const int kDefaultFileMode = S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH;
 const int kDefaultDirMode = S_IXUSR | S_IWUSR | S_IRUSR |
                             S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
+const int kPrivateFileMode = S_IWUSR | S_IRUSR;
+const int kPrivateDirMode = S_IXUSR | S_IWUSR | S_IRUSR;
+
+/**
+ * The magic numbers that identify a file system in statfs()
+ * Adjust GetFileSystemInfo() when new file systems are added
+ */
+enum EFileSystemTypes {
+  kFsTypeUnknown = 0,
+  kFsTypeAutofs = 0x0187,
+  kFsTypeNFS = 0x6969,
+  kFsTypeProc = 0x9fa0,
+  kFsTypeBeeGFS = 0x19830326
+};
+
+struct FileSystemInfo {
+  FileSystemInfo() : type(kFsTypeUnknown), is_rdonly(false) {}
+  EFileSystemTypes type;
+  bool is_rdonly;
+};
 
 std::string MakeCanonicalPath(const std::string &path);
 std::string GetParentPath(const std::string &path);
@@ -43,6 +63,10 @@ void SplitPath(const std::string &path,
 bool IsAbsolutePath(const std::string &path);
 std::string GetAbsolutePath(const std::string &path);
 bool IsHttpUrl(const std::string &path);
+
+std::string ResolvePath(const std::string &path);
+bool IsMountPoint(const std::string &path);
+FileSystemInfo GetFileSystemInfo(const std::string &path);
 
 void CreateFile(const std::string &path, const int mode,
                 const bool ignore_failure = false);
@@ -60,8 +84,6 @@ bool DiffTree(const std::string &path_a, const std::string &path_b);
 void Nonblock2Block(int filedes);
 void Block2Nonblock(int filedes);
 void SendMsg2Socket(const int fd, const std::string &msg);
-void LockMutex(pthread_mutex_t *mutex);
-void UnlockMutex(pthread_mutex_t *mutex);
 
 bool SwitchCredentials(const uid_t uid, const gid_t gid,
                        const bool temporarily);
@@ -89,15 +111,23 @@ std::vector<std::string> FindFilesBySuffix(const std::string &dir,
 std::vector<std::string> FindFilesByPrefix(const std::string &dir,
                                            const std::string &prefix);
 std::vector<std::string> FindDirectories(const std::string &parent_dir);
+std::string FindExecutable(const std::string &exe);
+bool ListDirectory(const std::string &directory,
+                   std::vector<std::string> *names,
+                   std::vector<mode_t> *modes);
 
+std::string GetUserName();
+std::string GetShell();
 bool GetUidOf(const std::string &username, uid_t *uid, gid_t *main_gid);
 bool GetGidOf(const std::string &groupname, gid_t *gid);
 mode_t GetUmask();
 bool AddGroup2Persona(const gid_t gid);
+std::string GetHomeDirectory();
 
 int SetLimitNoFile(unsigned limit_nofile);
 void GetLimitNoFile(unsigned *soft_limit, unsigned *hard_limit);
 
+bool ProcessExists(pid_t pid);
 void BlockSignal(int signum);
 void WaitForSignal(int signum);
 int WaitForChild(pid_t pid);
@@ -107,13 +137,14 @@ bool ExecuteBinary(int *fd_stdin,
                    int *fd_stdout,
                    int *fd_stderr,
                    const std::string &binary_path,
-                   const std::vector<std::string>  &argv,
+                   const std::vector<std::string> &argv,
                    const bool double_fork = true,
                    pid_t *child_pid = NULL);
 bool ManagedExec(const std::vector<std::string> &command_line,
                  const std::set<int> &preserve_fildes,
                  const std::map<int, int> &map_fildes,
                  const bool drop_credentials,
+                 const bool clear_env = false,
                  const bool double_fork = true,
                  pid_t *child_pid = NULL);
 
@@ -128,7 +159,6 @@ bool SafeWriteV(int fd, struct iovec *iov, unsigned iovcnt);
 bool SafeReadToString(int fd, std::string *final_result);
 bool SafeWriteToFile(const std::string &content,
                      const std::string &path, int mode);
-
 
 struct Pipe : public SingleCopy {
   Pipe() {

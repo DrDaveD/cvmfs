@@ -24,6 +24,7 @@
 #include "sync_item_tar.h"
 #include "sync_mediator.h"
 #include "sync_union.h"
+#include "util/exception.h"
 #include "util/posix.h"
 #include "util_concurrency.h"
 
@@ -121,7 +122,6 @@ void SyncUnionTarball::Traverse() {
   // we are simplying deleting entity from  the repo
   if (NULL == src) return;
 
-  bool first_iteration = true;
   struct archive_entry *entry = archive_entry_new();
   while (true) {
     // Get the lock, wait if lock is not available yet
@@ -131,10 +131,8 @@ void SyncUnionTarball::Traverse() {
 
     switch (result) {
       case ARCHIVE_FATAL: {
-        LogCvmfs(kLogUnionFs, kLogStderr,
-                 "Fatal error in reading the archive.\n%s\n",
-                 archive_error_string(src));
-        abort();
+        PANIC(kLogStderr, "Fatal error in reading the archive.\n%s\n",
+              archive_error_string(src));
         break;  // Only exit point with error
       }
 
@@ -147,6 +145,12 @@ void SyncUnionTarball::Traverse() {
       }
 
       case ARCHIVE_EOF: {
+        if (create_catalog_on_root_ && (base_directory_ != "/")) {
+          SharedPtr<SyncItem> catalog = SharedPtr<SyncItem>(
+              new SyncItemDummyCatalog(base_directory_, this));
+          ProcessFile(catalog);
+          to_create_catalog_dirs_.insert(base_directory_);
+        }
         for (set<string>::iterator dir = to_create_catalog_dirs_.begin();
              dir != to_create_catalog_dirs_.end(); ++dir) {
           assert(dirs_.find(*dir) != dirs_.end());
@@ -168,23 +172,6 @@ void SyncUnionTarball::Traverse() {
       }
 
       case ARCHIVE_OK: {
-        if (first_iteration && create_catalog_on_root_) {
-          struct archive_entry *catalog = archive_entry_new();
-          std::string catalog_path = ".cvmfscatalog";
-          archive_entry_set_pathname(catalog, catalog_path.c_str());
-          archive_entry_set_size(catalog, 0);
-          archive_entry_set_filetype(catalog, AE_IFREG);
-          archive_entry_set_perm(catalog, kDefaultFileMode);
-          archive_entry_set_gid(catalog, getgid());
-          archive_entry_set_uid(catalog, getuid());
-          ProcessArchiveEntry(catalog);
-          archive_entry_free(catalog);
-          // The ProcessArchiveEntry does call Wakeup on the signal, in this
-          // particular corner case we need to re-wait for it.
-          read_archive_signal_->Wait();
-        }
-        first_iteration = false;
-
         ProcessArchiveEntry(entry);
         break;
       }
@@ -192,11 +179,8 @@ void SyncUnionTarball::Traverse() {
       default: {
         // We should never enter in this branch, but just for safeness we prefer
         // to abort in case we hit a case we don't how to manage.
-        LogCvmfs(kLogUnionFs, kLogStderr,
-                 "Enter in unknow state. Aborting.\nError: %s\n", result,
-                 archive_error_string(src));
-
-        abort();
+        PANIC(kLogStderr, "Enter in unknow state. Aborting.\nError: %s\n",
+              result, archive_error_string(src));
       }
     }
   }
@@ -207,11 +191,14 @@ void SyncUnionTarball::ProcessArchiveEntry(struct archive_entry *entry) {
   archive_file_path = SanitizePath(archive_file_path);
 
   std::string complete_path =
-      MakeCanonicalPath(base_directory_ + "/" + archive_file_path);
+      base_directory_ != "/"
+          ? MakeCanonicalPath(base_directory_ + "/" + archive_file_path)
+          : MakeCanonicalPath(archive_file_path);
 
   std::string parent_path;
   std::string filename;
   SplitPath(complete_path, &parent_path, &filename);
+  if (parent_path == ".") parent_path.clear();
 
   CreateDirectories(parent_path);
 
@@ -219,8 +206,11 @@ void SyncUnionTarball::ProcessArchiveEntry(struct archive_entry *entry) {
       parent_path, filename, src, entry, read_archive_signal_, this));
 
   if (NULL != archive_entry_hardlink(entry)) {
-    const std::string hardlink =
-        base_directory_ + "/" + std::string(archive_entry_hardlink(entry));
+    const std::string hardlink_name(
+        SanitizePath(archive_entry_hardlink(entry)));
+    const std::string hardlink = base_directory_ != "/"
+                                     ? base_directory_ + "/" + hardlink_name
+                                     : hardlink_name;
 
     if (hardlinks_.find(hardlink) != hardlinks_.end()) {
       hardlinks_.find(hardlink)->second.push_back(complete_path);
@@ -228,6 +218,10 @@ void SyncUnionTarball::ProcessArchiveEntry(struct archive_entry *entry) {
       std::list<std::string> to_hardlink;
       to_hardlink.push_back(complete_path);
       hardlinks_[hardlink] = to_hardlink;
+    }
+    if (filename == ".cvmfscatalog") {
+      // the file is created in the PostUpload phase
+      to_create_catalog_dirs_.insert(parent_path);
     }
     read_archive_signal_->Wakeup();
     return;
@@ -259,11 +253,10 @@ void SyncUnionTarball::ProcessArchiveEntry(struct archive_entry *entry) {
     if (filename != ".cvmfscatalog") {
       ProcessFile(sync_entry);
     } else {
-      LogCvmfs(kLogUnionFs, kLogStderr,
-               "Found entity called as a catalog marker '%s' that however is "
-               "not a regular file, abort",
-               complete_path.c_str());
-      abort();
+      PANIC(kLogStderr,
+            "Found entity called as a catalog marker '%s' that however is "
+            "not a regular file, abort",
+            complete_path.c_str());
     }
 
     // here we don't need to read data from the tar file so we can wake up
@@ -271,22 +264,24 @@ void SyncUnionTarball::ProcessArchiveEntry(struct archive_entry *entry) {
     read_archive_signal_->Wakeup();
 
   } else {
-    LogCvmfs(kLogUnionFs, kLogStderr,
-             "Fatal error found unexpected file: \n%s\n", filename.c_str());
+    PANIC(kLogStderr, "Fatal error found unexpected file: \n%s\n",
+          filename.c_str());
     // if for any reason this code path change and we don't abort anymore,
     // remember to wakeup the signal, otherwise we will be stuck in a deadlock
     //
     // read_archive_signal_->Wakeup();
-    abort();
   }
 }
 
 std::string SyncUnionTarball::SanitizePath(const std::string &path) {
   if (path.length() >= 2) {
     if (path[0] == '.' && path[1] == '/') {
-      std::string to_return(path);
-      to_return.erase(0, 2);
-      return to_return;
+      return path.substr(2);
+    }
+  }
+  if (path.length() >= 1) {
+    if (path[0] == '/') {
+      return path.substr(1);
     }
   }
   return path;

@@ -23,7 +23,6 @@
 // inode.  See also integration test #23.
 
 #define ENOATTR ENODATA  /**< instead of including attr/xattr.h */
-#define FUSE_USE_VERSION 26
 
 #ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
@@ -38,8 +37,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fuse/fuse_lowlevel.h>
-#include <fuse/fuse_opt.h>
 #include <google/dense_hash_map>
 #include <inttypes.h>
 #include <openssl/crypto.h>
@@ -79,6 +76,7 @@
 #include "compression.h"
 #include "directory_entry.h"
 #include "download.h"
+#include "duplex_fuse.h"
 #include "fence.h"
 #include "fetch.h"
 #include "file_chunk.h"
@@ -91,6 +89,7 @@
 #include "loader.h"
 #include "logging.h"
 #include "lru_md.h"
+#include "magic_xattr.h"
 #include "manifest_fetch.h"
 #include "monitor.h"
 #include "mountpoint.h"
@@ -108,6 +107,7 @@
 #include "statistics.h"
 #include "talk.h"
 #include "tracer.h"
+#include "util/exception.h"
 #include "util_concurrency.h"
 #include "uuid.h"
 #include "wpad.h"
@@ -370,6 +370,8 @@ static void inline TraceInode(const int event,
  * We do check catalog TTL here (and reload, if necessary).
  */
 static void cvmfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_lookup());
+
   perf::Inc(file_system_->n_fs_lookup());
   const struct fuse_ctx *fuse_ctx = fuse_req_ctx(req);
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
@@ -378,6 +380,7 @@ static void cvmfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
   fuse_remounter_->fence()->Enter();
   catalog::ClientCatalogManager *catalog_mgr = mount_point_->catalog_mgr();
 
+  fuse_ino_t parent_fuse = parent;
   parent = catalog_mgr->MangleInode(parent);
   LogCvmfs(kLogCvmfs, kLogDebug,
            "cvmfs_lookup in parent inode: %" PRIu64 " for name: %s",
@@ -444,6 +447,8 @@ static void cvmfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
   return;
 
  lookup_reply_negative:
+  // Will be a no-op if there is no fuse cache eviction
+  mount_point_->nentry_tracker()->Add(parent_fuse, name, timeout);
   fuse_remounter_->fence()->Leave();
   perf::Inc(file_system_->n_fs_lookup_negative());
   result.ino = 0;
@@ -462,8 +467,14 @@ static void cvmfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
 static void cvmfs_forget(
   fuse_req_t req,
   fuse_ino_t ino,
+#if CVMFS_USE_LIBFUSE == 2
   unsigned long nlookup  // NOLINT
+#else
+  uint64_t nlookup
+#endif
 ) {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_forget());
+
   perf::Inc(file_system_->n_fs_forget());
 
   // The libfuse high-level library does the same
@@ -476,8 +487,13 @@ static void cvmfs_forget(
   ino = mount_point_->catalog_mgr()->MangleInode(ino);
   // This has been seen to deadlock on the debug log mutex on SL5.  Problem of
   // old kernel/fuse?
+#if CVMFS_USE_LIBCVMFS == 2
   LogCvmfs(kLogCvmfs, kLogDebug, "forget on inode %" PRIu64 " by %u",
            uint64_t(ino), nlookup);
+#else
+  LogCvmfs(kLogCvmfs, kLogDebug, "forget on inode %" PRIu64 " by %" PRIu64,
+           uint64_t(ino), nlookup);
+#endif
   if (!file_system_->IsNfsSource())
     mount_point_->inode_tracker()->VfsPut(ino, nlookup);
   fuse_remounter_->fence()->Leave();
@@ -485,9 +501,44 @@ static void cvmfs_forget(
 }
 
 
+#if (FUSE_VERSION >= 29)
+static void cvmfs_forget_multi(
+  fuse_req_t req,
+  size_t count,
+  struct fuse_forget_data *forgets
+) {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_forget_multi());
+
+  perf::Xadd(file_system_->n_fs_forget(), count);
+  if (file_system_->IsNfsSource()) {
+    fuse_reply_none(req);
+    return;
+  }
+
+  fuse_remounter_->fence()->Enter();
+  for (size_t i = 0; i < count; ++i) {
+    if (forgets[i].ino == FUSE_ROOT_ID) {
+      continue;
+    }
+
+    uint64_t ino = mount_point_->catalog_mgr()->MangleInode(forgets[i].ino);
+    LogCvmfs(kLogCvmfs, kLogDebug, "forget on inode %" PRIu64 " by %" PRIu64,
+             ino, forgets[i].nlookup);
+
+    mount_point_->inode_tracker()->VfsPut(ino, forgets[i].nlookup);
+  }
+  fuse_remounter_->fence()->Leave();
+
+  fuse_reply_none(req);
+}
+#endif  // FUSE_VERSION >= 29
+
+
 /**
  * Looks into dirent to decide if this is an EIO negative reply or an
- * ENOENT negative reply
+ * ENOENT negative reply.  We do not need to store the reply in the negative
+ * cache tracker because ReplyNegative is called on inode queries.  Inodes,
+ * however, change anyway when a new catalog is applied.
  */
 static void ReplyNegative(const catalog::DirectoryEntry &dirent,
                           fuse_req_t req)
@@ -505,6 +556,8 @@ static void ReplyNegative(const catalog::DirectoryEntry &dirent,
 static void cvmfs_getattr(fuse_req_t req, fuse_ino_t ino,
                           struct fuse_file_info *fi)
 {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_getattr());
+
   perf::Inc(file_system_->n_fs_stat());
   const struct fuse_ctx *fuse_ctx = fuse_req_ctx(req);
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
@@ -540,6 +593,8 @@ static void cvmfs_getattr(fuse_req_t req, fuse_ino_t ino,
  * Reads a symlink from the catalog.  Environment variables are expanded.
  */
 static void cvmfs_readlink(fuse_req_t req, fuse_ino_t ino) {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_readlink());
+
   perf::Inc(file_system_->n_fs_readlink());
   const struct fuse_ctx *fuse_ctx = fuse_req_ctx(req);
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
@@ -598,6 +653,8 @@ static void AddToDirListing(const fuse_req_t req,
 static void cvmfs_opendir(fuse_req_t req, fuse_ino_t ino,
                           struct fuse_file_info *fi)
 {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_opendir());
+
   const struct fuse_ctx *fuse_ctx = fuse_req_ctx(req);
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
   fuse_remounter_->TryFinish();
@@ -696,17 +753,26 @@ static void cvmfs_opendir(fuse_req_t req, fuse_ino_t ino,
     stream_listing.capacity = 0;
 
   // Save the directory listing and return a handle to the listing
-  pthread_mutex_lock(&lock_directory_handles_);
-  LogCvmfs(kLogCvmfs, kLogDebug,
-           "linking directory handle %d to dir inode: %" PRIu64,
-           next_directory_handle_, uint64_t(ino));
-  (*directory_handles_)[next_directory_handle_] = stream_listing;
-  fi->fh = next_directory_handle_;
-  ++next_directory_handle_;
-  pthread_mutex_unlock(&lock_directory_handles_);
+  {
+    MutexLockGuard m(&lock_directory_handles_);
+    LogCvmfs(kLogCvmfs, kLogDebug,
+             "linking directory handle %d to dir inode: %" PRIu64,
+             next_directory_handle_, uint64_t(ino));
+    (*directory_handles_)[next_directory_handle_] = stream_listing;
+    fi->fh = next_directory_handle_;
+    ++next_directory_handle_;
+  }
   perf::Inc(file_system_->n_fs_dir_open());
   perf::Inc(file_system_->no_open_dirs());
 
+#if (FUSE_VERSION >= 30)
+#ifdef CVMFS_ENABLE_FUSE3_CACHE_READDIR
+  // This affects only reads on the same open directory handle (e.g. multiple
+  // reads with rewinddir() between them).  A new opendir on the same directory
+  // will trigger readdir calls independently of this setting.
+  fi->cache_readdir = 1;
+#endif
+#endif
   fuse_reply_open(req, fi);
 }
 
@@ -717,26 +783,27 @@ static void cvmfs_opendir(fuse_req_t req, fuse_ino_t ino,
 static void cvmfs_releasedir(fuse_req_t req, fuse_ino_t ino,
                              struct fuse_file_info *fi)
 {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_releasedir());
+
   ino = mount_point_->catalog_mgr()->MangleInode(ino);
   LogCvmfs(kLogCvmfs, kLogDebug, "cvmfs_releasedir on inode %" PRIu64
            ", handle %d", uint64_t(ino), fi->fh);
 
   int reply = 0;
 
-  pthread_mutex_lock(&lock_directory_handles_);
-  DirectoryHandles::iterator iter_handle =
-    directory_handles_->find(fi->fh);
-  if (iter_handle != directory_handles_->end()) {
-    if (iter_handle->second.capacity == 0)
-      smunmap(iter_handle->second.buffer);
-    else
-      free(iter_handle->second.buffer);
-    directory_handles_->erase(iter_handle);
-    pthread_mutex_unlock(&lock_directory_handles_);
-    perf::Dec(file_system_->no_open_dirs());
-  } else {
-    pthread_mutex_unlock(&lock_directory_handles_);
-    reply = EINVAL;
+  {
+    MutexLockGuard m(&lock_directory_handles_);
+    DirectoryHandles::iterator iter_handle = directory_handles_->find(fi->fh);
+    if (iter_handle != directory_handles_->end()) {
+      if (iter_handle->second.capacity == 0)
+        smunmap(iter_handle->second.buffer);
+      else
+        free(iter_handle->second.buffer);
+      directory_handles_->erase(iter_handle);
+      perf::Dec(file_system_->no_open_dirs());
+    } else {
+      reply = EINVAL;
+    }
   }
 
   fuse_reply_err(req, reply);
@@ -765,24 +832,24 @@ static void ReplyBufferSlice(const fuse_req_t req, const char *buffer,
 static void cvmfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
                           off_t off, struct fuse_file_info *fi)
 {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_readdir());
+
   LogCvmfs(kLogCvmfs, kLogDebug,
            "cvmfs_readdir on inode %" PRIu64 " reading %d bytes from offset %d",
            uint64_t(mount_point_->catalog_mgr()->MangleInode(ino)), size, off);
 
   DirectoryListing listing;
 
-  pthread_mutex_lock(&lock_directory_handles_);
+  MutexLockGuard m(&lock_directory_handles_);
   DirectoryHandles::const_iterator iter_handle =
     directory_handles_->find(fi->fh);
   if (iter_handle != directory_handles_->end()) {
     listing = iter_handle->second;
-    pthread_mutex_unlock(&lock_directory_handles_);
 
     ReplyBufferSlice(req, listing.buffer, listing.size, off, size);
     return;
   }
 
-  pthread_mutex_unlock(&lock_directory_handles_);
   fuse_reply_err(req, EINVAL);
 }
 
@@ -796,6 +863,8 @@ static void cvmfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
                        struct fuse_file_info *fi)
 {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_open());
+
   const struct fuse_ctx *fuse_ctx = fuse_req_ctx(req);
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
   fuse_remounter_->fence()->Enter();
@@ -991,6 +1060,8 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
 static void cvmfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                        struct fuse_file_info *fi)
 {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_read());
+
   LogCvmfs(kLogCvmfs, kLogDebug,
            "cvmfs_read inode: %" PRIu64 " reading %d bytes from offset %d "
            "fd %d", uint64_t(mount_point_->catalog_mgr()->MangleInode(ino)),
@@ -1029,7 +1100,7 @@ static void cvmfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 
     // Lock chunk handle
     pthread_mutex_t *handle_lock = chunk_tables->Handle2Lock(chunk_handle);
-    LockMutex(handle_lock);
+    MutexLockGuard m(handle_lock);
     chunk_tables->Lock();
     retval = chunk_tables->handle2fd.Lookup(chunk_handle, &chunk_fd);
     assert(retval);
@@ -1068,7 +1139,6 @@ static void cvmfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
           chunk_tables->Lock();
           chunk_tables->handle2fd.Insert(chunk_handle, chunk_fd);
           chunk_tables->Unlock();
-          UnlockMutex(handle_lock);
           fuse_reply_err(req, EIO);
           return;
         }
@@ -1095,7 +1165,6 @@ static void cvmfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
         chunk_tables->Lock();
         chunk_tables->handle2fd.Insert(chunk_handle, chunk_fd);
         chunk_tables->Unlock();
-        UnlockMutex(handle_lock);
         fuse_reply_err(req, -bytes_fetched);
         return;
       }
@@ -1111,7 +1180,6 @@ static void cvmfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     chunk_tables->Lock();
     chunk_tables->handle2fd.Insert(chunk_handle, chunk_fd);
     chunk_tables->Unlock();
-    UnlockMutex(handle_lock);
     LogCvmfs(kLogCvmfs, kLogDebug, "released chunk file descriptor %d",
              chunk_fd.fd);
   } else {
@@ -1137,6 +1205,8 @@ static void cvmfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 static void cvmfs_release(fuse_req_t req, fuse_ino_t ino,
                           struct fuse_file_info *fi)
 {
+  HighPrecisionTimer guard_timer(file_system_->hist_fs_release());
+
   ino = mount_point_->catalog_mgr()->MangleInode(ino);
   LogCvmfs(kLogCvmfs, kLogDebug, "cvmfs_release on inode: %" PRIu64,
            uint64_t(ino));
@@ -1243,7 +1313,6 @@ static void cvmfs_statfs(fuse_req_t req, fuse_ino_t ino) {
   fuse_reply_statfs(req, &info);
 }
 
-
 #ifdef __APPLE__
 static void cvmfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
                            size_t size, uint32_t position)
@@ -1289,6 +1358,14 @@ static void cvmfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
     retval = catalog_mgr->LookupXattrs(path, &xattrs);
     assert(retval);
   }
+
+  MagicXattrRAIIWrapper magic_xattr;
+  bool magic_xattr_success = true;
+  magic_xattr = mount_point_->magic_xattr_mgr()->Get(attr, path, &d);
+  if (!magic_xattr.IsNull()) {
+    magic_xattr_success = magic_xattr->PrepareValueFenced();
+  }
+
   fuse_remounter_->fence()->Leave();
 
   if (!found) {
@@ -1296,216 +1373,15 @@ static void cvmfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
     return;
   }
 
+  if (!magic_xattr_success) {
+    fuse_reply_err(req, ENOATTR);
+    return;
+  }
+
   string attribute_value;
 
-  if (attr == "user.pid") {
-    attribute_value = StringifyInt(pid_);
-  } else if (attr == "user.version") {
-    attribute_value = string(VERSION) + "." + string(CVMFS_PATCH_LEVEL);
-  } else if (attr == "user.pubkeys") {
-    attribute_value = mount_point_->signature_mgr()->GetActivePubkeys();
-  } else if (attr == "user.hash") {
-    if (!d.checksum().IsNull()) {
-      attribute_value = d.checksum().ToString();
-    } else {
-      fuse_reply_err(req, ENOATTR);
-      return;
-    }
-  } else if (attr == "user.lhash") {
-    if (!d.checksum().IsNull()) {
-      string result;
-      CacheManager::ObjectInfo object_info;
-      object_info.description = path.ToString();
-      if (mount_point_->catalog_mgr()->volatile_flag())
-        object_info.type = CacheManager::kTypeVolatile;
-      int fd = file_system_->cache_mgr()->Open(
-        CacheManager::Bless(d.checksum(), object_info));
-      if (fd < 0) {
-        attribute_value = "Not in cache";
-      } else {
-        shash::Any hash(d.checksum().algorithm);
-        int retval_i = file_system_->cache_mgr()->ChecksumFd(fd, &hash);
-        if (retval_i != 0)
-          attribute_value = "I/O error (" + StringifyInt(retval_i) + ")";
-        else
-          attribute_value = hash.ToString();
-        file_system_->cache_mgr()->Close(fd);
-      }
-    } else {
-      fuse_reply_err(req, ENOATTR);
-      return;
-    }
-  } else if ((attr == "xfsroot.rawlink") || (attr == "user.rawlink")) {
-    if (d.IsLink()) {
-      attribute_value = d.symlink().ToString();
-    } else {
-      fuse_reply_err(req, ENOATTR);
-      return;
-    }
-  } else if (attr == "user.revision") {
-    const uint64_t revision = catalog_mgr->GetRevision();
-    attribute_value = StringifyInt(revision);
-  } else if (attr == "user.root_hash") {
-    attribute_value = catalog_mgr->GetRootHash().ToString();
-  } else if (attr == "user.tag") {
-    attribute_value = mount_point_->repository_tag();
-  } else if (attr == "user.expires") {
-    if (fuse_remounter_->catalogs_valid_until() ==
-        MountPoint::kIndefiniteDeadline)
-    {
-      attribute_value = "never (fixed root catalog)";
-    } else {
-      time_t now = time(NULL);
-      attribute_value = StringifyInt(
-        (fuse_remounter_->catalogs_valid_until() - now) / 60);
-    }
-  } else if (attr == "user.maxfd") {
-    attribute_value = StringifyInt(max_open_files_ - kNumReservedFd);
-  } else if (attr == "user.usedfd") {
-    attribute_value = file_system_->no_open_files()->ToString();
-  } else if (attr == "user.useddirp") {
-    attribute_value = file_system_->no_open_dirs()->ToString();
-  } else if (attr == "user.nioerr") {
-    attribute_value = file_system_->n_io_error()->ToString();
-  } else if (attr == "user.proxy") {
-    vector< vector<download::DownloadManager::ProxyInfo> > proxy_chain;
-    unsigned current_group;
-    mount_point_->download_mgr()->GetProxyInfo(
-      &proxy_chain, &current_group, NULL);
-    if (proxy_chain.size()) {
-      attribute_value = proxy_chain[current_group][0].url;
-    } else {
-      attribute_value = "DIRECT";
-    }
-  } else if (attr == "user.authz") {
-    if (!mount_point_->has_membership_req()) {
-      fuse_reply_err(req, ENOATTR);
-      return;
-    }
-    attribute_value = mount_point_->membership_req();
-  } else if (attr == "user.chunks") {
-    if (d.IsRegular()) {
-      if (d.IsChunkedFile()) {
-        FileChunkList chunks;
-        if (!catalog_mgr->ListFileChunks(path, d.hash_algorithm(), &chunks) ||
-            chunks.IsEmpty())
-        {
-          LogCvmfs(kLogCvmfs, kLogDebug| kLogSyslogErr, "file %s is marked as "
-                   "'chunked', but no chunks found.", path.c_str());
-          fuse_reply_err(req, EIO);
-          return;
-        } else {
-          attribute_value = StringifyInt(chunks.size());
-        }
-      } else {
-        attribute_value = "1";
-      }
-    } else {
-      fuse_reply_err(req, ENOATTR);
-      return;
-    }
-  } else if (attr == "user.external_file") {
-    if (d.IsRegular()) {
-      attribute_value = d.IsExternalFile() ? "1" : "0";
-    } else {
-      fuse_reply_err(req, ENOATTR);
-      return;
-    }
-  } else if (attr == "user.external_host") {
-    vector<string> host_chain;
-    vector<int> rtt;
-    unsigned current_host;
-    mount_point_->external_download_mgr()->GetHostInfo(
-      &host_chain, &rtt, &current_host);
-    if (host_chain.size()) {
-      attribute_value = string(host_chain[current_host]);
-    } else {
-      attribute_value = "internal error: no hosts defined";
-    }
-  } else if (attr == "user.compression") {
-    if (d.IsRegular()) {
-      attribute_value = zlib::AlgorithmName(d.compression_algorithm());
-    } else {
-      fuse_reply_err(req, ENOATTR);
-      return;
-    }
-  } else if (attr == "user.host") {
-    vector<string> host_chain;
-    vector<int> rtt;
-    unsigned current_host;
-    mount_point_->download_mgr()->GetHostInfo(&host_chain, &rtt, &current_host);
-    if (host_chain.size()) {
-      attribute_value = string(host_chain[current_host]);
-    } else {
-      attribute_value = "internal error: no hosts defined";
-    }
-  } else if (attr == "user.host_list") {
-    vector<string> host_chain;
-    vector<int> rtt;
-    unsigned current_host;
-    mount_point_->download_mgr()->GetHostInfo(&host_chain, &rtt, &current_host);
-    if (host_chain.size()) {
-      attribute_value = host_chain[current_host];
-      for (unsigned i = 1; i < host_chain.size(); ++i) {
-        attribute_value +=
-          ";" + host_chain[(i+current_host) % host_chain.size()];
-      }
-    } else {
-      attribute_value = "internal error: no hosts defined";
-    }
-  } else if (attr == "user.uptime") {
-    time_t now = time(NULL);
-    uint64_t uptime = now - loader_exports_->boot_time;
-    attribute_value = StringifyInt(uptime / 60);
-  } else if (attr == "user.nclg") {
-    const int num_catalogs = catalog_mgr->GetNumCatalogs();
-    attribute_value = StringifyInt(num_catalogs);
-  } else if (attr == "user.nopen") {
-    attribute_value = file_system_->n_fs_open()->ToString();
-  } else if (attr == "user.ndiropen") {
-    attribute_value = file_system_->n_fs_dir_open()->ToString();
-  } else if (attr == "user.ndownload") {
-    attribute_value =
-      mount_point_->statistics()->Lookup("fetch.n_downloads")->Print();
-  } else if (attr == "user.timeout") {
-    unsigned seconds, seconds_direct;
-    mount_point_->download_mgr()->GetTimeout(&seconds, &seconds_direct);
-    attribute_value = StringifyInt(seconds);
-  } else if (attr == "user.timeout_direct") {
-    unsigned seconds, seconds_direct;
-    mount_point_->download_mgr()->GetTimeout(&seconds, &seconds_direct);
-    attribute_value = StringifyInt(seconds_direct);
-  } else if (attr == "user.external_timeout") {
-    unsigned seconds, seconds_direct;
-    mount_point_->download_mgr()->GetTimeout(&seconds, &seconds_direct);
-    attribute_value = StringifyInt(seconds_direct);
-  } else if (attr == "user.rx") {
-    perf::Statistics *statistics = mount_point_->statistics();
-    int64_t rx = statistics->Lookup("download.sz_transferred_bytes")->Get();
-    attribute_value = StringifyInt(rx/1024);
-  } else if (attr == "user.speed") {
-    perf::Statistics *statistics = mount_point_->statistics();
-    int64_t rx = statistics->Lookup("download.sz_transferred_bytes")->Get();
-    int64_t time = statistics->Lookup("download.sz_transfer_time")->Get();
-    if (time == 0)
-      attribute_value = "n/a";
-    else
-      attribute_value = StringifyInt((1000 * (rx/1024))/time);
-  } else if (attr == "user.fqrn") {
-    attribute_value = loader_exports_->repository_name;
-  } else if (attr == "user.inode_max") {
-    attribute_value = StringifyInt(
-      inode_generation_info_.inode_generation +
-      catalog_mgr->inode_gauge());
-  } else if (attr == "user.ncleanup24") {
-    QuotaManager *quota_mgr = file_system_->cache_mgr()->quota_mgr();
-    if (!quota_mgr->HasCapability(QuotaManager::kCapIntrospectCleanupRate)) {
-      attribute_value = StringifyInt(-1);
-    } else {
-      const uint64_t period_s = 24 * 60 * 60;
-      const uint64_t rate = quota_mgr->GetCleanupRate(period_s);
-      attribute_value = StringifyInt(rate);
-    }
+  if (!magic_xattr.IsNull()) {
+    attribute_value = magic_xattr->GetValue();
   } else {
     if (!xattrs.Get(attr, &attribute_value)) {
       fuse_reply_err(req, ENOATTR);
@@ -1533,7 +1409,8 @@ static void cvmfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) {
   TraceInode(Tracer::kEventListAttr, ino, "listxattr()");
   LogCvmfs(kLogCvmfs, kLogDebug,
            "cvmfs_listxattr on inode: %" PRIu64 ", size %u [hide xattrs %d]",
-           uint64_t(ino), size, mount_point_->hide_magic_xattrs());
+           uint64_t(ino), size,
+           mount_point_->magic_xattr_mgr()->hide_magic_xattrs());
 
   catalog::DirectoryEntry d;
   const bool found = GetDirentForInode(ino, &d);
@@ -1552,38 +1429,9 @@ static void cvmfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) {
     return;
   }
 
-  const char base_list[] = "user.pid\0user.version\0user.revision\0"
-    "user.root_hash\0user.expires\0user.maxfd\0user.usedfd\0user.nioerr\0"
-    "user.host\0user.proxy\0user.uptime\0user.nclg\0user.nopen\0"
-    "user.ndownload\0user.timeout\0user.timeout_direct\0user.rx\0user.speed\0"
-    "user.fqrn\0user.ndiropen\0user.inode_max\0user.tag\0user.host_list\0"
-    "user.external_host\0user.external_timeout\0user.pubkeys\0"
-    "user.ncleanup24\0";
   string attribute_list;
-  if (mount_point_->hide_magic_xattrs()) {
-    LogCvmfs(kLogCvmfs, kLogDebug, "Hiding extended attributes");
-    attribute_list = xattrs.ListKeysPosix("");
-  } else {
-    attribute_list = string(base_list, sizeof(base_list)-1);
-    if (!d.checksum().IsNull()) {
-      const char regular_file_list[] = "user.hash\0user.lhash\0";
-      attribute_list += string(regular_file_list, sizeof(regular_file_list)-1);
-    }
-
-    if (d.IsLink()) {
-      const char symlink_list[] = "xfsroot.rawlink\0user.rawlink\0";
-      attribute_list += string(symlink_list, sizeof(symlink_list)-1);
-    } else if (d.IsRegular()) {
-      const char regular_file_list[] = "user.external_file\0user.compression\0"
-                                       "user.chunks\0";
-      attribute_list += string(regular_file_list, sizeof(regular_file_list)-1);
-    }
-
-    if (mount_point_->has_membership_req()) {
-      attribute_list += "user.authz\0";
-    }
-    attribute_list = xattrs.ListKeysPosix(attribute_list);
-  }
+  attribute_list = mount_point_->magic_xattr_mgr()->GetListString(&d);
+  attribute_list = xattrs.ListKeysPosix(attribute_list);
 
   if (size == 0) {
     fuse_reply_xattr(req, attribute_list.length());
@@ -1690,6 +1538,22 @@ static void cvmfs_init(void *userdata, struct fuse_conn_info *conn) {
 #ifdef CVMFS_NFS_SUPPORT
   conn->want |= FUSE_CAP_EXPORT_SUPPORT;
 #endif
+
+  if (mount_point_->enforce_acls()) {
+#ifdef FUSE_CAP_POSIX_ACL
+    if ((conn->capable & FUSE_CAP_POSIX_ACL) == 0) {
+      PANIC(kLogDebug | kLogSyslogErr,
+            "ACL support requested but missing fuse kernel support, "
+            "aborting");
+    }
+    conn->want |= FUSE_CAP_POSIX_ACL;
+    LogCvmfs(kLogCvmfs, kLogDebug | kLogSyslog, "enforcing ACLs");
+#else
+    PANIC(kLogDebug | kLogSyslogErr,
+          "ACL support requested but not available in this version of "
+          "libfuse, aborting");
+#endif
+  }
 }
 
 static void cvmfs_destroy(void *unused __attribute__((unused))) {
@@ -1704,22 +1568,25 @@ static void SetCvmfsOperations(struct fuse_lowlevel_ops *cvmfs_operations) {
   memset(cvmfs_operations, 0, sizeof(*cvmfs_operations));
 
   // Init/Fini
-  cvmfs_operations->init     = cvmfs_init;
-  cvmfs_operations->destroy  = cvmfs_destroy;
+  cvmfs_operations->init         = cvmfs_init;
+  cvmfs_operations->destroy      = cvmfs_destroy;
 
-  cvmfs_operations->lookup      = cvmfs_lookup;
-  cvmfs_operations->getattr     = cvmfs_getattr;
-  cvmfs_operations->readlink    = cvmfs_readlink;
-  cvmfs_operations->open        = cvmfs_open;
-  cvmfs_operations->read        = cvmfs_read;
-  cvmfs_operations->release     = cvmfs_release;
-  cvmfs_operations->opendir     = cvmfs_opendir;
-  cvmfs_operations->readdir     = cvmfs_readdir;
-  cvmfs_operations->releasedir  = cvmfs_releasedir;
-  cvmfs_operations->statfs      = cvmfs_statfs;
-  cvmfs_operations->getxattr    = cvmfs_getxattr;
-  cvmfs_operations->listxattr   = cvmfs_listxattr;
-  cvmfs_operations->forget      = cvmfs_forget;
+  cvmfs_operations->lookup       = cvmfs_lookup;
+  cvmfs_operations->getattr      = cvmfs_getattr;
+  cvmfs_operations->readlink     = cvmfs_readlink;
+  cvmfs_operations->open         = cvmfs_open;
+  cvmfs_operations->read         = cvmfs_read;
+  cvmfs_operations->release      = cvmfs_release;
+  cvmfs_operations->opendir      = cvmfs_opendir;
+  cvmfs_operations->readdir      = cvmfs_readdir;
+  cvmfs_operations->releasedir   = cvmfs_releasedir;
+  cvmfs_operations->statfs       = cvmfs_statfs;
+  cvmfs_operations->getxattr     = cvmfs_getxattr;
+  cvmfs_operations->listxattr    = cvmfs_listxattr;
+  cvmfs_operations->forget       = cvmfs_forget;
+#if (FUSE_VERSION >= 29)
+  cvmfs_operations->forget_multi = cvmfs_forget_multi;
+#endif
 }
 
 // Called by cvmfs_talk when switching into read-only cache mode
@@ -1742,6 +1609,66 @@ string *g_boot_error = NULL;
 __attribute__((visibility("default")))
 loader::CvmfsExports *g_cvmfs_exports = NULL;
 
+/**
+ * Begin section of cvmfs.cc-specific magic extended attributes
+ */
+
+class ExpiresMagicXattr : public BaseMagicXattr {
+  time_t catalogs_valid_until_;
+
+  virtual bool PrepareValueFenced() {
+    catalogs_valid_until_ = cvmfs::fuse_remounter_->catalogs_valid_until();
+    return true;
+  }
+
+  virtual std::string GetValue() {
+    if (catalogs_valid_until_ == MountPoint::kIndefiniteDeadline) {
+      return "never (fixed root catalog)";
+    } else {
+      time_t now = time(NULL);
+      return StringifyInt( (catalogs_valid_until_ - now) / 60);
+    }
+  }
+};
+
+class InodeMaxMagicXattr : public BaseMagicXattr {
+  virtual std::string GetValue() {
+    return StringifyInt(
+      cvmfs::inode_generation_info_.inode_generation +
+      mount_point_->catalog_mgr()->inode_gauge());
+  }
+};
+
+class MaxFdMagicXattr : public BaseMagicXattr {
+  virtual std::string GetValue() {
+    return StringifyInt(cvmfs::max_open_files_ - cvmfs::kNumReservedFd);
+  }
+};
+
+class PidMagicXattr : public BaseMagicXattr {
+  virtual std::string GetValue() { return StringifyInt(cvmfs::pid_); }
+};
+
+class UptimeMagicXattr : public BaseMagicXattr {
+  virtual std::string GetValue() {
+    time_t now = time(NULL);
+    uint64_t uptime = now - cvmfs::loader_exports_->boot_time;
+    return StringifyInt(uptime / 60);
+  }
+};
+
+/**
+ * Register cvmfs.cc-specific magic extended attributes to mountpoint's
+ * magic xattribute manager
+ */
+static void RegisterMagicXattrs() {
+  MagicXattrManager *mgr = cvmfs::mount_point_->magic_xattr_mgr();
+  mgr->Register("user.expires", new ExpiresMagicXattr());
+  mgr->Register("user.inode_max", new InodeMaxMagicXattr());
+  mgr->Register("user.pid", new PidMagicXattr());
+  mgr->Register("user.maxfd", new MaxFdMagicXattr());
+  mgr->Register("user.uptime", new UptimeMagicXattr());
+}
 
 /**
  * Construct a file system but prevent hanging when already mounted.  That
@@ -1829,6 +1756,8 @@ static int Init(const loader::LoaderExports *loader_exports) {
     return cvmfs::mount_point_->boot_status();
   }
 
+  RegisterMagicXattrs();
+
   cvmfs::directory_handles_ = new cvmfs::DirectoryHandles();
   cvmfs::directory_handles_->set_empty_key((uint64_t)(-1));
   cvmfs::directory_handles_->set_deleted_key((uint64_t)(-2));
@@ -1843,9 +1772,10 @@ static int Init(const loader::LoaderExports *loader_exports) {
   LogCvmfs(kLogCvmfs, kLogDebug, "root inode is %" PRIu64,
            uint64_t(cvmfs::mount_point_->catalog_mgr()->GetRootInode()));
 
-  struct fuse_chan **channel = NULL;
-  if (loader_exports->version >= 4)
-    channel = loader_exports->fuse_channel;
+  void **channel_or_session = NULL;
+  if (loader_exports->version >= 4) {
+    channel_or_session = loader_exports->fuse_channel_or_session;
+  }
 
   bool fuse_notify_invalidation = true;
   std::string buf;
@@ -1853,11 +1783,12 @@ static int Init(const loader::LoaderExports *loader_exports) {
                                     &buf)) {
     if (!cvmfs::options_mgr_->IsOn(buf)) {
       fuse_notify_invalidation = false;
+      cvmfs::mount_point_->nentry_tracker()->Disable();
     }
   }
   cvmfs::fuse_remounter_ =
       new FuseRemounter(cvmfs::mount_point_, &cvmfs::inode_generation_info_,
-                        channel, fuse_notify_invalidation);
+                        channel_or_session, fuse_notify_invalidation);
 
   // Monitor, check for maximum number of open files
   if (cvmfs::UseWatchdog()) {
@@ -1872,9 +1803,23 @@ static int Init(const loader::LoaderExports *loader_exports) {
 
   // Control & command interface
   cvmfs::talk_mgr_ = TalkManager::Create(
-    "./cvmfs_io." + cvmfs::mount_point_->fqrn(),
+    cvmfs::mount_point_->talk_socket_path(),
     cvmfs::mount_point_,
     cvmfs::fuse_remounter_);
+  if ((cvmfs::mount_point_->talk_socket_uid() != 0) ||
+      (cvmfs::mount_point_->talk_socket_gid() != 0))
+  {
+    uid_t tgt_uid = cvmfs::mount_point_->talk_socket_uid();
+    gid_t tgt_gid = cvmfs::mount_point_->talk_socket_gid();
+    int rvi = chown(cvmfs::mount_point_->talk_socket_path().c_str(),
+                    tgt_uid, tgt_gid);
+    if (rvi != 0) {
+      *g_boot_error = std::string("failed to set talk socket ownership - ")
+        + "target " + StringifyInt(tgt_uid) + ":" + StringifyInt(tgt_uid)
+        + ", user " + StringifyInt(geteuid()) + ":" + StringifyInt(getegid());
+      return loader::kFailTalk;
+    }
+  }
   if (cvmfs::talk_mgr_ == NULL) {
     *g_boot_error = "failed to initialize talk socket (" +
                     StringifyInt(errno) + ")";
@@ -1915,6 +1860,10 @@ static void Spawn() {
   }
 
   cvmfs::fuse_remounter_->Spawn();
+  if (cvmfs::mount_point_->nentry_tracker()->is_active()) {
+    cvmfs::mount_point_->nentry_tracker()->SpawnCleaner(
+      cvmfs::mount_point_->kcache_timeout_sec());  // Usually every minute
+  }
 
   cvmfs::mount_point_->download_mgr()->Spawn();
   cvmfs::mount_point_->external_download_mgr()->Spawn();
@@ -1952,7 +1901,12 @@ static string GetErrorMsg() {
 }
 
 
-static void Fini() {
+/**
+ * Called alone at the end of SaveState; it performs a Fini() half way through,
+ * enough to delete the catalog manager, so that no more open file handles
+ * from file catalogs are active.
+ */
+static void ShutdownMountpoint() {
   delete cvmfs::talk_mgr_;
   cvmfs::talk_mgr_ = NULL;
 
@@ -1976,10 +1930,16 @@ static void Fini() {
 
   delete cvmfs::directory_handles_;
   delete cvmfs::mount_point_;
-  delete cvmfs::file_system_;
-  delete cvmfs::options_mgr_;
   cvmfs::directory_handles_ = NULL;
   cvmfs::mount_point_ = NULL;
+}
+
+
+static void Fini() {
+  ShutdownMountpoint();
+
+  delete cvmfs::file_system_;
+  delete cvmfs::options_mgr_;
   cvmfs::file_system_ = NULL;
   cvmfs::options_mgr_ = NULL;
 
@@ -2055,6 +2015,15 @@ static bool SaveState(const int fd_progress, loader::StateList *saved_states) {
     saved_states->push_back(state_glue_buffer);
   }
 
+  msg_progress = "Saving negative entry cache\n";
+  SendMsg2Socket(fd_progress, msg_progress);
+  glue::NentryTracker *saved_nentry_cache =
+    new glue::NentryTracker(*cvmfs::mount_point_->nentry_tracker());
+  loader::SavedState *state_nentry_tracker = new loader::SavedState();
+  state_nentry_tracker->state_id = loader::kStateNentryTracker;
+  state_nentry_tracker->state = saved_nentry_cache;
+  saved_states->push_back(state_nentry_tracker);
+
   msg_progress = "Saving chunk tables\n";
   SendMsg2Socket(fd_progress, msg_progress);
   ChunkTables *saved_chunk_tables = new ChunkTables(
@@ -2075,7 +2044,9 @@ static bool SaveState(const int fd_progress, loader::StateList *saved_states) {
   state_inode_generation->state = saved_inode_generation;
   saved_states->push_back(state_inode_generation);
 
-  SendMsg2Socket(fd_progress, msg_progress);
+  // Close open file catalogs
+  ShutdownMountpoint();
+
   loader::SavedState *state_cache_mgr = new loader::SavedState();
   state_cache_mgr->state_id = loader::kStateOpenFiles;
   state_cache_mgr->state =
@@ -2083,7 +2054,6 @@ static bool SaveState(const int fd_progress, loader::StateList *saved_states) {
   saved_states->push_back(state_cache_mgr);
 
   msg_progress = "Saving open files counter\n";
-  SendMsg2Socket(fd_progress, msg_progress);
   uint32_t *saved_num_fd =
     new uint32_t(cvmfs::file_system_->no_open_files()->Get());
   loader::SavedState *state_num_fd = new loader::SavedState();
@@ -2155,6 +2125,16 @@ static bool RestoreState(const int fd_progress,
       SendMsg2Socket(fd_progress, " done\n");
     }
 
+    if (saved_states[i]->state_id == loader::kStateNentryTracker) {
+      SendMsg2Socket(fd_progress, "Restoring negative entry cache... ");
+      cvmfs::mount_point_->nentry_tracker()->~NentryTracker();
+      glue::NentryTracker *saved_nentry_tracker =
+        (glue::NentryTracker *)saved_states[i]->state;
+      new (cvmfs::mount_point_->nentry_tracker())
+        glue::NentryTracker(*saved_nentry_tracker);
+      SendMsg2Socket(fd_progress, " done\n");
+    }
+
     ChunkTables *chunk_tables = cvmfs::mount_point_->chunk_tables();
 
     if (saved_states[i]->state_id == loader::kStateOpenChunks) {
@@ -2219,8 +2199,13 @@ static bool RestoreState(const int fd_progress,
     }
 
     if (saved_states[i]->state_id == loader::kStateOpenFiles) {
-      cvmfs::file_system_->cache_mgr()->RestoreState(
+      int new_root_fd = cvmfs::file_system_->cache_mgr()->RestoreState(
         fd_progress, saved_states[i]->state);
+      LogCvmfs(kLogCvmfs, kLogDebug, "new root file catalog descriptor @%d",
+               new_root_fd);
+      if (new_root_fd >= 0) {
+        cvmfs::file_system_->RemapCatalogFd(0, new_root_fd);
+      }
     }
   }
   if (cvmfs::mount_point_->inode_annotation()) {
@@ -2262,6 +2247,10 @@ static void FreeSavedState(const int fd_progress,
       case loader::kStateGlueBufferV4:
         SendMsg2Socket(fd_progress, "Releasing saved glue buffer\n");
         delete static_cast<glue::InodeTracker *>(saved_states[i]->state);
+        break;
+      case loader::kStateNentryTracker:
+        SendMsg2Socket(fd_progress, "Releasing saved negative entry cache\n");
+        delete static_cast<glue::NentryTracker *>(saved_states[i]->state);
         break;
       case loader::kStateOpenChunks:
         SendMsg2Socket(fd_progress, "Releasing chunk tables (version 1)\n");

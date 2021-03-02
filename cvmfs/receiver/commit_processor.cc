@@ -4,6 +4,8 @@
 
 #include "commit_processor.h"
 
+#include <time.h>
+
 #include <vector>
 
 #include "catalog_diff_tool.h"
@@ -18,6 +20,7 @@
 #include "params.h"
 #include "signing_tool.h"
 #include "statistics.h"
+#include "statistics_database.h"
 #include "swissknife.h"
 #include "swissknife_history.h"
 #include "util/algorithm.h"
@@ -74,7 +77,7 @@ bool CreateNewTag(const RepositoryTag& repo_tag, const std::string& repo_name,
 
 namespace receiver {
 
-CommitProcessor::CommitProcessor() : num_errors_(0) {}
+CommitProcessor::CommitProcessor() : num_errors_(0), statistics_(NULL) {}
 
 CommitProcessor::~CommitProcessor() {}
 
@@ -96,17 +99,31 @@ CommitProcessor::~CommitProcessor() {}
  */
 CommitProcessor::Result CommitProcessor::Process(
     const std::string& lease_path, const shash::Any& old_root_hash,
-    const shash::Any& new_root_hash, const RepositoryTag& tag) {
+    const shash::Any& new_root_hash, const RepositoryTag& tag,
+    uint64_t *final_revision) {
   RepositoryTag final_tag = tag;
   // If tag_name is a generic tag, update the time stamp
   if (HasPrefix(final_tag.name_, "generic-", false)) {
-    // timestamp=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
-    char buf[32];
-    time_t now = time(NULL);
+    // format time following the ISO 8601 YYYY-MM-DDThh:mm:ss.sssZ
+    // note the millisecond accurracy
+    uint64_t nanoseconds_timestamp = platform_realtime_ns();
+
+    time_t seconds = nanoseconds_timestamp / 1000000000;  // 1E9
     struct tm timestamp;
-    gmtime_r(&now, &timestamp);
-    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &timestamp);
-    final_tag.name_ = std::string("generic-") + buf;
+    gmtime_r(&seconds, &timestamp);
+    char seconds_buffer[32];
+    strftime(seconds_buffer, sizeof(seconds_buffer),
+             "generic-%Y-%m-%dT%H:%M:%S", &timestamp);
+
+    // first we get the raw nanoseconds from the timestamp using the module
+    // and then we divide to extract the millisecond.
+    // the division truncate the number brutally, it should be enough.
+    time_t milliseconds = (nanoseconds_timestamp % 1000000000) / 1000000;
+    char millis_buffer[48];
+    snprintf(millis_buffer, sizeof(millis_buffer), "%s.%03ldZ", seconds_buffer,
+             milliseconds);
+
+    final_tag.name_ = std::string(millis_buffer);
   }
 
   LogCvmfs(kLogReceiver, kLogSyslog,
@@ -181,7 +198,8 @@ CommitProcessor::Result CommitProcessor::Process(
                    catalog::SimpleCatalogManager>
       merge_tool(params.stratum0, old_root_hash, new_root_hash,
                  relative_lease_path, temp_dir_root,
-                 server_tool->download_manager(), manifest.weak_ref());
+                 server_tool->download_manager(), manifest.weak_ref(),
+                 statistics_);
   if (!merge_tool.Init()) {
     LogCvmfs(kLogReceiver, kLogSyslogErr,
              "Error: Could not initialize the catalog merge tool");
@@ -189,7 +207,7 @@ CommitProcessor::Result CommitProcessor::Process(
   }
 
   std::string new_manifest_path;
-  if (!merge_tool.Run(params, &new_manifest_path)) {
+  if (!merge_tool.Run(params, &new_manifest_path, final_revision)) {
     LogCvmfs(kLogReceiver, kLogSyslogErr,
              "CommitProcessor - error: Catalog merge failed");
     return kMergeFailure;
@@ -215,12 +233,17 @@ CommitProcessor::Result CommitProcessor::Process(
            "CommitProcessor - lease_path: %s, signing manifest",
            lease_path.c_str());
 
+  // Add C_N root catalog hash to reflog through SigningTool,
+  // so garbage collector can later delete it.
+  std::vector<shash::Any> reflog_catalogs;
+  reflog_catalogs.push_back(new_root_hash);
+
   SigningTool signing_tool(server_tool.weak_ref());
   SigningTool::Result res = signing_tool.Run(
       new_manifest_path, params.stratum0, params.spooler_configuration,
       temp_dir, certificate, private_key, repo_name, "", "",
       "/var/spool/cvmfs/" + repo_name + "/reflog.chksum",
-      params.garbage_collection);
+      params.garbage_collection, false, false, reflog_catalogs);
   switch (res) {
     case SigningTool::kReflogChecksumMissing:
       LogCvmfs(kLogReceiver, kLogSyslogErr,
@@ -281,7 +304,36 @@ CommitProcessor::Result CommitProcessor::Process(
     return kError;
   }
 
+  StatisticsDatabase *stats_db = StatisticsDatabase::OpenStandardDB(repo_name);
+  if (stats_db != NULL) {
+    if (!stats_db->StorePublishStatistics(statistics_, start_time_, true)) {
+      LogCvmfs(kLogReceiver, kLogSyslogErr,
+        "Could not store publish statistics");
+    }
+    if (params.upload_stats_db) {
+      upload::SpoolerDefinition sd(params.spooler_configuration, shash::kAny);
+      upload::Spooler *spooler = upload::Spooler::Construct(sd);
+      if (!stats_db->UploadStatistics(spooler)) {
+        LogCvmfs(kLogReceiver, kLogSyslogErr,
+          "Could not upload statistics DB to upstream storage");
+      }
+      delete spooler;
+    }
+    delete stats_db;
+
+  } else {
+    LogCvmfs(kLogReceiver, kLogSyslogErr, "Could not open statistics DB");
+  }
+
   return kSuccess;
+}
+
+void CommitProcessor::SetStatistics(perf::Statistics *st,
+                                    std::string start_time)
+{
+  statistics_ = st;
+  statistics_->Register("publish.revision", "");
+  start_time_ = start_time;
 }
 
 }  // namespace receiver

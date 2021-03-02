@@ -26,6 +26,7 @@ std::string StringifyTime(const time_t seconds, const bool utc);
 std::string StringifyTimeval(const timeval value);
 std::string RfcTimestamp();
 std::string IsoTimestamp();
+std::string WhitelistTimestamp(time_t when);
 time_t IsoTimestamp2UtcTime(const std::string &iso8601);
 int64_t String2Int64(const std::string &value);
 uint64_t String2Uint64(const std::string &value);
@@ -58,7 +59,8 @@ std::string Tail(const std::string &source, unsigned num_lines);
 std::string Base64(const std::string &data);
 std::string Base64Url(const std::string &data);
 bool Debase64(const std::string &data, std::string *decoded);
-std::string GetGMTimestamp();
+std::string GetGMTimestamp(std::string format = "%Y-%m-%d %H:%M:%S");
+
 
 #ifdef CVMFS_NAMESPACE_GUARD
 }  // namespace CVMFS_NAMESPACE_GUARD

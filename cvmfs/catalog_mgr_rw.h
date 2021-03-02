@@ -107,11 +107,15 @@ class WritableCatalogManager : public SimpleCatalogManager {
   void RemoveFile(const std::string &file_path);
 
   void AddDirectory(const DirectoryEntryBase &entry,
+                    const XattrList &xattrs,
                     const std::string &parent_directory);
   void TouchDirectory(const DirectoryEntryBase &entry,
+                      const XattrList &xattrs,
                       const std::string &directory_path);
   void RemoveDirectory(const std::string &directory_path);
+
   void Clone(const std::string from, const std::string to);
+  void CloneTree(const std::string &from_dir, const std::string &to_dir);
 
   // Hardlink group handling
   void AddHardlinkGroup(const DirectoryEntryBaseList &entries,
@@ -166,6 +170,10 @@ class WritableCatalogManager : public SimpleCatalogManager {
                    DirectoryEntry     *dirent = NULL);
   void DoBalance();
   void FixWeight(WritableCatalog *catalog);
+
+  void CloneTreeImpl(const PathString &source_dir,
+                     const std::string &dest_parent_dir,
+                     const NameString &dest_name);
 
   struct CatalogInfo {
     uint64_t     ttl;

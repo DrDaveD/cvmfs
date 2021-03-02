@@ -38,12 +38,12 @@ set (CVMFS_OPT_FLAGS "-Os")
 if (CMAKE_COMPILER_IS_GNUCC)
   message (STATUS "checking gcc version...")
   execute_process (
-    COMMAND ${CMAKE_C_COMPILER} -v
+    COMMAND ${CMAKE_C_COMPILER} --version
     OUTPUT_VARIABLE CVMFS_GCC_VERSION
     ERROR_VARIABLE  CVMFS_GCC_VERSION
   )
-  STRING(REGEX REPLACE ".*([0-9]+)\\.[0-9]+\\.[0-9]+.*" "\\1" CVMFS_GCC_MAJOR "${CVMFS_GCC_VERSION}")
-  STRING(REGEX REPLACE ".*[0-9]+\\.([0-9]+)\\.[0-9]+.*" "\\1" CVMFS_GCC_MINOR "${CVMFS_GCC_VERSION}")
+  STRING(REGEX REPLACE "[A-Za-z]* \\(.+\\) ([0-9]+)\\.[0-9]+\\.[0-9]+.*" "\\1" CVMFS_GCC_MAJOR "${CVMFS_GCC_VERSION}")
+  STRING(REGEX REPLACE "[A-Za-z]* \\(.+\\) [0-9]+\\.([0-9]+)\\.[0-9]+.*" "\\1" CVMFS_GCC_MINOR "${CVMFS_GCC_VERSION}")
   if (${CVMFS_GCC_MAJOR} LESS 4)
     message (FATAL_ERROR "GCC < 4.1 unsupported")
   endif (${CVMFS_GCC_MAJOR} LESS 4)
@@ -59,9 +59,7 @@ endif (CMAKE_COMPILER_IS_GNUCC)
 message (STATUS "using compiler opt flag ${CVMFS_OPT_FLAGS}")
 set (CVMFS_BASE_C_FLAGS "${CVMFS_OPT_FLAGS} -g -fno-strict-aliasing -fasynchronous-unwind-tables -fno-omit-frame-pointer -fwrapv -fvisibility=hidden -Wall ${CVMFS_FIX_FLAGS}")
 if (APPLE)
-  if (${CMAKE_SYSTEM_VERSION} GREATER 14.5.0)
-    set(CVMFS_BASE_C_FLAGS "${CVMFS_BASE_C_FLAGS} -mmacosx-version-min=10.11")
-  endif(${CMAKE_SYSTEM_VERSION} GREATER 14.5.0)
+  set(CVMFS_BASE_C_FLAGS "${CVMFS_BASE_C_FLAGS} -mmacosx-version-min=10.14")
 endif(APPLE)
 set (CVMFS_BASE_CXX_FLAGS "${CVMFS_BASE_C_FLAGS} -fno-exceptions")
 if (NOT USING_CLANG)

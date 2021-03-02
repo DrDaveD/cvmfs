@@ -33,6 +33,9 @@ get_redhat_version() {
 }
 
 get_package_type() {
+  # Build the cvmfs service container if the build container says so
+  [ -f /cvmfs-package-type ]  && cat /cvmfs-package-type && return 0
+
   which dpkg > /dev/null 2>&1 && echo "deb" && return 0
   which rpm  > /dev/null 2>&1 && echo "rpm" && return 0
   [ x"$(uname)" = x"Darwin" ] && echo "pkg" && return 0
@@ -113,6 +116,7 @@ generate_package_map() {
   local config="$6"
   local shrinkwrap="$7"
   local ducc="$8"
+  local fuse3="$9"
 
   cat > pkgmap.${platform} << EOF
 [$platform]
@@ -122,8 +126,11 @@ devel=$devel
 shrinkwrap=$shrinkwrap
 unittests=$unittests
 config=$config
-$(if [ "x$ducc" != "x" ]; then 
+$(if [ "x$ducc" != "x" ]; then
         echo "ducc=$ducc"
+fi)
+$(if [ "x$fuse3" != "x" ]; then
+        echo "fuse3=$fuse3"
 fi)
 EOF
 }
@@ -214,6 +221,7 @@ expand_template() {
   echo "$tmp"
 }
 
+# we need at least go 1.12.0 for `strings.ReplaceAll`
 can_build_ducc() {
   if which go > /dev/null 2>&1 && which go-junit-report > /dev/null 2>&1 ; then
     go_version=$(go version)
@@ -221,14 +229,22 @@ can_build_ducc() {
     go_minor=$(echo $go_version | sed -n 's/go version go\([0-9]\)\.\([0-9]*\)\.\([0-9]*\).*/\2/p')
     go_patch=$(echo $go_version | sed -n 's/go version go\([0-9]\)\.\([0-9]*\)\.\([0-9]*\).*/\3/p')
 
-    if [ $go_minor -ge 11 ]; then
-      if [ $go_patch -ge 4 ]; then
-        echo "1"
-      else
-        echo "0"
-      fi
-    else
+    if [ $go_major -gt 1 ]; then
+      echo "1"
+    elif [ $go_major -lt 1 ]; then
       echo "0"
+    else
+      if [ $go_minor -gt 12 ]; then
+        echo "1"
+      elif [ $go_minor -lt 12 ]; then
+        echo "0"
+      else
+        if [ $go_patch -ge 0 ]; then
+          echo "1"
+        else
+          echo "0"
+        fi
+      fi
     fi
   else
     echo "0"

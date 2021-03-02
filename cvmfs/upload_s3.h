@@ -14,21 +14,24 @@
 #include "atomic.h"
 #include "s3fanout.h"
 #include "upload_facility.h"
+#include "util/file_backed_buffer.h"
+#include "util/pointer.h"
+#include "util/single_copy.h"
 
 namespace upload {
 
 struct S3StreamHandle : public UploadStreamHandle {
   S3StreamHandle(
     const CallbackTN *commit_callback,
-    const int tmp_fd,
-    const std::string &tmp_path)
+    uint64_t in_memory_threshold,
+    const std::string &tmp_dir = "/tmp/")
     : UploadStreamHandle(commit_callback)
-    , file_descriptor(tmp_fd)
-    , temporary_path(tmp_path)
-  { }
+  {
+    buffer = FileBackedBuffer::Create(in_memory_threshold, tmp_dir);
+  }
 
-  const int file_descriptor;
-  const std::string temporary_path;
+  // Ownership is later transferred to the S3 fanout
+  UniquePtr<FileBackedBuffer> buffer;
 };
 
 /**
@@ -45,6 +48,8 @@ class S3Uploader : public AbstractUploader {
 
   virtual std::string name() const { return "S3"; }
 
+  virtual bool Create();
+
   /**
    * Upload() is not done concurrently in the current implementation of the
    * S3Spooler, since it is a simple move or copy of a file without CPU
@@ -52,9 +57,9 @@ class S3Uploader : public AbstractUploader {
    * This method calls NotifyListeners and invokes a callback for all
    * registered listeners (see the Observable template for details).
    */
-  virtual void FileUpload(const std::string &local_path,
-                          const std::string &remote_path,
-                          const CallbackTN *callback = NULL);
+  virtual void DoUpload(const std::string &remote_path,
+                        IngestionSource *source,
+                        const CallbackTN *callback = NULL);
 
   virtual UploadStreamHandle *InitStreamedUpload(
     const CallbackTN *callback = NULL);
@@ -65,13 +70,14 @@ class S3Uploader : public AbstractUploader {
 
   virtual void DoRemoveAsync(const std::string &file_to_delete);
   virtual bool Peek(const std::string &path);
+  virtual bool Mkdir(const std::string &path);
   virtual bool PlaceBootstrappingShortcut(const shash::Any &object);
 
   virtual unsigned int GetNumberOfErrors() const;
   int64_t DoGetObjectSize(const std::string &file_name);
 
   // Only for testing
-  s3fanout::S3FanoutManager *GetS3FanoutManager() { return &s3fanout_mgr_; }
+  s3fanout::S3FanoutManager *GetS3FanoutManager() { return s3fanout_mgr_; }
 
  private:
   static const unsigned kDefaultPort = 80;
@@ -80,15 +86,24 @@ class S3Uploader : public AbstractUploader {
   static const unsigned kDefaultTimeoutSec = 60;
   static const unsigned kDefaultBackoffInitMs = 100;
   static const unsigned kDefaultBackoffMaxMs = 2000;
+  static const unsigned kInMemoryObjectThreshold = 500*1024;  // 500KiB
 
-  // Used to make the async HEAD requests synchronous in Peek()
-  struct PeekCtrl {
-    PeekCtrl() : exists(false) { pipe_wait[0] = pipe_wait[1] = 0; }
-    bool exists;
+  // Used to make the async HTTP requests synchronous in Peek() Create(),
+  // and Upload() of single bits
+  struct RequestCtrl : SingleCopy {
+    RequestCtrl() : return_code(-1), callback_forward(NULL) {
+      pipe_wait[0] = pipe_wait[1] = -1;
+    }
+
+    void WaitFor();
+
+    int return_code;
+    const CallbackTN *callback_forward;
+    std::string original_path;
     int pipe_wait[2];
   };
 
-  void OnPeekCopmlete(const upload::UploaderResults &results, PeekCtrl *ctrl);
+  void OnReqComplete(const upload::UploaderResults &results, RequestCtrl *ctrl);
 
   static void *MainCollectResults(void *data);
 
@@ -97,11 +112,12 @@ class S3Uploader : public AbstractUploader {
 
   s3fanout::JobInfo *CreateJobInfo(const std::string &path) const;
 
-  s3fanout::S3FanoutManager s3fanout_mgr_;
+  UniquePtr<s3fanout::S3FanoutManager> s3fanout_mgr_;
   std::string repository_alias_;
   std::string host_name_port_;
   std::string host_name_;
   std::string region_;
+  std::string flavor_;
   std::string bucket_;
   bool dns_buckets_;
   int num_parallel_uploads_;

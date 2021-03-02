@@ -39,7 +39,7 @@ struct MockStreamHandle : public upload::UploadStreamHandle {
 
   void Append(upload::AbstractUploader::UploadBuffer buffer) {
     Extend(buffer.size);
-    void *b_ptr = buffer.data;
+    const void *b_ptr = buffer.data;
     unsigned char *r_ptr = data + marker;
     memcpy(r_ptr, b_ptr, buffer.size);
     marker += buffer.size;
@@ -86,6 +86,8 @@ class IngestionMockUploader
 
   virtual std::string name() const { return "IngestionMockUploader"; }
   void ClearResults() { results.clear(); }
+
+  virtual bool Create() { return true; }
 
   upload::UploadStreamHandle *InitStreamedUpload(
     const CallbackTN *callback = NULL)

@@ -4,18 +4,6 @@
 script_location=$(dirname $(readlink --canonicalize $0))
 . ${script_location}/common_setup.sh
 
-# create additional disk partitions to accomodate CVMFS test repos
-echo -n "creating additional disk partitions... "
-disk_to_partition=/dev/vda
-free_disk_space=$(get_unpartitioned_space $disk_to_partition)
-if [ $free_disk_space -lt 25000000000 ]; then # at least 25GB required
-  die "fail (not enough unpartitioned disk space - $free_disk_space bytes)"
-fi
-partition_size=$(( $free_disk_space / 2 - 10240000))
-create_partition $disk_to_partition $partition_size || die "fail (creating partition 1)"
-create_partition $disk_to_partition $partition_size || die "fail (creating partition 2)"
-echo "done"
-
 # update packages installed on the system
 echo "updating installed RPM packages (including kernel)..."
 sudo yum -y update || die "fail (yum update)"
@@ -95,6 +83,8 @@ install_from_repo cmake         || die "fail (installing cmake)"
 install_from_repo libattr-devel || die "fail (installing libattr-devel)"
 install_from_repo python-devel  || die "fail (installing python-devel)"
 
+install_from_repo acl
+
 # install test dependency for 600
 install_from_repo compat-expat1          || die "fail (installing compat-expat1)"
 install_from_repo openssl098e            || die "fail (installing openssl098e)"
@@ -107,13 +97,14 @@ install_from_repo globus-gsi-credential  || die "fail (installing globus-gsi-cre
 install_from_repo globus-gsi-sysconfig   || die "fail (installing globus-gsi-sysconfig)"
 # TODO(jblomer): when we get support on more platforms, we might want to get the
 # helper package in a more general way than hard-coding it into the setup script
-x509_helper="https://ecsft.cern.ch/dist/cvmfs/cvmfs-x509-helper/cvmfs-x509-helper-0.9-1.el6.x86_64.rpm"
-echo -n "download X509 helper $x509_helper... "
-wget --no-check-certificate --quiet "$x509_helper" || die "download failed"
+contrib_release="http://ecsft.cern.ch/dist/cvmfs/cvmfs-contrib-release/cvmfs-contrib-release-latest.noarch.rpm"
+echo -n "download contrib release $contrib_release... "
+wget --no-check-certificate --quiet "$contrib_release" || die "download failed"
 echo "OK"
-echo -n "install x509 helper... "
-sudo rpm -ivh $(basename $x509_helper) > /dev/null || die "install failed"
+echo -n "install contrib release... "
+sudo rpm -ivh $(basename $contrib_release) > /dev/null || die "install failed"
 echo "OK"
+install_from_repo cvmfs-x509-helper || die "fail (install cvmfs-x509-helper)"
 
 # Install test dependency for 647
 install_from_repo python-flask          || die "fail (installing python-flask)"

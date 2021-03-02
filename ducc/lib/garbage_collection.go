@@ -12,6 +12,189 @@ import (
 	da "github.com/cvmfs/ducc/docker-api"
 )
 
+func FindAllUsedFlatImages(CVMFSRepo string) ([]string, error) {
+	root := filepath.Join("/", "cvmfs", CVMFSRepo)
+	root_components := strings.Split(root, string(os.PathSeparator))
+	result := make([]string, 0)
+	walker := func(path string, info os.FileInfo, err error) error {
+		// some kind of error, we don't really care and we just move on.
+		if err != nil {
+			LogE(err).WithFields(log.Fields{"path": path}).Warning("Error in opening the path, moving on.")
+			return nil
+		}
+		components := strings.Split(path, string(os.PathSeparator))
+		// first root directory, not sure if this ever happen
+		if len(components) == len(root_components) {
+			return nil
+		}
+		// checking if we are in a hidden directory
+		// if we are, we skip it all
+		first_dir := components[len(root_components)]
+		if strings.HasPrefix(first_dir, ".") {
+			return filepath.SkipDir
+		}
+		// let's check if we have reach a symlink
+		// if we are in a symlink, we should capture
+		// the image digest
+		// we don't need to break the walk since Walk
+		// does not follow symlinks
+		if info.Mode()&os.ModeSymlink != 0 {
+			realName, _ := filepath.EvalSymlinks(path)
+			if err != nil {
+				return nil
+			}
+			result = append(result, realName)
+		}
+		// general case we keep iterating
+		return nil
+	}
+	filepath.Walk(root, walker)
+	return result, nil
+}
+
+func FindAllFlatImages(CVMFSRepo string) ([]string, error) {
+	root := filepath.Join("/", "cvmfs", CVMFSRepo, ".flat")
+	root_components := strings.Split(root, string(os.PathSeparator))
+	result := make([]string, 0)
+	walker := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			LogE(err).WithFields(log.Fields{"path": path}).Warning("Error in opening the path, moving on.")
+			return nil
+		}
+		components := strings.Split(path, string(os.PathSeparator))
+		if len(components) == len(root_components)+2 && info.IsDir() {
+			result = append(result, path)
+			return filepath.SkipDir
+		}
+		if len(components) > len(root_components)+2 {
+			return filepath.SkipDir
+		}
+		if len(components) < len(root_components)+2 {
+			return nil
+		}
+		// general case we keep iterating
+		return nil
+	}
+	filepath.Walk(root, walker)
+	return result, nil
+}
+
+func FindAllLayers(CVMFSRepo string) ([]string, error) {
+	root := filepath.Join("/", "cvmfs", CVMFSRepo, ".layers")
+	root_components := strings.Split(root, string(os.PathSeparator))
+	result := make([]string, 0)
+	walker := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			LogE(err).WithFields(log.Fields{"path": path}).Warning("Error in opening the path, moving on.")
+			return nil
+		}
+		components := strings.Split(path, string(os.PathSeparator))
+		if len(components) == len(root_components)+2 && info.IsDir() {
+			result = append(result, path)
+			return filepath.SkipDir
+		}
+		if len(components) > len(root_components)+2 {
+			return filepath.SkipDir
+		}
+		if len(components) < len(root_components)+2 {
+			return nil
+		}
+		// general case we keep iterating
+		return nil
+	}
+	filepath.Walk(root, walker)
+	return result, nil
+}
+
+func FindAllUsedLayers(CVMFSRepo string) ([]string, error) {
+	root := filepath.Join("/", "cvmfs", CVMFSRepo, ".metadata")
+	result := make([]string, 0)
+	walker := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			LogE(err).WithFields(log.Fields{"path": path}).Warning("Error in opening the path, moving on.")
+			return nil
+		}
+		if info.Name() == "manifest.json" {
+			bytes, err := ioutil.ReadFile(path)
+			if err != nil {
+				return filepath.SkipDir
+			}
+			var manifest da.Manifest
+			err = json.Unmarshal(bytes, &manifest)
+			if err != nil {
+				return filepath.SkipDir
+			}
+			for _, layerStruct := range manifest.Layers {
+				layer := strings.Split(layerStruct.Digest, ":")[1]
+				layerPath := filepath.Join("/", "cvmfs", CVMFSRepo, ".layers", layer[0:2], layer)
+				result = append(result, layerPath)
+			}
+			return filepath.SkipDir
+		}
+		return nil
+	}
+	filepath.Walk(root, walker)
+	return result, nil
+}
+
+func FindPodmanPathsToDelete(CVMFSRepo string, layersToDelete []string) ([]string, error) {
+	podmanPathsToDelete := make([]string, 0)
+	layerInfoPath := filepath.Join("/cvmfs", CVMFSRepo, "podmanStore", "overlay-layers", "layers.json")
+
+	layersToDeleteMap := make(map[string]bool)
+	for _, layerpath := range layersToDelete {
+		components := strings.Split(layerpath, string(os.PathSeparator))
+		layerid := components[len(components)-1]
+		layersToDeleteMap[layerid] = true
+	}
+ 
+	_, err := os.Stat(layerInfoPath)
+	if err == nil {
+		layersdata := []LayerInfo{}
+		file, err := ioutil.ReadFile(layerInfoPath)
+		if err != nil {
+			LogE(err).Error("Error in reading layers.json file")
+			return podmanPathsToDelete, err
+		}
+		json.Unmarshal(file, &layersdata)
+
+		newlayersdata := []LayerInfo{}
+		for _, info := range layersdata {
+			layerid := strings.Split(info.CompressedDiffDigest, ":")[1]
+			if layersToDeleteMap[layerid] {
+				podmanLayerPath := filepath.Join("/cvmfs", CVMFSRepo, "podmanStore", "overlay", info.ID)
+				
+				linkFilePath := filepath.Join(podmanLayerPath, "link")
+				data, err := ioutil.ReadFile(linkFilePath)
+				if err != nil {
+					LogE(err).Error("Error in reading link file")
+					return podmanPathsToDelete, err
+				}
+				id := string(data)
+				
+				linkDirPath := filepath.Join("/cvmfs", CVMFSRepo, "overlay", "l", id)
+				podmanPathsToDelete = append(podmanPathsToDelete, podmanLayerPath)
+				podmanPathsToDelete = append(podmanPathsToDelete, linkDirPath)
+				continue
+			}
+			newlayersdata = append(newlayersdata, info)
+		}
+
+		layerInfo, err := json.MarshalIndent(newlayersdata, "", " ")
+		if err != nil {
+			LogE(err).Error("Error in marshaling json data for layers.json")
+			return podmanPathsToDelete, err
+		}
+
+		err = writeDataToCvmfs(CVMFSRepo, TrimCVMFSRepoPrefix(layerInfoPath), layerInfo)
+		if err != nil {
+			LogE(err).Error("Error in writing layers.json")
+			return podmanPathsToDelete, err
+		}
+	}
+	return podmanPathsToDelete, nil
+}
+
 func FindImageToGarbageCollect(CVMFSRepo string) ([]da.Manifest, error) {
 	removeSchedulePath := RemoveScheduleLocation(CVMFSRepo)
 	llog := func(l *log.Entry) *log.Entry {

@@ -137,6 +137,11 @@ inline bool platform_umount(const char *mountpoint, const bool lazy) {
   return retval == 0;
 }
 
+inline bool platform_umount_lazy(const char *mountpoint) {
+  int retval = umount2(mountpoint, MNT_DETACH);
+  return retval == 0;
+}
+
 /**
  * Spinlocks are not necessarily part of pthread on all platforms.
  */
@@ -318,15 +323,30 @@ inline std::string platform_getexepath() {
   return "";
 }
 
-inline uint64_t platform_monotonic_time() {
+inline struct timespec _time_with_clock(int clock) {
   struct timespec tp;
-#ifdef CLOCK_MONOTONIC_COARSE
-  int retval = clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
-#else
-  int retval = clock_gettime(CLOCK_MONOTONIC, &tp);
-#endif
+  int retval = clock_gettime(clock, &tp);
   assert(retval == 0);
+  return tp;
+}
+
+inline uint64_t platform_monotonic_time() {
+#ifdef CLOCK_MONOTONIC_COARSE
+  struct timespec tp = _time_with_clock(CLOCK_MONOTONIC_COARSE);
+#else
+  struct timespec tp = _time_with_clock(CLOCK_MONOTONIC);
+#endif
   return tp.tv_sec + (tp.tv_nsec >= 500000000);
+}
+
+inline uint64_t platform_monotonic_time_ns() {
+  struct timespec tp = _time_with_clock(CLOCK_MONOTONIC);
+  return static_cast<uint64_t>(tp.tv_sec * 1e9 + tp.tv_nsec);
+}
+
+inline uint64_t platform_realtime_ns() {
+  struct timespec tp = _time_with_clock(CLOCK_REALTIME);
+  return static_cast<uint64_t>(tp.tv_sec * 1e9 + tp.tv_nsec);
 }
 
 inline uint64_t platform_memsize() {

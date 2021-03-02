@@ -24,6 +24,11 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/mount.h>  //  for statfs()
+#else
+#include <sys/statfs.h>
+#endif
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -48,7 +53,35 @@
 #include "logging.h"
 #include "platform.h"
 
+#include "util/algorithm.h"
+#include "util/exception.h"
+#include "util/string.h"
+#include "util_concurrency.h"
+
 //using namespace std;  // NOLINT
+
+#ifndef ST_RDONLY
+// On Linux, this is in sys/statvfs.h
+// On macOS, this flag is called MNT_RDONLY /usr/include/sys/mount.h
+#define ST_RDONLY 1
+#endif
+
+// Older Linux glibc versions do not provide the f_flags member in struct statfs
+#define CVMFS_HAS_STATFS_F_FLAGS
+#ifndef __APPLE__
+#ifdef __GLIBC_MINOR__
+#if __GLIBC_MINOR__ < 12
+#undef CVMFS_HAS_STATFS_F_FLAGS
+#endif
+#endif
+#endif
+
+// Work around missing clearenv()
+#ifdef __APPLE__
+extern "C" {
+extern char **environ;
+}
+#endif
 
 #ifdef CVMFS_NAMESPACE_GUARD
 namespace CVMFS_NAMESPACE_GUARD {
@@ -177,8 +210,90 @@ bool IsHttpUrl(const std::string &path) {
 }
 
 
+FileSystemInfo GetFileSystemInfo(const std::string &path) {
+  FileSystemInfo result;
+
+  struct statfs info;
+  int retval = statfs(path.c_str(), &info);
+  if (retval != 0)
+    return result;
+
+  switch (info.f_type) {
+    case kFsTypeAutofs:
+      result.type = kFsTypeAutofs;
+      break;
+    case kFsTypeNFS:
+      result.type = kFsTypeNFS;
+      break;
+    case kFsTypeProc:
+      result.type = kFsTypeProc;
+      break;
+    case kFsTypeBeeGFS:
+      result.type = kFsTypeBeeGFS;
+      break;
+    default:
+      result.type = kFsTypeUnknown;
+  }
+
+#ifdef CVMFS_HAS_STATFS_F_FLAGS
+  if (info.f_flags & ST_RDONLY)
+    result.is_rdonly = true;
+#else
+  // On old Linux systems, fall back to access()
+  retval = access(path.c_str(), W_OK);
+  result.is_rdonly = (retval != 0);
+#endif
+
+
+
+  return result;
+}
+
+
 /**
- * By default abort() on failure
+ * Follow all symlinks if possible. Equivalent to
+ * `readlink --canonicalize-missing`
+ */
+std::string ResolvePath(const std::string &path) {
+  if (path.empty() || (path == "/"))
+    return "/";
+  std::string name = GetFileName(path);
+  std::string result = name;
+  if (name != path) {
+    // There is a parent path of 'path'
+    std::string parent = ResolvePath(GetParentPath(path));
+    result = parent + (parent == "/" ? "" : "/") + name;
+  }
+  char *real_result = realpath(result.c_str(), NULL);
+  if (real_result) {
+    result = real_result;
+    free(real_result);
+  }
+  if (SymlinkExists(result)) {
+    char buf[PATH_MAX + 1];
+    ssize_t nchars = readlink(result.c_str(), buf, PATH_MAX);
+    if (nchars >= 0) {
+      buf[nchars] = '\0';
+      result = buf;
+    }
+  }
+  return result;
+}
+
+
+bool IsMountPoint(const std::string &path) {
+  std::vector<std::string> mount_list = platform_mountlist();
+  std::string resolved_path = ResolvePath(path);
+  for (unsigned i = 0; i < mount_list.size(); ++i) {
+    if (mount_list[i] == resolved_path)
+      return true;
+  }
+  return false;
+}
+
+
+/**
+ * By default PANIC(NULL) on failure
  */
 void CreateFile(
   const std::string &path,
@@ -192,7 +307,7 @@ void CreateFile(
   }
   if (ignore_failure)
     return;
-  assert(false);
+  PANIC(NULL);
 }
 
 
@@ -350,7 +465,6 @@ int ConnectSocket(const std::string &path) {
     RemoveShortSocketLink(short_path);
 
   if (retval < 0) {
-    // LogCvmfs(kLogCvmfs, kLogStderr, "ERROR %d", errno);
     close(socket_fd);
     return -1;
   }
@@ -561,18 +675,6 @@ void Block2Nonblock(int filedes) {
  */
 void SendMsg2Socket(const int fd, const std::string &msg) {
   (void)send(fd, &msg[0], msg.length(), MSG_NOSIGNAL);
-}
-
-
-void LockMutex(pthread_mutex_t *mutex) {
-  int retval = pthread_mutex_lock(mutex);
-  assert(retval == 0);
-}
-
-
-void UnlockMutex(pthread_mutex_t *mutex) {
-  int retval = pthread_mutex_unlock(mutex);
-  assert(retval == 0);
 }
 
 
@@ -925,6 +1027,7 @@ bool RemoveTree(const std::string &path) {
   FileSystemTraversal<RemoveTreeHelper> traversal(remove_tree_helper, "",
                                                   true);
   traversal.fn_new_file = &RemoveTreeHelper::RemoveFile;
+  traversal.fn_new_character_dev = &RemoveTreeHelper::RemoveFile;
   traversal.fn_new_symlink = &RemoveTreeHelper::RemoveFile;
   traversal.fn_new_socket = &RemoveTreeHelper::RemoveFile;
   traversal.fn_new_fifo = &RemoveTreeHelper::RemoveFile;
@@ -1021,6 +1124,120 @@ std::vector<std::string> FindDirectories(const std::string &parent_dir) {
   return result;
 }
 
+
+/**
+ * Finds all files and direct subdirectories under directory (except ., ..).
+ */
+bool ListDirectory(const std::string &directory,
+                   std::vector<std::string> *names,
+                   std::vector<mode_t> *modes)
+{
+  DIR *dirp = opendir(directory.c_str());
+  if (!dirp)
+    return false;
+
+  platform_dirent64 *dirent;
+  while ((dirent = platform_readdir(dirp))) {
+    const std::string name(dirent->d_name);
+    if ((name == ".") || (name == ".."))
+      continue;
+    const std::string path = directory + "/" + name;
+
+    platform_stat64 info;
+    int retval = platform_lstat(path.c_str(), &info);
+    if (retval != 0) {
+      closedir(dirp);
+      return false;
+    }
+
+    names->push_back(name);
+    modes->push_back(info.st_mode);
+  }
+  closedir(dirp);
+
+  SortTeam(names, modes);
+  return true;
+}
+
+
+/**
+ * Looks whether exe is an executable file.  If exe is not an absolute path,
+ * searches the PATH environment.
+ */
+std::string FindExecutable(const std::string &exe) {
+  if (exe.empty())
+    return "";
+
+  std::vector<std::string> search_paths;
+  if (exe[0] == '/') {
+    search_paths.push_back(GetParentPath(exe));
+  } else {
+    char *path_env = getenv("PATH");
+    if (path_env) {
+      search_paths = SplitString(path_env, ':');
+    }
+  }
+
+  for (unsigned i = 0; i < search_paths.size(); ++i) {
+    if (search_paths[i].empty())
+      continue;
+    if (search_paths[i][0] != '/')
+      continue;
+
+    std::string path = search_paths[i] + "/" + GetFileName(exe);
+    platform_stat64 info;
+    int retval = platform_stat(path.c_str(), &info);
+    if (retval != 0)
+      continue;
+    if (!S_ISREG(info.st_mode))
+      continue;
+    retval = access(path.c_str(), X_OK);
+    if (retval != 0)
+      continue;
+
+    return path;
+  }
+
+  return "";
+}
+
+
+std::string GetUserName() {
+  struct passwd pwd;
+  struct passwd *result = NULL;
+  int bufsize = 16 * 1024;
+  char *buf = static_cast<char *>(smalloc(bufsize));
+  while (getpwuid_r(geteuid(), &pwd, buf, bufsize, &result) == ERANGE) {
+    bufsize *= 2;
+    buf = static_cast<char *>(srealloc(buf, bufsize));
+  }
+  if (result == NULL) {
+    free(buf);
+    return "";
+  }
+  std::string user_name = pwd.pw_name;
+  free(buf);
+  return user_name;
+}
+
+std::string GetShell() {
+  struct passwd pwd;
+  struct passwd *result = NULL;
+  int bufsize = 16 * 1024;
+  char *buf = static_cast<char *>(smalloc(bufsize));
+  while (getpwuid_r(geteuid(), &pwd, buf, bufsize, &result) == ERANGE) {
+    bufsize *= 2;
+    buf = static_cast<char *>(srealloc(buf, bufsize));
+  }
+  if (result == NULL) {
+    free(buf);
+    return "";
+  }
+  std::string shell = pwd.pw_shell;
+  free(buf);
+  return shell;
+}
+
 /**
  * Name -> UID from passwd database
  */
@@ -1071,10 +1288,9 @@ bool GetGidOf(const std::string &groupname, gid_t *gid) {
  *       this function and beware of scalability bottlenecks
  */
 mode_t GetUmask() {
-  LockMutex(&getumask_mutex);
+  MutexLockGuard m(&getumask_mutex);
   const mode_t my_umask = umask(0);
   umask(my_umask);
-  UnlockMutex(&getumask_mutex);
   return my_umask;
 }
 
@@ -1102,6 +1318,26 @@ bool AddGroup2Persona(const gid_t gid) {
   retval = setgroups(ngroups+1, groups);
   free(groups);
   return retval == 0;
+}
+
+
+std::string GetHomeDirectory() {
+  uid_t uid = getuid();
+  struct passwd pwd;
+  struct passwd *result = NULL;
+  int bufsize = 16 * 1024;
+  char *buf = static_cast<char *>(smalloc(bufsize));
+  while (getpwuid_r(uid, &pwd, buf, bufsize, &result) == ERANGE) {
+    bufsize *= 2;
+    buf = static_cast<char *>(srealloc(buf, bufsize));
+  }
+  if (result == NULL) {
+    free(buf);
+    return "";
+  }
+  std::string home_dir = result->pw_dir;
+  free(buf);
+  return home_dir;
 }
 
 
@@ -1150,6 +1386,15 @@ void GetLimitNoFile(unsigned *soft_limit, unsigned *hard_limit) {
 }
 
 
+bool ProcessExists(pid_t pid) {
+  assert(pid > 0);
+  int retval = kill(pid, 0);
+  if (retval == 0)
+    return true;
+  return (errno != ESRCH);
+}
+
+
 /**
  * Blocks a signal for the calling thread.
  */
@@ -1188,7 +1433,7 @@ int WaitForChild(pid_t pid) {
     if (retval == -1) {
       if (errno == EINTR)
         continue;
-      assert(false);
+      PANIC(NULL);
     }
     assert(retval == pid);
     break;
@@ -1264,7 +1509,8 @@ bool ExecuteBinary(
   if (!ManagedExec(cmd_line,
                    preserve_fildes,
                    map_fildes,
-                   true,
+                   true /* drop_credentials */,
+                   false /* clear_env */,
                    double_fork,
                    child_pid))
   {
@@ -1347,6 +1593,7 @@ bool ManagedExec(const std::vector<std::string>  &command_line,
                  const std::set<int>        &preserve_fildes,
                  const std::map<int, int>   &map_fildes,
                  const bool             drop_credentials,
+                 const bool             clear_env,
                  const bool             double_fork,
                        pid_t           *child_pid)
 {
@@ -1360,6 +1607,15 @@ bool ManagedExec(const std::vector<std::string>  &command_line,
     int max_fd;
     int fd_flags;
     ForkFailures::Names failed = ForkFailures::kUnknown;
+
+    if (clear_env) {
+#ifdef __APPLE__
+      environ = NULL;
+#else
+      int retval = clearenv();
+      assert(retval == 0);
+#endif
+    }
 
     const char *argv[command_line.size() + 1];
     for (unsigned i = 0; i < command_line.size(); ++i)
@@ -1418,7 +1674,8 @@ bool ManagedExec(const std::vector<std::string>  &command_line,
     // retrieve the PID of the new (grand) child process and send it to the
     // grand father
     pid_grand_child = getpid();
-    pipe_fork.Write(ForkFailures::kSendPid);
+    failed = ForkFailures::kSendPid;
+    pipe_fork.Write(&failed, sizeof(failed));
     pipe_fork.Write(pid_grand_child);
 
     execvp(command_line[0].c_str(), const_cast<char **>(argv));
@@ -1426,7 +1683,7 @@ bool ManagedExec(const std::vector<std::string>  &command_line,
     failed = ForkFailures::kFailExec;
 
    fork_failure:
-    pipe_fork.Write(failed);
+    pipe_fork.Write(&failed, sizeof(failed));
     _exit(1);
   }
   if (double_fork) {
@@ -1438,7 +1695,7 @@ bool ManagedExec(const std::vector<std::string>  &command_line,
 
   // Either the PID or a return value is sent
   ForkFailures::Names status_code;
-  bool retcode = pipe_fork.Read(&status_code);
+  bool retcode = pipe_fork.Read(&status_code, sizeof(status_code));
   assert(retcode);
   if (status_code != ForkFailures::kSendPid) {
     close(pipe_fork.read_end);
@@ -1577,12 +1834,13 @@ bool SafeReadToString(int fd, std::string *final_result) {
 bool SafeWriteToFile(const std::string &content,
                      const std::string &path,
                      int mode) {
-  int fd = open(path.c_str(), O_WRONLY | O_CREAT, mode);
+  int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode);
   if (fd < 0) return false;
   bool retval = SafeWrite(fd, content.data(), content.size());
   close(fd);
   return retval;
 }
+
 
 #ifdef CVMFS_NAMESPACE_GUARD
 }  // namespace CVMFS_NAMESPACE_GUARD

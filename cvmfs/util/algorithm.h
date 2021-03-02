@@ -8,15 +8,15 @@
 #include <sys/time.h>
 
 #include <algorithm>
-#include <cassert>
 #include <string>
 #include <vector>
 
+#include "atomic.h"
 #include "murmur.h"
 // TODO(jblomer): should be also part of algorithm
+#include "platform.h"
 #include "prng.h"
 #include "util/single_copy.h"
-
 
 #ifdef CVMFS_NAMESPACE_GUARD
 namespace CVMFS_NAMESPACE_GUARD {
@@ -107,6 +107,96 @@ class StopWatch : SingleCopy {
   timeval start_, end_;
 };
 
+
+/**
+ * Log2Histogram is a simple implementation of
+ * log2 histogram data structure which stores
+ * and prints log2 histogram. It is used for
+ * getting and printing latency metrics of
+ * CVMFS fuse calls.
+ *
+ * Log2Histogram hist(2);
+ * hist.Add(1);
+ * hist.Add(2);
+ * hist.PrintLog2Histogram();
+ */
+
+class Log2Histogram {
+friend class UTLog2Histogram;
+
+ public:
+  explicit Log2Histogram(unsigned int nbins);
+
+  void Add(unsigned int value) {
+    unsigned int i;
+    const unsigned int n = this->bins_.size() - 1;
+
+    for (i = 1; i <= n; i++) {
+      if (value < this->boundary_values_[i]) {
+        atomic_inc32(&(this->bins_[i]));
+        return;
+      }
+    }
+
+    atomic_inc32(&(this->bins_[0]));  // add to overflow bin.
+  }
+
+  /**
+   * Returns the total number of elements in the histogram
+   */
+  inline uint64_t N() {
+    uint64_t n = 0;
+    unsigned int i;
+    for (i = 0; i <= this->bins_.size() - 1; i++) {
+      n += (unsigned int)atomic_read32(&(this->bins_[i]));
+    }
+    return n;
+  }
+
+  /**
+   * compute the quantile of order n
+   */
+  unsigned int GetQuantile(float n);
+
+  std::string ToString();
+
+  void PrintLog2Histogram();
+
+ private:
+  std::vector<atomic_int32> bins_;
+  // boundary_values_ handle the largest value a certain
+  // bin can store in itself.
+  std::vector<unsigned int> boundary_values_;
+};
+
+/**
+ * UTLog2Histogram class is a helper for the unit tests
+ * to extract internals from Log2Histogram.
+ */
+class UTLog2Histogram {
+ public:
+  std::vector<atomic_int32> GetBins(const Log2Histogram &h);
+};
+
+
+class HighPrecisionTimer : SingleCopy {
+ public:
+  static bool g_is_enabled;  // false by default
+
+  explicit HighPrecisionTimer(Log2Histogram *recorder)
+    : timestamp_start_(g_is_enabled ? platform_monotonic_time_ns() : 0)
+    , recorder_(recorder)
+  { }
+
+  ~HighPrecisionTimer() {
+    if (g_is_enabled)
+      recorder_->Add(platform_monotonic_time_ns() - timestamp_start_);
+  }
+
+ private:
+  uint64_t timestamp_start_;
+  Log2Histogram *recorder_;
+};
 
 #ifdef CVMFS_NAMESPACE_GUARD
 }  // namespace CVMFS_NAMESPACE_GUARD

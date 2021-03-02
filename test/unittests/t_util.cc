@@ -18,6 +18,7 @@
 #include <limits>
 #include <vector>
 
+#include "atomic.h"
 #include "shortstring.h"
 #include "smalloc.h"
 #include "testutil.h"
@@ -127,6 +128,21 @@ class T_Util : public ::testing::Test {
 };
 
 
+TEST_F(T_Util, GetUserName) {
+  EXPECT_FALSE(GetUserName().empty());
+  if (getenv("USER") != NULL) {
+    EXPECT_STREQ(getenv("USER"), GetUserName().c_str());
+  }
+}
+
+
+TEST_F(T_Util, GetShell) {
+  if (getenv("SHELL") != NULL) {
+    EXPECT_STREQ(getenv("SHELL"), GetShell().c_str());
+  }
+}
+
+
 TEST_F(T_Util, GetUidOf) {
   uid_t uid;
   gid_t gid;
@@ -134,6 +150,12 @@ TEST_F(T_Util, GetUidOf) {
   EXPECT_EQ(0U, uid);
   EXPECT_EQ(0U, gid);
   EXPECT_FALSE(GetUidOf("no-such-user", &uid, &gid));
+}
+
+
+TEST_F(T_Util, GetHomeDirectory) {
+  EXPECT_FALSE(GetHomeDirectory().empty());
+  EXPECT_TRUE(DirectoryExists(GetHomeDirectory()));
 }
 
 
@@ -336,6 +358,42 @@ TEST_F(T_Util, GetFileName) {
   EXPECT_EQ(NameString(NameString("path")),
       GetFileName(PathString(path_without_slash)));
   EXPECT_EQ(NameString(fake_path), GetFileName(PathString(fake_path)));
+}
+
+
+TEST_F(T_Util, GetFileSystemInfo) {
+  if (!DirectoryExists("/proc")) {
+    printf("Skipping\n");
+    return;
+  }
+
+  FileSystemInfo fs_info;
+  fs_info = GetFileSystemInfo("/proc");
+  EXPECT_EQ(kFsTypeProc, fs_info.type);
+  fs_info = GetFileSystemInfo("/");
+  EXPECT_EQ(kFsTypeUnknown, fs_info.type);
+}
+
+
+TEST_F(T_Util, ResolvePath) {
+  EXPECT_EQ("/", ResolvePath("/"));
+  EXPECT_EQ("/", ResolvePath(""));
+  EXPECT_EQ("/no/such/path", ResolvePath("/no/such/path"));
+  EXPECT_EQ("/", ResolvePath("/.//././."));
+  EXPECT_EQ("/", ResolvePath("/usr/.."));
+
+  EXPECT_EQ(0, symlink(".", "cvmfs_test_link"));
+  EXPECT_EQ(GetCurrentWorkingDirectory(), ResolvePath("cvmfs_test_link"));
+
+  EXPECT_EQ(0, symlink("/no/such/path", "cvmfs_test_link_dangling"));
+  EXPECT_EQ("/no/such/path", ResolvePath("cvmfs_test_link_dangling"));
+}
+
+
+TEST_F(T_Util, IsMountPoint) {
+  EXPECT_TRUE(IsMountPoint(""));
+  EXPECT_TRUE(IsMountPoint("/"));
+  EXPECT_FALSE(IsMountPoint("/no/such/file"));
 }
 
 
@@ -712,11 +770,6 @@ TEST_F(T_Util, TcpEndpoints) {
 }
 
 
-TEST_F(T_Util, Mutex) {
-  ASSERT_DEATH(LockMutex(static_cast<pthread_mutex_t*>(NULL)), ".*");
-  ASSERT_DEATH(UnlockMutex(static_cast<pthread_mutex_t*>(NULL)), ".*");
-}
-
 TEST_F(T_Util, SwitchCredentials) {
   // if I am root
   if (getuid() == 0) {
@@ -1003,6 +1056,48 @@ TEST_F(T_Util, FindDirectories) {
 }
 
 
+TEST_F(T_Util, ListDirectory) {
+  std::vector<std::string> names;
+  std::vector<mode_t> modes;
+
+  EXPECT_FALSE(ListDirectory("/no/such/dir", &names, &modes));
+  string dir = sandbox + "/test-listdir";
+  ASSERT_TRUE(MkdirDeep(dir, 0700));
+
+  EXPECT_TRUE(ListDirectory(dir, &names, &modes));
+  EXPECT_TRUE(names.empty());
+  EXPECT_TRUE(modes.empty());
+
+  ASSERT_TRUE(MkdirDeep(dir + "/dir1/sub", 0700));
+  ASSERT_TRUE(MkdirDeep(dir + "/dir2", 0700));
+  EXPECT_TRUE(SymlinkForced(dir + "/dir1", dir + "/dirX"));
+  string temp_file = CreateTempPath(dir + "/tempfile", 0600);
+  ASSERT_FALSE(temp_file.empty());
+
+  EXPECT_TRUE(ListDirectory(dir, &names, &modes));
+  ASSERT_EQ(4U, names.size());
+  EXPECT_EQ("dir1", names[0]);
+  EXPECT_EQ("dir2", names[1]);
+  EXPECT_EQ("dirX", names[2]);
+  EXPECT_EQ(GetFileName(temp_file), names[3]);
+  EXPECT_TRUE(S_ISDIR(modes[0]));
+  EXPECT_TRUE(S_ISDIR(modes[1]));
+  EXPECT_TRUE(S_ISLNK(modes[2]));
+  EXPECT_TRUE(S_ISREG(modes[3]));
+}
+
+
+TEST_F(T_Util, FindExecutable) {
+  std::string ls = FindExecutable("ls");
+  ASSERT_FALSE(ls.empty());
+  EXPECT_EQ('/', ls[0]);
+  std::string ls_abs = FindExecutable(ls);
+  EXPECT_EQ(ls, ls_abs);
+  std::string fail = FindExecutable("no-such-exe");
+  EXPECT_TRUE(fail.empty());
+}
+
+
 TEST_F(T_Util, GetUmask) {
   unsigned test_umask = 0755;
   mode_t original_mask = umask(test_umask);
@@ -1080,6 +1175,11 @@ TEST_F(T_Util, IsoTimestamp) {
   EXPECT_GT(converted, 0);
   EXPECT_GE(converted, now - 5);
   EXPECT_LE(converted, now + 5);
+}
+
+TEST_F(T_Util, WhitelistTimestamp) {
+  string timestamp = WhitelistTimestamp(0);
+  EXPECT_STREQ("19700101000000", timestamp.c_str());
 }
 
 TEST_F(T_Util, StringifyTimeval) {
@@ -1375,6 +1475,13 @@ TEST_F(T_Util, ReplaceAll) {
           "REPLACED"));
 }
 
+TEST_F(T_Util, ProcessExists) {
+  EXPECT_TRUE(ProcessExists(getpid()));
+  EXPECT_TRUE(ProcessExists(1));
+  EXPECT_FALSE(ProcessExists(999999999));
+  EXPECT_DEATH(ProcessExists(0), ".*");
+}
+
 TEST_F(T_Util, BlockSignal) {
   EXPECT_DEATH(kill(getpid(), SIGUSR1), ".*");
   BlockSignal(SIGUSR1);
@@ -1530,8 +1637,10 @@ TEST_F(T_Util, ManagedExecCommandLine) {
   map<int, int> fd_map;
   fd_map[fd_stdout[1]] = 1;
 
-  success = ManagedExec(command_line, preserve_filedes, fd_map, true, true,
-      &pid);
+  success = ManagedExec(command_line, preserve_filedes, fd_map,
+                        true /* drop_credentials */, false /* clear_env */,
+                        true /* double_fork */,
+                        &pid);
   ASSERT_TRUE(success);
   close(fd_stdout[1]);
   ssize_t bytes_read = read(fd_stdout[0], buffer, message.length());
@@ -1540,6 +1649,37 @@ TEST_F(T_Util, ManagedExecCommandLine) {
   ASSERT_EQ(message, result);
   close(fd_stdout[0]);
 }
+
+
+TEST_F(T_Util, ManagedExecClearEnv) {
+  bool success;
+  pid_t pid;
+  int fd_stdout[2];
+  int fd_stdin[2];
+  UniquePtr<unsigned char> buffer(static_cast<unsigned char*>(
+    scalloc(100, 1)));
+  MakePipe(fd_stdout);
+  MakePipe(fd_stdin);
+  vector<string> command_line;
+  command_line.push_back("/usr/bin/env");
+
+  set<int> preserve_filedes;
+  preserve_filedes.insert(1);
+
+  map<int, int> fd_map;
+  fd_map[fd_stdout[1]] = 1;
+
+  success = ManagedExec(command_line, preserve_filedes, fd_map,
+                        true /* drop_credentials */, true /* clear_env */,
+                        true /* double_fork */,
+                        &pid);
+  close(fd_stdout[1]);
+  ASSERT_TRUE(success);
+  ssize_t bytes_read = read(fd_stdout[0], buffer, 64);
+  EXPECT_EQ(bytes_read, 0);
+  close(fd_stdout[0]);
+}
+
 
 TEST_F(T_Util, ManagedExecRunShell) {
   int fd_stdin;
@@ -1767,4 +1907,88 @@ TEST_F(T_Util, DiffTree) {
   EXPECT_TRUE(DiffTree(".", "."));
   EXPECT_TRUE(DiffTree("./.", "."));
   EXPECT_FALSE(DiffTree(".", "/"));
+}
+
+TEST(Log2Histogram, 2BinEmpty) {
+  Log2Histogram log2hist(2);
+  log2hist.Add(10);
+  log2hist.Add(11);
+  log2hist.Add(12);
+
+  UTLog2Histogram unit_test;
+
+  std::vector<atomic_int32> bins = unit_test.GetBins(log2hist);
+  int res[3] = {3, 0, 0};
+  for (int i = 0; i < 3; i++) {
+    EXPECT_EQ(res[i], atomic_read32(&bins[i]));
+  }
+}
+
+TEST(Log2Histogram, 2Bins) {
+  Log2Histogram log2hist(2);
+  log2hist.Add(0);
+  log2hist.Add(1);
+  log2hist.Add(1);
+  log2hist.Add(2);
+  log2hist.Add(3);
+  log2hist.Add(4);
+
+  UTLog2Histogram unit_test;
+
+  std::vector<atomic_int32> bins = unit_test.GetBins(log2hist);
+  int res[3] = {1, 3, 2};
+  for (int i = 0; i < 3; i++) {
+    EXPECT_EQ(res[i], atomic_read32(&bins[i]));
+  }
+}
+
+TEST(Log2Histogram, 3Bins) {
+  Log2Histogram log2hist(3);
+  log2hist.Add(0);
+  log2hist.Add(0);
+  log2hist.Add(1);
+  log2hist.Add(1);
+  log2hist.Add(1);
+  log2hist.Add(2);
+  log2hist.Add(3);
+  log2hist.Add(4);
+  log2hist.Add(5);
+  log2hist.Add(5);
+  log2hist.Add(7);
+  log2hist.Add(8);
+
+  UTLog2Histogram unit_test;
+
+  std::vector<atomic_int32> bins = unit_test.GetBins(log2hist);
+  int res[4] = {1, 5, 2, 4};
+  for (int i = 0; i < 4; i++) {
+    EXPECT_EQ(res[i], atomic_read32(&bins[i]));
+  }
+}
+
+TEST(Log2Histogram, Quantiles) {
+  int N = 16;
+  int64_t max = 1 << N;
+  Log2Histogram log2hist(N + 1);
+
+  // the quantile computation to fail with tolerance ~0.001 (~0.1%) we add a
+  // safety factor of 50 (~5%)
+  float tolerance = 0.05;
+
+  Prng rng = Prng();
+  rng.InitLocaltime();
+
+  // we are oversampling to test the quantiles
+  int64_t i = 1 << (N + 4);
+  for (; i >= 0; i--) {
+    log2hist.Add(rng.Next(max));
+  }
+  float qs[12] = {0.15, 0.20, 0.3,   0.5,   0.75,   0.9,
+                  0.95, 0.99, 0.995, 0.999, 0.9995, 0.9999};
+  for (int i = 0; i < 12; i++) {
+    double expected = max * qs[i];
+    double max_difference = expected * tolerance;
+    unsigned int q = log2hist.GetQuantile(qs[i]);
+    EXPECT_NEAR(q, expected, max_difference);
+  }
 }

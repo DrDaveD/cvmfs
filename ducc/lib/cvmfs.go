@@ -23,7 +23,7 @@ var filePermision = os.FileMode(0644)
 // path: the path inside the repository, without the prefix (ex: .foo/bar/baz), where to put the ingested target
 // target: the path of the target in the normal FS, the thing to ingest
 // if no error is returned, we remove the target from the FS
-func IngestIntoCVMFS(CVMFSRepo string, path string, target string) (err error) {
+func PublishToCVMFS(CVMFSRepo string, path string, target string) (err error) {
 	defer func() {
 		if err == nil {
 			Log().WithFields(log.Fields{"target": target, "action": "ingesting"}).Info("Deleting temporary directory")
@@ -56,7 +56,7 @@ func IngestIntoCVMFS(CVMFSRepo string, path string, target string) (err error) {
 		if err != nil {
 			LogE(err).WithFields(log.Fields{"repo": CVMFSRepo}).Warning("Error in creating the directory where to copy the singularity")
 		}
-		err = copy.Copy(target, path)
+		err = copy.Copy(target, path, copy.Options{PreserveTimes: true})
 
 	} else if targetStat.Mode().IsRegular() {
 		err = func() error {
@@ -119,6 +119,16 @@ func CreateSymlinkIntoCVMFS(CVMFSRepo, newLinkName, toLinkPath string) (err erro
 		return err
 	}
 
+	relativePath, err := filepath.Rel(newLinkName, toLinkPath)
+	if err != nil {
+		llog(LogE(err)).Error("Error in find the relative path")
+		return err
+	}
+	// from the relativePath we remove the first part of the path.
+	// The part we remove reprensent the same directory where is the target.
+	linkChunks := strings.Split(relativePath, string(os.PathSeparator))
+	link := filepath.Join(linkChunks[1:]...)
+
 	err = ExecCommand("cvmfs_server", "transaction", CVMFSRepo).Start()
 	if err != nil {
 		llog(LogE(err)).Error("Error in opening the transaction")
@@ -153,7 +163,7 @@ func CreateSymlinkIntoCVMFS(CVMFSRepo, newLinkName, toLinkPath string) (err erro
 		}
 	}
 
-	err = os.Symlink(toLinkPath, newLinkName)
+	err = os.Symlink(link, newLinkName)
 	if err != nil {
 		llog(LogE(err)).Error(
 			"Error in creating the symlink")
@@ -222,7 +232,7 @@ func getBacklinkFromLayer(CVMFSRepo, layerDigest string) (backlink Backlink, err
 	return
 }
 
-func SaveLayersBacklink(CVMFSRepo string, img Image, layerDigest []string) error {
+func SaveLayersBacklink(CVMFSRepo string, img *Image, layerDigest []string) error {
 	llog := func(l *log.Entry) *log.Entry {
 		return l.WithFields(log.Fields{"action": "save backlink",
 			"repo":  CVMFSRepo,
@@ -486,7 +496,7 @@ func CreateCatalogIntoDir(CVMFSRepo, dir string) (err error) {
 		if err != nil {
 			return err
 		}
-		err = IngestIntoCVMFS(CVMFSRepo, TrimCVMFSRepoPrefix(catalogPath), tmpFile.Name())
+		err = PublishToCVMFS(CVMFSRepo, TrimCVMFSRepoPrefix(catalogPath), tmpFile.Name())
 		if err != nil {
 			return err
 		}
@@ -509,4 +519,25 @@ func RepositoryExists(CVMFSRepo string) bool {
 	} else {
 		return false
 	}
+}
+
+//writes data to file and publish in cvmfs repo path
+func writeDataToCvmfs(CVMFSRepo, path string, data []byte) (err error) {
+	tmpFile, err := UserDefinedTempFile()
+	if err != nil {
+		LogE(err).Error("Error in creating temporary file for writing data")
+		return err
+	}
+	defer os.RemoveAll(tmpFile.Name())
+	err = ioutil.WriteFile(tmpFile.Name(), data, 0644)
+	if err != nil {
+		LogE(err).Error("Error in writing data to file")
+		return err
+	}
+	err = tmpFile.Close()
+	if err != nil {
+		LogE(err).Error("Error in closing temporary file")
+		return err
+	}
+	return PublishToCVMFS(CVMFSRepo, path, tmpFile.Name())
 }

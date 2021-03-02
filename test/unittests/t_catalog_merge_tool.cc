@@ -11,12 +11,12 @@
 #include "xattr.h"
 
 namespace {
-const char* hashes[] = {"b026324c6904b2a9cb4b88d6d61c81d1000000",
-                        "26ab0db90d72e28ad0ba1e22ee510510000000",
-                        "6d7fce9fee471194aa8b5b6e47267f03000000",
-                        "48a24b70a0b376535542b996af517398000000",
-                        "1dcca23355272056f04fe8bf20edfce0000000",
-                        "11111111111111111111111111111111111111"};
+const char* hashes[] = {"b026324c6904b2a9cb4b88d6d61c81d100000000",
+                        "26ab0db90d72e28ad0ba1e22ee51051000000000",
+                        "6d7fce9fee471194aa8b5b6e47267f0300000000",
+                        "48a24b70a0b376535542b996af51739800000000",
+                        "1dcca23355272056f04fe8bf20edfce000000000",
+                        "1111111111111111111111111111111111111111"};
 
 DirSpec MakeBaseSpec() {
   DirSpec spec;
@@ -111,15 +111,19 @@ TEST_F(T_CatalogMergeTool, CRUD) {
 
   CatalogTestTool::History history = tester.history();
 
+  perf::Statistics statistics;
+
   receiver::CatalogMergeTool<catalog::WritableCatalogManager,
                              catalog::SimpleCatalogManager>
       merge_tool(params.stratum0, history[1].second, history[2].second,
                  PathString(""), GetCurrentWorkingDirectory() + "/merge_tool",
-                 server_tool->download_manager(), &first_manifest);
+                 server_tool->download_manager(), &first_manifest, &statistics);
   EXPECT_TRUE(merge_tool.Init());
 
   std::string output_manifest_path;
-  EXPECT_TRUE(merge_tool.Run(params, &output_manifest_path));
+  uint64_t final_rev;
+  EXPECT_TRUE(merge_tool.Run(params, &output_manifest_path, &final_rev));
+  EXPECT_EQ(2U, final_rev);
 
   UniquePtr<manifest::Manifest> output_manifest(
       manifest::Manifest::LoadFile(output_manifest_path));
@@ -149,4 +153,78 @@ TEST_F(T_CatalogMergeTool, CRUD) {
   // check size of "/dir/new_dir/new_file.txt"
   EXPECT_EQ(1024u,
             output_spec.Item("dir/new_dir/new_file.txt")->entry_base().size());
+
+  EXPECT_FALSE(output_spec.Item("dir/dir"));
+}
+
+TEST_F(T_CatalogMergeTool, Symlink) {
+  // we start by creating a simple structure
+  // .
+  // |- foo
+  // |- bar
+  //    |- baz
+  //       |- .cvmfscatalog
+  DirSpec base;
+  EXPECT_TRUE(base.AddDirectory("foo", "", 4096));
+  EXPECT_TRUE(base.AddDirectory("bar", "", 4096));
+  EXPECT_TRUE(base.AddDirectory("baz", "bar", 4096));
+  EXPECT_TRUE(base.AddNestedCatalog("bar/baz"));
+
+  CatalogTestTool tester("test_symlink");
+  EXPECT_TRUE(tester.Init());
+
+  // we apply the structure above to the tester
+  EXPECT_TRUE(tester.Apply("base", base));
+  manifest::Manifest first_manifest = *(tester.manifest());
+
+  // starting from the base structure, we remove the bar/baz directory
+  // and we create a symlink to /foo
+  // .
+  // |- foo
+  // |- bar
+  //    |- baz -> /foo
+  DirSpec update = base;
+
+  update.RemoveItemRec("bar/baz");
+  EXPECT_TRUE(update.LinkFile("baz", "bar", "/foo", 4));
+
+  EXPECT_TRUE(tester.Apply("second", update));
+
+  UniquePtr<ServerTool> server_tool(new ServerTool());
+  EXPECT_TRUE(server_tool->InitDownloadManager(true));
+
+  receiver::Params params = MakeMergeToolParams("test_symlink");
+
+  CatalogTestTool::History history = tester.history();
+
+  perf::Statistics statistics;
+
+  receiver::CatalogMergeTool<catalog::WritableCatalogManager,
+                             catalog::SimpleCatalogManager>
+      merge_tool(params.stratum0, history[1].second, history[2].second,
+                 PathString(""), GetCurrentWorkingDirectory() + "/merge_tool",
+                 server_tool->download_manager(), &first_manifest, &statistics);
+  EXPECT_TRUE(merge_tool.Init());
+
+  std::string output_manifest_path;
+  uint64_t final_rev;
+  EXPECT_TRUE(merge_tool.Run(params, &output_manifest_path, &final_rev));
+  EXPECT_EQ(2U, final_rev);
+
+  UniquePtr<manifest::Manifest> output_manifest(
+      manifest::Manifest::LoadFile(output_manifest_path));
+
+  EXPECT_TRUE(output_manifest.IsValid());
+
+  DirSpec output_spec;
+  EXPECT_TRUE(
+      tester.DirSpecAtRootHash(output_manifest->catalog_hash(), &output_spec));
+
+  std::string spec2_str;
+  update.ToString(&spec2_str);
+  std::string out_spec_str;
+  output_spec.ToString(&out_spec_str);
+
+  // the printed form of the target and output dir specs should be the same
+  EXPECT_EQ(0, strcmp(spec2_str.c_str(), out_spec_str.c_str()));
 }

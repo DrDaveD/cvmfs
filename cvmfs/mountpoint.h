@@ -20,6 +20,8 @@
 #include "gtest/gtest_prod.h"
 #include "hash.h"
 #include "loader.h"
+#include "magic_xattr.h"
+#include "util/algorithm.h"
 #include "util/pointer.h"
 
 class AuthzAttachment;
@@ -41,6 +43,7 @@ class DownloadManager;
 }
 namespace glue {
 class InodeTracker;
+class NentryTracker;
 }
 namespace lru {
 class InodeCache;
@@ -166,11 +169,24 @@ class FileSystem : SingleCopy, public BootFactory {
   bool IsHaNfsSource() { return nfs_mode_ & kNfsMapsHa; }
   void ResetErrorCounters();
   void TearDown2ReadOnly();
+  void RemapCatalogFd(int from, int to);
 
   CacheManager *cache_mgr() { return cache_mgr_; }
   std::string cache_mgr_instance() { return cache_mgr_instance_; }
   std::string exe_path() { return exe_path_; }
   bool found_previous_crash() { return found_previous_crash_; }
+  Log2Histogram *hist_fs_lookup() { return hist_fs_lookup_; }
+  Log2Histogram *hist_fs_forget() { return hist_fs_forget_; }
+  Log2Histogram *hist_fs_forget_multi() { return hist_fs_forget_multi_; }
+  Log2Histogram *hist_fs_getattr() { return hist_fs_getattr_; }
+  Log2Histogram *hist_fs_readlink() { return hist_fs_readlink_; }
+  Log2Histogram *hist_fs_opendir() { return hist_fs_opendir_; }
+  Log2Histogram *hist_fs_releasedir() { return hist_fs_releasedir_; }
+  Log2Histogram *hist_fs_readdir() { return hist_fs_readdir_; }
+  Log2Histogram *hist_fs_open() { return hist_fs_open_; }
+  Log2Histogram *hist_fs_read() { return hist_fs_read_; }
+  Log2Histogram *hist_fs_release() { return hist_fs_release_; }
+
   perf::Counter *n_fs_dir_open() { return n_fs_dir_open_; }
   perf::Counter *n_fs_forget() { return n_fs_forget_; }
   perf::Counter *n_fs_lookup() { return n_fs_lookup_; }
@@ -279,6 +295,18 @@ class FileSystem : SingleCopy, public BootFactory {
   perf::Counter *no_open_files_;
   perf::Counter *no_open_dirs_;
   perf::Statistics *statistics_;
+
+  Log2Histogram *hist_fs_lookup_;
+  Log2Histogram *hist_fs_forget_;
+  Log2Histogram *hist_fs_forget_multi_;
+  Log2Histogram *hist_fs_getattr_;
+  Log2Histogram *hist_fs_readlink_;
+  Log2Histogram *hist_fs_opendir_;
+  Log2Histogram *hist_fs_releasedir_;
+  Log2Histogram *hist_fs_readdir_;
+  Log2Histogram *hist_fs_open_;
+  Log2Histogram *hist_fs_read_;
+  Log2Histogram *hist_fs_release_;
 
   /**
    * A writeable local directory.  Only small amounts of data (few bytes) will
@@ -389,11 +417,12 @@ class MountPoint : SingleCopy, public BootFactory {
   }
   cvmfs::Fetcher *fetcher() { return fetcher_; }
   bool fixed_catalog() { return fixed_catalog_; }
-  std::string fqrn() { return fqrn_; }
+  std::string fqrn() const { return fqrn_; }
   cvmfs::Fetcher *external_fetcher() { return external_fetcher_; }
   FileSystem *file_system() { return file_system_; }
+  MagicXattrManager *magic_xattr_mgr() { return magic_xattr_mgr_; }
   bool has_membership_req() { return has_membership_req_; }
-  bool hide_magic_xattrs() { return hide_magic_xattrs_; }
+  bool enforce_acls() { return enforce_acls_; }
   catalog::InodeAnnotation *inode_annotation() {
     return inode_annotation_;
   }
@@ -402,11 +431,15 @@ class MountPoint : SingleCopy, public BootFactory {
   double kcache_timeout_sec() { return kcache_timeout_sec_; }
   lru::Md5PathCache *md5path_cache() { return md5path_cache_; }
   std::string membership_req() { return membership_req_; }
+  glue::NentryTracker *nentry_tracker() { return nentry_tracker_; }
   lru::PathCache *path_cache() { return path_cache_; }
   std::string repository_tag() { return repository_tag_; }
   SimpleChunkTables *simple_chunk_tables() { return simple_chunk_tables_; }
   perf::Statistics *statistics() { return statistics_; }
   signature::SignatureManager *signature_mgr() { return signature_mgr_; }
+  uid_t talk_socket_uid() { return talk_socket_uid_; }
+  gid_t talk_socket_gid() { return talk_socket_gid_; }
+  std::string talk_socket_path() { return talk_socket_path_; }
   Tracer *tracer() { return tracer_; }
   cvmfs::Uuid *uuid() { return uuid_; }
 
@@ -470,7 +503,7 @@ class MountPoint : SingleCopy, public BootFactory {
   bool CreateCatalogManager();
   void CreateTables();
   bool CreateTracer();
-  void SetupBehavior();
+  bool SetupBehavior();
   void SetupDnsTuning(download::DownloadManager *manager);
   void SetupHttpTuning();
   bool SetupExternalDownloadMgr(bool dogeosort);
@@ -511,6 +544,8 @@ class MountPoint : SingleCopy, public BootFactory {
   lru::Md5PathCache *md5path_cache_;
   Tracer *tracer_;
   glue::InodeTracker *inode_tracker_;
+  glue::NentryTracker *nentry_tracker_;
+  MagicXattrManager *magic_xattr_mgr_;
 
   file_watcher::FileWatcher* resolv_conf_watcher_;
 
@@ -518,13 +553,17 @@ class MountPoint : SingleCopy, public BootFactory {
   pthread_mutex_t lock_max_ttl_;
   double kcache_timeout_sec_;
   bool fixed_catalog_;
-  bool hide_magic_xattrs_;
+  bool enforce_acls_;
   std::string repository_tag_;
   std::vector<std::string> blacklist_paths_;
 
   // TODO(jblomer): this should go in the catalog manager
   std::string membership_req_;
   bool has_membership_req_;
+
+  std::string talk_socket_path_;
+  uid_t talk_socket_uid_;
+  gid_t talk_socket_gid_;
 };  // class MointPoint
 
 #endif  // CVMFS_MOUNTPOINT_H_

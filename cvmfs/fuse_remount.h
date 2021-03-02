@@ -13,6 +13,7 @@
 #include "duplex_fuse.h"
 #include "fence.h"
 #include "fuse_evict.h"
+#include "hash.h"
 #include "util/single_copy.h"
 
 namespace cvmfs {
@@ -46,14 +47,15 @@ class FuseRemounter : SingleCopy {
 
   FuseRemounter(MountPoint *mountpoint,
                 cvmfs::InodeGenerationInfo *inode_generation_info,
-                struct fuse_chan **fuse_channel,
+                void **fuse_channel_or_session,
                 bool fuse_notify_invalidation);
   ~FuseRemounter();
   void Spawn();
 
   Status Check();
   Status CheckSynchronously();
-  void TryFinish();
+  Status ChangeRoot(const shash::Any &root_hash);
+  void TryFinish(const shash::Any &root_hash = shash::Any());
   void EnterMaintenanceMode();
   bool IsCaching() {
     return (atomic_read32(&maintenance_mode_) == 0) &&

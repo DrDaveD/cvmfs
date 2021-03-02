@@ -15,11 +15,11 @@ message ("Running CMake version ${CMAKE_VERSION}")
 # The version numbers
 #
 # DON'T DELETE
-## CVMFS_VERSION 2.6.3
+## CVMFS_VERSION 2.8.0
 #---------------------
 set (CernVM-FS_VERSION_MAJOR 2)
-set (CernVM-FS_VERSION_MINOR 6)
-set (CernVM-FS_VERSION_PATCH 3)
+set (CernVM-FS_VERSION_MINOR 8)
+set (CernVM-FS_VERSION_PATCH 0)
 set (CernVM-FS_VERSION_STRING "${CernVM-FS_VERSION_MAJOR}.${CernVM-FS_VERSION_MINOR}.${CernVM-FS_VERSION_PATCH}")
 
 #
@@ -57,6 +57,15 @@ if (LINUX AND CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
   set (CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "CVMFS install path default is /usr" FORCE)
   message("Setting default install prefix to ${CMAKE_INSTALL_PREFIX} on Linux")
 endif (LINUX AND CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+
+#
+# Explicitly check that the install prefix is not /usr/local.
+#
+if (LINUX AND "${CMAKE_INSTALL_PREFIX}" STREQUAL "/usr/local")
+  message("######################################################################")
+  message(WARNING "The installation path has been set to ${CMAKE_INSTALL_PREFIX}.")
+  message("######################################################################")
+endif (LINUX AND "${CMAKE_INSTALL_PREFIX}" STREQUAL "/usr/local")
 
 #
 # check if we use Clang
@@ -405,13 +414,16 @@ if (BUILD_CVMFS)
   else (MACOSX)
     find_package (FUSE REQUIRED)
     set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${FUSE_INCLUDE_DIR})
+    find_package (FUSE3)
+    if (FUSE3_FOUND)
+      set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${FUSE3_INCLUDE_DIR})
+      add_definitions(-DHAS_FUSE3)
+    endif ()
   endif (MACOSX)
 endif (BUILD_CVMFS)
 
-# Server only: unzip, libcap, mongoose
+# Server only: unzip, libcap
 if (BUILD_SERVER OR BUILD_SERVER_DEBUG)
-  find_package(Mongoose REQUIRED)
-  set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${MONGOOSE_INCLUDE_DIRS})
   find_package(PythonLibs REQUIRED)
   find_package(LibCAP REQUIRED)
   find_program(UNZIP_EXE NAMES unzip)
@@ -460,6 +472,10 @@ endif(BUILD_QC_TESTS)
 if (BUILD_DUCC)
   add_subdirectory (ducc)
 endif(BUILD_DUCC)
+
+if (BUILD_STRESS_TESTS)
+  include(test/stress/CMakeLists.txt)
+endif (BUILD_STRESS_TESTS)
 
 #
 # Documentation

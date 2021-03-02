@@ -67,10 +67,12 @@ bool FuseInvalidator::HasFuseNotifyInval() {
 
 FuseInvalidator::FuseInvalidator(
   glue::InodeTracker *inode_tracker,
-  struct fuse_chan **fuse_channel,
+  glue::NentryTracker *nentry_tracker,
+  void **fuse_channel_or_session,
   bool fuse_notify_invalidation)
   : inode_tracker_(inode_tracker)
-  , fuse_channel_(fuse_channel)
+  , nentry_tracker_(nentry_tracker)
+  , fuse_channel_or_session_(fuse_channel_or_session)
   , spawned_(false)
 {
   g_fuse_notify_invalidation_ = fuse_notify_invalidation;
@@ -118,7 +120,9 @@ void *FuseInvalidator::MainInvalidator(void *data) {
     uint64_t deadline = platform_monotonic_time() + handle->timeout_s_;
 
     // Fallback: drainout by timeout
-    if ((invalidator->fuse_channel_ == NULL) || !HasFuseNotifyInval()) {
+    if ((invalidator->fuse_channel_or_session_ == NULL) ||
+        !HasFuseNotifyInval())
+    {
       while (platform_monotonic_time() < deadline) {
         SafeSleepMs(kCheckTimeoutFreqMs);
         if (atomic_read32(&invalidator->terminated_) == 1) {
@@ -133,14 +137,14 @@ void *FuseInvalidator::MainInvalidator(void *data) {
 
     // We must not hold a lock when calling fuse_lowlevel_notify_inval_entry.
     // Therefore, we first copy all the inodes into a temporary data structure.
-    glue::InodeTracker::Cursor cursor(
+    glue::InodeTracker::Cursor inode_cursor(
       invalidator->inode_tracker_->BeginEnumerate());
     uint64_t inode;
-    while (invalidator->inode_tracker_->NextInode(&cursor, &inode))
+    while (invalidator->inode_tracker_->NextInode(&inode_cursor, &inode))
     {
       invalidator->evict_list_.PushBack(inode);
     }
-    invalidator->inode_tracker_->EndEnumerate(&cursor);
+    invalidator->inode_tracker_->EndEnumerate(&inode_cursor);
 
     unsigned i = 0;
     unsigned N = invalidator->evict_list_.size();
@@ -149,8 +153,13 @@ void *FuseInvalidator::MainInvalidator(void *data) {
       if (inode == 0)
         inode = FUSE_ROOT_ID;
       // Can fail, e.g. the inode might be already evicted
-      fuse_lowlevel_notify_inval_inode(
-        *invalidator->fuse_channel_, inode, 0, 0);
+#if CVMFS_USE_LIBFUSE == 2
+      fuse_lowlevel_notify_inval_inode(*reinterpret_cast<struct fuse_chan**>(
+        invalidator->fuse_channel_or_session_), inode, 0, 0);
+#else
+      fuse_lowlevel_notify_inval_inode(*reinterpret_cast<struct fuse_session**>(
+        invalidator->fuse_channel_or_session_), inode, 0, 0);
+#endif
       LogCvmfs(kLogCvmfs, kLogDebug, "evicting inode %" PRIu64, inode);
 
       if ((++i % kCheckTimeoutFreqOps) == 0) {
@@ -166,6 +175,38 @@ void *FuseInvalidator::MainInvalidator(void *data) {
         }
       }
     }
+
+    // Do the nentry tracker last to increase the effectiveness of pruning
+    invalidator->nentry_tracker_->Prune();
+    // Copy and empty the nentry tracker in a single atomic operation
+    glue::NentryTracker *nentries_copy = invalidator->nentry_tracker_->Move();
+    glue::NentryTracker::Cursor nentry_cursor = nentries_copy->BeginEnumerate();
+    uint64_t entry_parent;
+    NameString entry_name;
+    i = 0;
+    while (nentries_copy->NextEntry(&nentry_cursor, &entry_parent, &entry_name))
+    {
+      // Can fail, e.g. the entry might be already evicted
+#if CVMFS_USE_LIBFUSE == 2
+      fuse_lowlevel_notify_inval_entry(*reinterpret_cast<struct fuse_chan**>(
+        invalidator->fuse_channel_or_session_),
+        entry_parent, entry_name.GetChars(), entry_name.GetLength());
+#else
+      fuse_lowlevel_notify_inval_entry(*reinterpret_cast<struct fuse_session**>(
+        invalidator->fuse_channel_or_session_),
+        entry_parent, entry_name.GetChars(), entry_name.GetLength());
+#endif
+      if ((++i % kCheckTimeoutFreqOps) == 0) {
+        if (atomic_read32(&invalidator->terminated_) == 1) {
+          LogCvmfs(kLogCvmfs, kLogDebug,
+                   "cancel cache eviction due to termination");
+          break;
+        }
+      }
+    }
+    nentries_copy->EndEnumerate(&nentry_cursor);
+    delete nentries_copy;
+
     handle->SetDone();
     invalidator->evict_list_.Clear();
   }

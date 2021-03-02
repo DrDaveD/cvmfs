@@ -11,6 +11,7 @@
 #include <cstdlib>
 
 #include "logging.h"
+#include "util/exception.h"
 #include "util_concurrency.h"
 #include "xattr.h"
 
@@ -221,13 +222,28 @@ void WritableCatalog::IncLinkcount(const string &path_within_group,
 
 
 void WritableCatalog::TouchEntry(const DirectoryEntryBase &entry,
+                                 const XattrList &xattrs,
                                  const shash::Md5 &path_hash) {
   SetDirty();
 
-  bool retval =
-    sql_touch_->BindPathHash(path_hash) &&
-    sql_touch_->BindDirentBase(entry)   &&
-    sql_touch_->Execute();
+  catalog::DirectoryEntry prev_entry;
+  bool retval = LookupMd5Path(path_hash, &prev_entry);
+  assert(retval);
+
+  retval = sql_touch_->BindPathHash(path_hash) &&
+           sql_touch_->BindDirentBase(entry);
+  assert(retval);
+  if (xattrs.IsEmpty()) {
+    retval = sql_touch_->BindXattrEmpty();
+    if (prev_entry.HasXattrs())
+      delta_counters_.self.xattrs--;
+  } else {
+    retval = sql_touch_->BindXattr(xattrs);
+    if (!prev_entry.HasXattrs())
+      delta_counters_.self.xattrs++;
+  }
+  assert(retval);
+  retval = sql_touch_->Execute();
   assert(retval);
   sql_touch_->Reset();
 }
@@ -654,16 +670,9 @@ void WritableCatalog::RemoveFromParent() {
 
   // Remove the nested catalog reference for this nested catalog.
   // From now on this catalog will be dangling!
-  Catalog* child_catalog;
-  parent->RemoveNestedCatalog(this->mountpoint().ToString(), &child_catalog);
-
-  const Counters& child_counters = child_catalog->GetCounters();
-
-  parent->delta_counters_.subtree.directories -= 1;
-  parent->delta_counters_.subtree.file_size -= child_counters.self.file_size;
-  parent->delta_counters_.subtree.regular_files -=
-      child_counters.self.regular_files;
-  parent->delta_counters_.subtree.symlinks -= child_counters.self.symlinks;
+  parent->RemoveNestedCatalog(this->mountpoint().ToString(), NULL);
+  parent->delta_counters_.RemoveFromSubtree(
+    Counters::Diff(Counters(), GetCounters()));
 }
 
 
@@ -785,9 +794,7 @@ void WritableCatalog::VacuumDatabaseIfNecessary() {
              ratio * 100.0,
              reason.c_str());
     if (!db.Vacuum()) {
-      LogCvmfs(kLogCatalog, kLogStderr, "failed (SQLite: %s)",
-               db.GetLastErrorMsg().c_str());
-      assert(false);
+      PANIC(kLogStderr, "failed (SQLite: %s)", db.GetLastErrorMsg().c_str());
     }
     LogCvmfs(kLogCatalog, kLogStdout, "done");
   }

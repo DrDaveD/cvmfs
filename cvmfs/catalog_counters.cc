@@ -5,6 +5,7 @@
 #include "catalog_counters.h"
 
 #include "directory_entry.h"
+#include "util/exception.h"
 
 namespace catalog {
 
@@ -27,7 +28,7 @@ void DeltaCounters::ApplyDelta(const DirectoryEntry &dirent, const int delta) {
   } else if (dirent.IsDirectory()) {
     self.directories += delta;
   } else {
-    assert(false);
+    PANIC(NULL);
   }
   if (dirent.HasXattrs()) {
     self.xattrs += delta;
@@ -38,6 +39,11 @@ void DeltaCounters::ApplyDelta(const DirectoryEntry &dirent, const int delta) {
 void DeltaCounters::PopulateToParent(DeltaCounters *parent) const {
   parent->subtree.Add(self);
   parent->subtree.Add(subtree);
+}
+
+void DeltaCounters::RemoveFromSubtree(const DeltaCounters &child) {
+  subtree.Subtract(child.self);
+  subtree.Subtract(child.subtree);
 }
 
 
@@ -51,7 +57,6 @@ void Counters::AddAsSubtree(DeltaCounters *delta) const {
   delta->subtree.Add(self);
   delta->subtree.Add(subtree);
 }
-
 
 void Counters::MergeIntoParent(DeltaCounters *parent_delta) const {
   parent_delta->self.Add(self);

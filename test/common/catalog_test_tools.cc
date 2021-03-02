@@ -66,9 +66,7 @@ DirSpec::DirSpec() : items_(), dirs_() {
 bool DirSpec::AddFile(const std::string& name, const std::string& parent,
                       const std::string& digest, const size_t size,
                       const XattrList& xattrs, shash::Suffix suffix) {
-  shash::Any hash = shash::Any(
-      shash::kSha1, reinterpret_cast<const unsigned char*>(digest.c_str()),
-      suffix);
+  shash::Any hash = shash::MkFromHexPtr(shash::HexPtr(digest), suffix);
   if (!HasDir(parent)) {
     return false;
   }
@@ -109,7 +107,9 @@ bool DirSpec::AddDirectory(const std::string& name, const std::string& parent,
 
 bool DirSpec::AddNestedCatalog(const std::string& name) {
   bool ret = AddNC(name);
+  if (!ret) return ret;
   nested_catalogs_.push_back(name);
+  AddFile(".cvmfscatalog", name, "0000000000000000000000000000000000000001", 0);
   return ret;
 }
 
@@ -135,17 +135,22 @@ void DirSpec::ToString(std::string* out) {
   for (DirSpec::ItemList::const_iterator it = items_.begin();
        it != items_.end(); ++it) {
     const DirSpecItem& item = it->second;
-    char item_type = ' ';
     if (item.entry_base().IsRegular()) {
-      item_type = 'F';
+      ostr << "F ";
     } else if (item.entry_base().IsDirectory()) {
-      item_type = 'D';
+      ostr << "D ";
+    } else if (item.entry_base().IsLink()) {
+      ostr << "S ";
     }
     std::string parent = item.parent();
     AddLeadingSlash(&parent);
 
-    ostr << item_type << " " << item.entry_base().GetFullPath(parent).c_str()
-         << std::endl;
+    ostr << item.entry_base().GetFullPath(parent).c_str();
+    if (item.entry_base().IsLink()) {
+      ostr << " -> " << item.entry_base().symlink().c_str();
+    }
+
+    ostr << std::endl;
   }
   *out = ostr.str();
 }
@@ -154,6 +159,11 @@ const DirSpecItem* DirSpec::Item(const std::string& full_path) const {
   ItemList::const_iterator it = items_.find(full_path);
   if (it != items_.end()) {
     return &it->second;
+  }
+  std::string no_slash(full_path);
+  RemoveLeadingSlash(&no_slash);
+  if (no_slash != full_path) {
+    return Item(full_path);
   }
   return NULL;
 }
@@ -167,6 +177,7 @@ static void RemoveItemHelper(
   if (it != spec.items().end()) {
     const DirSpecItem item = it->second;
     acc->push_back(full_path);
+
     if (item.entry_base().IsDirectory()) {
       std::string rel_full_path(full_path);
       RemoveLeadingSlash(&rel_full_path);
@@ -183,8 +194,10 @@ static void RemoveItemHelper(
 }
 
 void DirSpec::RemoveItemRec(const std::string& full_path) {
+  std::string path(full_path);
+  RemoveLeadingSlash(&path);
   std::vector<std::string> acc(0);
-  RemoveItemHelper(*this, full_path, &acc);
+  RemoveItemHelper(*this, path, &acc);
 
   for (size_t i = 0u; i < acc.size(); ++i) {
     const DirSpecItem* item = Item(acc[i]);
@@ -192,6 +205,15 @@ void DirSpec::RemoveItemRec(const std::string& full_path) {
       RmDir(std::string(item->entry_base().name().c_str()), item->parent());
     }
     items_.erase(acc[i]);
+
+    DirSpec::NestedCatalogList::iterator n;
+    for (n = nested_catalogs_.begin(); n != nested_catalogs_.end();) {
+      if (*n == acc[i]) {
+        n = nested_catalogs_.erase(n);
+      } else {
+        ++n;
+      }
+    }
   }
 }
 
@@ -260,7 +282,6 @@ bool CatalogTestTool::Init() {
     return false;
   }
 
-  perf::Statistics stats;
   manifest_ = CreateRepository(temp_dir_, spooler_);
 
   if (!manifest_.IsValid()) {
@@ -283,16 +304,20 @@ bool CatalogTestTool::Init() {
   return true;
 }
 
+void CatalogTestTool::UpdateManifest() {
+  CreateManifest(stratum0_, manifest_);
+}
+
 // Note: we always apply the dir spec to the revision corresponding to the
 // original,
 //       empty repository.
 bool CatalogTestTool::Apply(const std::string& id, const DirSpec& spec) {
-  perf::Statistics stats;
-  UniquePtr<catalog::WritableCatalogManager> catalog_mgr(
-      CreateCatalogMgr(history_.front().second, "file://" + stratum0_,
-                       temp_dir_, spooler_, download_manager(), &stats));
-
-  if (!catalog_mgr.IsValid()) {
+  statistics_ = new perf::Statistics();
+  catalog_mgr_ =
+    CreateCatalogMgr(history_.front().second, "file://" + stratum0_,
+                     temp_dir_, spooler_, download_manager(),
+                     statistics_.weak_ref());
+  if (!catalog_mgr_.IsValid()) {
     return false;
   }
 
@@ -300,13 +325,21 @@ bool CatalogTestTool::Apply(const std::string& id, const DirSpec& spec) {
        it != spec.items().end(); ++it) {
     const DirSpecItem& item = it->second;
     if (item.entry_.IsRegular() || item.entry_.IsLink()) {
-      catalog_mgr->AddFile(item.entry_base(), item.xattrs(), item.parent());
+      catalog_mgr_->AddFile(item.entry_base(), item.xattrs(), item.parent());
     } else if (item.entry_.IsDirectory()) {
-      catalog_mgr->AddDirectory(item.entry_base(), item.parent());
+      catalog_mgr_->AddDirectory(
+        item.entry_base(), item.xattrs(), item.parent());
     }
   }
 
-  if (!catalog_mgr->Commit(false, 0, manifest_)) {
+  DirSpec::NestedCatalogList::const_iterator it;
+  for (it = spec.nested_catalogs().begin();
+       it != spec.nested_catalogs().end(); ++it) {
+    catalog_mgr_->CreateNestedCatalog(*it);
+  }
+
+
+  if (!catalog_mgr_->Commit(false, 0, manifest_)) {
     return false;
   }
 
@@ -319,12 +352,11 @@ bool CatalogTestTool::ApplyAtRootHash(
   const shash::Any& root_hash,
   const DirSpec& spec
 ) {
-  perf::Statistics stats;
-  UniquePtr<catalog::WritableCatalogManager> catalog_mgr(
-      CreateCatalogMgr(root_hash, "file://" + stratum0_, temp_dir_, spooler_,
-                       download_manager(), &stats));
-
-  if (!catalog_mgr.IsValid()) {
+  statistics_ = new perf::Statistics();
+  catalog_mgr_ =
+    CreateCatalogMgr(root_hash, "file://" + stratum0_, temp_dir_, spooler_,
+                     download_manager(), statistics_.weak_ref());
+  if (!catalog_mgr_.IsValid()) {
     return false;
   }
 
@@ -332,19 +364,20 @@ bool CatalogTestTool::ApplyAtRootHash(
        it != spec.items().end(); ++it) {
     const DirSpecItem& item = it->second;
     if (item.entry_.IsRegular() || item.entry_.IsLink()) {
-      catalog_mgr->AddFile(item.entry_base(), item.xattrs(), item.parent());
+      catalog_mgr_->AddFile(item.entry_base(), item.xattrs(), item.parent());
     } else if (item.entry_.IsDirectory()) {
-      catalog_mgr->AddDirectory(item.entry_base(), item.parent());
+      catalog_mgr_->AddDirectory(
+        item.entry_base(), item.xattrs(), item.parent());
     }
   }
 
   DirSpec::NestedCatalogList::const_iterator it;
   for (it = spec.nested_catalogs().begin();
        it != spec.nested_catalogs().end(); ++it) {
-    catalog_mgr->CreateNestedCatalog(*it);
+    catalog_mgr_->CreateNestedCatalog(*it);
   }
 
-  if (!catalog_mgr->Commit(false, 0, manifest_)) {
+  if (!catalog_mgr_->Commit(false, 0, manifest_)) {
     return false;
   }
 

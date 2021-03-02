@@ -1,3 +1,153 @@
+2.8.0:
+  * Update maxminddb to version 1.5.4
+  * Fix committing publications with gateway >= 1.2
+  * Fix cvmfs_config status for broken mountpoints (CVM-1959)
+  * Improve network error handling during GC (CVM-1957)
+  * [macOS] fix reload on macOS >= 10.15
+  * Fix reload if only config repository is mounted
+  * Log when geosort ends up switching a proxy (CVM-1920)
+  * [server] fix stuck Apache processes with disabled geo API (CVM-1956)
+  * [ducc] add support for podman image store meta-data
+  * Add experimental `cvmfs_server diff --worktree` command (CVM-1869)
+  * New defaults overlayfs over aufs and CVMFS_IGNORE_XDIR_HARDLINKS (CVM-1909)
+  * [macOS] update to macFUSE 4 (CVM-1960)
+  * [ducc] preserve timestamp of extracted files (CVM-1950)
+  * [libcvmfs] implement cvmfs_remount(), add cvmfs_get_revision() (CVM-1958)
+  * Fix reflog repair when there is a zombie hash in the manifest (CVM-1919)
+  * [server] add `enter` command to open an ephemeral environment that gives
+    writable access to a repository (CVM-1924)
+  * [ducc] add support for pulling Docker images with authenticated user
+    using CVMFS_DOCKERHUB_[USER|PASS] environment variables
+  * [gc] show progress during sweep phase (CVM-1929)
+  * [server] add support for wait & retry on opening transactions (CVM-1937)
+  * [server] let return code of transaction indicate the error (CVM-1873)
+  * Fix ingestion of hardlinked catalog markers (CVM-1931)
+  * Add `cvmfs_talk chroot <hash>` command
+  * Add CVMFS_TALK_SOCKET and CVMFS_TALK_OWNER client parameters
+  * Add `cvmfs_server transaction -T /foo=/bar` template transactions (CVM-1801)
+  * Refuse non-regular .cvmfscatalog files during publish (CVM-1868)
+  * Replace `swissknife hash` by `publish hash` including MD5 support
+  * Add experimental support for WSL2
+  * [deb] demote apache2 dependency from required to recommended
+  * Add support for Azure blob storage as an S3 backend
+  * Add a Docker service container as a new package type
+  * [macOS] update libressl to version 3.1.2
+  * Update c-ares to version 1.16.1
+  * Update libcurl to version 7.71.1
+  * Update sqlite to version 3.32.2
+  * Fix ingest into root directory
+  * Spawn watchdog for `swissknife sync` command
+  * Add 'chunk_list' magic extended attribute (CVM-1875)
+  * Remove perl as a package dependency
+  * [libcvmfs] add cvmfs_options_parse_default()
+  * [libcvmfs] add cvmfs_listdir_stat()
+  * [libcvmfs] add catalog counters to struct cvmfs_nc_attr
+  * Parallelize catalog traversal in garbage collection
+  * [gw] publish files without writing temporaries to disk (CVM-1793)
+  * Improve performance of uploading small objects to S3
+  * Fix double counting in swissknife filestats command
+  * [ducc] Parallelize check if images are up to date
+  * Indicate error type by return value in `cvmfs_server transaction`
+  * [gw] add incoming publisher catalog to reflog to avoid dark garbage
+  * [ducc] Add support for converting from private registries
+  * Use multi-threaded upload facility on gateway (CVM-1739)
+  * Maintain publish statistics on gateway (CVM-1806)
+  * Add CVMFS_STATS_DB_DAYS_TO_KEEP parameter to prune publish statistics
+    database, defaults to 356 days (CVM-1841)
+  * [client] Add catalog_counters extended attribute (CVM-1824)
+  * [server] Add CVMFS_UPLOAD_STATS_PLOTS parameter to automatically generate
+    and upload publish statistics plots; requires ROOT (CVM-1836)
+  * [ducc] Improve robustness against intermittent registry failures (CVM-1829)
+  * [ducc] Add support for wildcards in tag names (CVM-1715)
+  * [ducc] Make temporary directory configurable (CVM-1826)
+  * [ducc] Require Singularity >= 3.5 (CVM-1840)
+  * [server] Add new parameter CVMFS_UPLOAD_STATS_DB=[true/false] in order to
+    push publish and GC statistics into the /stats location on the Stratum 0
+  * Add the cvmfs_publish transitional utility
+  * Add convert-singularity-image command to DUCC
+  * Enable readdir caching on fuse3 and kernel >= 4.20
+  * Add fuse forget_multi calback for fuse >= 2.9
+  * Add POSIX external cache plugin (CVM-1823)
+  * Manage DUCC daemon with systemd units
+
+2.7.6:
+  * Improve reporting of .cvmfsdirtab errors
+
+2.7.5:
+  * Fix crash when kernel meta-data caches close to 4G get evicted (CVM-1918)
+  * Add CVMFS_CLIENT_PROFILE, CVMFS_USE_CDN to cvmfs_config parameter list
+  * Let mount helper detect defined but empty CVMFS_HTTP_PROXY
+
+2.7.4:
+  * Fix name clash with certain concurrently hosted repository names (CVM-1899)
+  * [gw] fix statistics counting on renaming of nested subtrees (CVM-1906)
+  * Fix ingestion of tarballs with leading slashes (CVM-1907)
+  * Build cvmfs-fuse3 on Ubuntu 20.04 (CVM-1898)
+  * Remove insserv and initscripts as cvmfs-server dependencies (CVM-1897)
+
+2.7.3:
+  * Fix spurious SElinux error message on EL8 package upgrade (CVM-1878)
+  * Add `add-replica -P` option to create pass-through replicas (CVM-1845)
+  * Fix `cvmfs_config chksetup` for squashed NFS alien cache (CVM-1888)
+  * Fix building with GCC >= 10 (CVM-1894)
+  * Fix handling of .cvmfs_status.json after GC (CVM-1887)
+  * Add hidden `cvmfs_server eliminate-bulk-hashes` command (CVM-1428)
+
+2.7.2:
+  * Add `cvmfs_talk latency` command
+  * Improve logging when switching hosts (CVM-1844)
+  * Minor improvements to geo db command line interface (CVM-1850, CVM-1851)
+  * Reduce minimum and maximum days for geo db update
+  * Fix packaging for Fedora 31
+  * [gw] use watchdog in cvmfs_receiver (CVM-1864)
+  * [gw] build debug version of cvmfs_receiver (CVM-1863)
+  * [gw] fix lease acquisiton on non-existing paths (CVM-1696)
+  * Optimize loading of nested catalogs (CVM-1848)
+  * Fix creation of nested catalogs by ingestion command (CVM-1862)
+  * [gw] fix/relax JSON parsing of success status message
+
+2.7.1:
+  * Build cvmfs-fuse3 on Debian 10 "buster" (CVM-1825)
+  * Add support for CVMFS_GEO_DB_FILE replica parameter
+  * Change geodb update to use license key (CVM-1833)
+  * Fix host fail-over after redirection (CVM-1675)
+  * Add reboot info to Catalina installation screen
+
+2.7.0:
+  * Fix potential file descriptor mix-up of external cache manager after reload
+  * Fix spurious error with 'auto;DIRECT' when WPAD returns no proxy (CVM-1818)
+  * Add firmlink /cvmfs --> /Users/Shared/cvmfs on macOS >= 10.15
+  * Set default mount point to /Users/Shared/cvmfs on macOS >= 10.15 (CVM-1813)
+  * Use relative symbolic links in DUCC (CVM-1817)
+  * Terminate fuse daemon if watchdog disappears (CVM-1753)
+  * Fix clashing generic tags for short transactions with gateway (CVM-1735)
+  * Add "repo_counters" and "repo_metainfo" xattrs (CVM-1499, 1733)
+  * Add support for extended attributes on directories
+  * Add support for CVMFS_ENFORCE_ACLS client parameter
+  * Fix missing package dependency on Debian 9 and Ubuntu 18.04 (CVM-1789)
+  * Enable default config repository for debian stretch and newer (CVM-1794)
+  * Fix potential parsing of incomplete /etc/hosts
+  * Fix stale negative entries in active cache eviction (CVM-1759)
+  * Add support for EL8 platform (CVM-1731)
+  * Fix publish statistics for several corner cases (CVM-1716 .. CVM-1720)
+  * Add 'list_reflog' command to cvmfs_swissknife (CVM-1760)
+  * Add 'filestats' command to cvmfs_swissknife (CVM-1756)
+  * Add fuse callback performance instrumentation through new switch
+    CVMFS_INSTRUMENT_FUSE (CVM-1770)
+  * Add S3 standalone benchmark utility along with -DCVMFS_STRESS_TESTS build
+    option (CVM-1749)
+  * Explicitly specify python2 in webapi/cvmfs-api.py shebang
+  * Remove cvmfs_stratum_agent and the mongoose external library
+  * Add support for CVMFS_LIBRARY_PATH to simplify standalone deployment
+  * Enforce CVMFS_NFILES only if mounted via mount helper
+  * Add support for pre-mounted mount point with libfuse3
+  * Add support for libfuse3, including new mount option libfuse=[2|3]
+    (CVM-1710, CVM-1744)
+
+2.6.4:
+  * Fix client updates on shared writable alien cache (CVM-1803)
+  * Fix spurious error message when spawning external cache
+
 2.6.3:
   * Fix parsing of /etc/hosts (CVM-1796, CVM-1797)
 
@@ -36,7 +186,7 @@
     checks (CVM-1704)
   * Fix a bug preventing GC on the repository gateway (CVM-1705)
   * Fix a bug in the gateway key parser when key contained repeated chars
-  * Fix transaction lock name for tarball ingest with gateway backend 
+  * Fix transaction lock name for tarball ingest with gateway backend
   * Add GC support for legacy catalogs before 1.0 schema stabilized (CVM-1698)
   * Fix potential race condition in the stats collector for the S3 uploader
   * Better control of memory consumption in file processing pipeline (CVM-1687)
@@ -68,7 +218,7 @@
 
 2.5.3:
   * [S3] fix rare crash during file upload
-  * [macOS] fix hanging reload during `cvmfs_config reload` 
+  * [macOS] fix hanging reload during `cvmfs_config reload`
   * Reduce IOPS during publishing to local backend
   * [S3] Add support for CVMFS_S3_PEEK_BEFORE_PUT
   * Prevent dirtab entries from wandering outside the repository (CVM-1608)

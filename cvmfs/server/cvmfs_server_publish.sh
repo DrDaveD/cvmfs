@@ -98,7 +98,8 @@ cvmfs_server_publish() {
     if [ x"$upstream_type" = xgw ]; then
         health_check -g -r $name
     else
-        health_check -r $name
+        # TODO(jblomer): switch me back to `health_check -r $name`
+        health_check -g -r $name
     fi
 
     # get repository information
@@ -273,6 +274,9 @@ cvmfs_server_publish() {
     if [ "x$CVMFS_IGNORE_SPECIAL_FILES" = "xtrue" ]; then
       sync_command="$sync_command -g"
     fi
+    if [ "x$CVMFS_UPLOAD_STATS_DB" = "xtrue" ]; then
+      sync_command="$sync_command -I"
+    fi
     local sync_command_virtual_dir=
     if [ "x${CVMFS_VIRTUAL_DIR}" = "xtrue" ]; then
       sync_command_virtual_dir="$sync_command -S snapshots"
@@ -354,6 +358,7 @@ cvmfs_server_publish() {
     fi
 
     if [ x"$upstream_type" = xgw ]; then
+        # TODO(jpriessn): implement publication counters upload to gateway
         close_transaction  $name $use_fd_fallback
         publish_after_hook $name
         publish_succeeded $name
@@ -443,6 +448,9 @@ cvmfs_server_publish() {
     fi
 
     # remount the repository
+    if [ "x$CVMFS_UPLOAD_STATS_PLOTS" = "xtrue" ]; then
+      /usr/share/cvmfs-server/upload_stats_plots.sh $name
+    fi
     close_transaction  $name $use_fd_fallback
     publish_after_hook $name
     publish_succeeded  $name

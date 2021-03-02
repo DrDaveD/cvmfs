@@ -1,5 +1,7 @@
 #!/bin/sh
 
+export CVMFS_PLATFORM_NAME="centos7-x86_64"
+
 # source the common platform independent functionality and option parsing
 script_location=$(cd "$(dirname "$0")"; pwd)
 . ${script_location}/common_test.sh
@@ -20,6 +22,9 @@ echo "OK"
 run_unittests --gtest_shuffle \
               --gtest_death_test_use_fork || retval=1
 
+# Exclusions
+# 682-enter: missing fuse-overlayfs
+
 cd ${SOURCE_DIRECTORY}/test
 echo "running CernVM-FS client test cases..."
 CVMFS_TEST_CLASS_NAME=ClientIntegrationTests                                  \
@@ -27,6 +32,7 @@ CVMFS_TEST_CLASS_NAME=ClientIntegrationTests                                  \
                               -x src/005-asetup                               \
                                  src/004-davinci                              \
                                  src/007-testjobs                             \
+                                 src/084-premounted                           \
                                  --                                           \
                                  src/0*                                       \
                               || retval=1
@@ -37,10 +43,11 @@ CVMFS_TEST_CLASS_NAME=ServerIntegrationTests                                  \
 CVMFS_TEST_UNIONFS=overlayfs                                                  \
 ./run.sh $SERVER_TEST_LOGFILE -o ${SERVER_TEST_LOGFILE}${XUNIT_OUTPUT_SUFFIX} \
                               -x src/518-hardlinkstresstest                   \
-                                 src/585-xattrs                               \
                                  src/600-securecvmfs                          \
-                                 src/602-libcvmfs                             \
                                  src/628-pythonwrappedcvmfsserver             \
+                                 src/672-publish_stats_hardlinks              \
+                                 src/673-acl                                  \
+                                 src/682-enter                                \
                                  --                                           \
                                  src/5*                                       \
                                  src/6*                                       \
@@ -50,10 +57,25 @@ CVMFS_TEST_UNIONFS=overlayfs                                                  \
                               || retval=1
 
 
-echo "running CernVM-FS migration test cases..."
-CVMFS_TEST_CLASS_NAME=MigrationTests                                              \
-./run.sh $MIGRATIONTEST_LOGFILE -o ${MIGRATIONTEST_LOGFILE}${XUNIT_OUTPUT_SUFFIX} \
-                                   migration_tests/*                              \
+echo "running CernVM-FS client migration test cases..."
+CVMFS_TEST_CLASS_NAME=ClientMigrationTests                        \
+./run.sh $MIGRATIONTEST_CLIENT_LOGFILE                            \
+         -o ${MIGRATIONTEST_CLIENT_LOGFILE}${XUNIT_OUTPUT_SUFFIX} \
+            migration_tests/0*                                    \
+         || retval=1
+
+
+echo "running CernVM-FS server migration test cases..."
+CVMFS_TEST_CLASS_NAME=ServerMigrationTests                        \
+./run.sh $MIGRATIONTEST_SERVER_LOGFILE                            \
+         -o ${MIGRATIONTEST_SERVER_LOGFILE}${XUNIT_OUTPUT_SUFFIX} \
+            migration_tests/5*                                    \
+         || retval=1
+
+echo "running DUCC test cases..."
+CVMFS_TEST_CLASS_NAME=DUCCTests                                         \
+./run.sh $DUCCTEST_LOGFILE -o ${DUCCTEST_LOGFILE}${XUNIT_OUTPUT_SUFFIX} \
+                                   src/4*                               \
                                 || retval=1
 
 exit $retval

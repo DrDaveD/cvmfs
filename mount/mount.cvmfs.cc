@@ -71,20 +71,13 @@ static bool CheckFuse() {
   string fuse_device;
   int retval;
 #ifdef __APPLE__
-  if (FileExists("/Library/Filesystems/osxfuse.fs/Contents/Resources/"
-                 "load_osxfuse"))
-  {
-    // OS X Fuse 3
-    retval = system("/Library/Filesystems/osxfuse.fs/Contents/Resources/"
-                    "load_osxfuse");
-  } else {
-    retval = system("/Library/Filesystems/osxfusefs.fs/Support/load_osxfusefs");
-  }
+  retval = system("/Library/Filesystems/macfuse.fs/Contents/Resources/"
+                  "load_macfuse");
   if (retval != 0) {
-    LogCvmfs(kLogCvmfs, kLogStderr, "Failed loading OSX Fuse");
+    LogCvmfs(kLogCvmfs, kLogStderr, "Failed loading macFUSE");
     return false;
   }
-  fuse_device = "/dev/osxfuse0";
+  fuse_device = "/dev/macfuse0";
 #else
   fuse_device = "/dev/fuse";
 #endif
@@ -131,7 +124,7 @@ static bool CheckStrictMount(const string &fqrn) {
 static bool CheckProxy() {
   string param;
   int retval = options_manager_.GetValue("CVMFS_HTTP_PROXY", &param);
-  if (!retval) {
+  if (!retval || param.empty()) {
     LogCvmfs(kLogCvmfs, kLogStderr, "CVMFS_HTTP_PROXY required");
     return false;
   }
@@ -479,6 +472,7 @@ int main(int argc, char **argv) {
   }
 #endif
 
+  AddMountOption("system_mount", &mount_options);
   AddMountOption("fsname=cvmfs2", &mount_options);
   AddMountOption("allow_other", &mount_options);
   AddMountOption("grab_mountpoint", &mount_options);

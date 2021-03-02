@@ -162,6 +162,25 @@ std::string IsoTimestamp() {
 }
 
 
+/**
+ * UTC time in format YYYYMMDDHHMMSS.  Used in cvmfs whitelists.
+ */
+std::string WhitelistTimestamp(time_t when) {
+  struct tm timestamp;
+  gmtime_r(&when, &timestamp);
+
+  char buffer[15];
+  snprintf(buffer, sizeof(buffer), "%04d%02d%02d%02d%02d%02d",
+           timestamp.tm_year + 1900,
+           timestamp.tm_mon + 1,
+           timestamp.tm_mday,
+           timestamp.tm_hour,
+           timestamp.tm_min,
+           timestamp.tm_sec);
+  return string(buffer);
+}
+
+
 string StringifyTimeval(const timeval value) {
   char buffer[64];
   int64_t msec = value.tv_sec * 1000;
@@ -558,15 +577,18 @@ string Tail(const string &source, unsigned num_lines) {
 /**
   * Get UTC Time.
   *
-  * @return a timestamp in "YYYY-MM-DD HH:MM:SS" format
+  * @param format format if timestamp (YYYY-MM-DD HH:MM:SS by default)
+  * @return a timestamp string on success, empty string on failure
   */
-std::string GetGMTimestamp() {
+std::string GetGMTimestamp(std::string format) {
   struct tm time_ptr;
-  char date_and_time[50];
+  char date_and_time[100];
   time_t t = time(NULL);
   gmtime_r(&t, &time_ptr);      // take UTC
-  // timestamp format
-  strftime(date_and_time, 50, "%Y-%m-%d %H:%M:%S", &time_ptr);
+  // return empty string if formatting fails
+  if (!strftime(date_and_time, 100, format.c_str(), &time_ptr)) {
+    return "";
+  }
   std::string timestamp(date_and_time);
   return timestamp;
 }

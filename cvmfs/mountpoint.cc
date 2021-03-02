@@ -6,9 +6,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#ifndef CVMFS_LIBCVMFS
-#include <fuse/fuse_lowlevel.h>
-#endif
 #include <inttypes.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -18,6 +15,8 @@
 #include <climits>
 #include <cstring>
 #include <vector>
+
+#include "duplex_fuse.h"  // NOLINT
 
 #ifndef CVMFS_LIBCVMFS
 #ifdef FUSE_CAP_EXPORT_SUPPORT
@@ -216,6 +215,25 @@ void FileSystem::CreateStatistics() {
                                          "Number of currently opened files");
   no_open_dirs_ = statistics_->Register("cvmfs.no_open_dirs",
                   "Number of currently opened directories");
+
+  string optarg;
+  if (options_mgr_->GetValue("CVMFS_INSTRUMENT_FUSE", &optarg) &&
+      options_mgr_->IsOn(optarg))
+  {
+    HighPrecisionTimer::g_is_enabled = true;
+  }
+
+  hist_fs_lookup_ = new Log2Histogram(30);
+  hist_fs_forget_ = new Log2Histogram(30);
+  hist_fs_forget_multi_ = new Log2Histogram(30);
+  hist_fs_getattr_ = new Log2Histogram(30);
+  hist_fs_readlink_ = new Log2Histogram(30);
+  hist_fs_opendir_ = new Log2Histogram(30);
+  hist_fs_releasedir_ = new Log2Histogram(30);
+  hist_fs_readdir_ = new Log2Histogram(30);
+  hist_fs_open_ = new Log2Histogram(30);
+  hist_fs_read_ = new Log2Histogram(30);
+  hist_fs_release_ = new Log2Histogram(30);
 }
 
 
@@ -390,6 +408,17 @@ FileSystem::~FileSystem() {
   sqlite3_shutdown();
   SqliteMemoryManager::CleanupInstance();
 
+  delete hist_fs_lookup_;
+  delete hist_fs_forget_multi_;
+  delete hist_fs_forget_;
+  delete hist_fs_getattr_;
+  delete hist_fs_readlink_;
+  delete hist_fs_opendir_;
+  delete hist_fs_releasedir_;
+  delete hist_fs_readdir_;
+  delete hist_fs_open_;
+  delete hist_fs_read_;
+  delete hist_fs_release_;
   delete statistics_;
 
   SetLogSyslogPrefix("");
@@ -645,7 +674,7 @@ CacheManager *FileSystem::SetupRamCacheMgr(const string &instance) {
       return NULL;
     }
   }
-  sz_cache_bytes = RoundUp8(std::max(static_cast<uint64_t>(200 * 1024 * 1024),
+  sz_cache_bytes = RoundUp8(std::max(static_cast<uint64_t>(40 * 1024 * 1024),
                                      sz_cache_bytes));
   RamCacheManager *cache_mgr = new RamCacheManager(
         sz_cache_bytes,
@@ -1018,6 +1047,11 @@ void FileSystem::TearDown2ReadOnly() {
 }
 
 
+void FileSystem::RemapCatalogFd(int from, int to) {
+  sqlite::RegisterFdMapping(from, to);
+}
+
+
 bool FileSystem::TriageCacheMgr() {
   cache_mgr_instance_ = kDefaultCacheMgrInstance;
   string instance;
@@ -1131,7 +1165,8 @@ MountPoint *MountPoint::Create(
 
   mountpoint->ReEvaluateAuthz();
   mountpoint->CreateTables();
-  mountpoint->SetupBehavior();
+  if (!mountpoint->SetupBehavior())
+    return mountpoint.Release();
 
   mountpoint->boot_status_ = loader::kFailOk;
   return mountpoint.Release();
@@ -1371,6 +1406,13 @@ void MountPoint::CreateStatistics() {
                         "overall number of successful path lookups");
   statistics_->Register("inode_tracker.n_miss_path",
                         "overall number of unsuccessful path lookups");
+
+  statistics_->Register("nentry_tracker.n_insert",
+                        "overall number of added negative cache entries");
+  statistics_->Register("nentry_tracker.n_remove",
+                        "overall number of evicted negative cache entries");
+  statistics_->Register("nentry_tracker.n_prune",
+                        "overall number of prune calls");
 }
 
 
@@ -1402,6 +1444,7 @@ void MountPoint::CreateTables() {
                                          statistics_);
 
   inode_tracker_ = new glue::InodeTracker();
+  nentry_tracker_ = new glue::NentryTracker();
 }
 
 /**
@@ -1600,12 +1643,16 @@ MountPoint::MountPoint(
   , md5path_cache_(NULL)
   , tracer_(NULL)
   , inode_tracker_(NULL)
+  , nentry_tracker_(NULL)
   , resolv_conf_watcher_(NULL)
   , max_ttl_sec_(kDefaultMaxTtlSec)
   , kcache_timeout_sec_(static_cast<double>(kDefaultKCacheTtlSec))
   , fixed_catalog_(false)
-  , hide_magic_xattrs_(false)
+  , enforce_acls_(false)
   , has_membership_req_(false)
+  , talk_socket_path_(std::string("./cvmfs_io.") + fqrn)
+  , talk_socket_uid_(0)
+  , talk_socket_gid_(0)
 {
   int retval = pthread_mutex_init(&lock_max_ttl_, NULL);
   assert(retval == 0);
@@ -1615,6 +1662,7 @@ MountPoint::MountPoint(
 MountPoint::~MountPoint() {
   pthread_mutex_destroy(&lock_max_ttl_);
 
+  delete nentry_tracker_;
   delete inode_tracker_;
   delete tracer_;
   delete md5path_cache_;
@@ -1670,7 +1718,7 @@ void MountPoint::SetMaxTtlMn(unsigned value_minutes) {
 }
 
 
-void MountPoint::SetupBehavior() {
+bool MountPoint::SetupBehavior() {
   string optarg;
 
   if (options_mgr_->GetValue("CVMFS_MAX_TTL", &optarg))
@@ -1684,11 +1732,34 @@ void MountPoint::SetupBehavior() {
   LogCvmfs(kLogCvmfs, kLogDebug, "kernel caches expire after %d seconds",
            static_cast<int>(kcache_timeout_sec_));
 
+  bool hide_magic_xattrs = false;
   if (options_mgr_->GetValue("CVMFS_HIDE_MAGIC_XATTRS", &optarg)
       && options_mgr_->IsOn(optarg))
   {
-    hide_magic_xattrs_ = true;
+    hide_magic_xattrs = true;
   }
+  magic_xattr_mgr_ = new MagicXattrManager(this, hide_magic_xattrs);
+
+
+  if (options_mgr_->GetValue("CVMFS_ENFORCE_ACLS", &optarg)
+      && options_mgr_->IsOn(optarg))
+  {
+    enforce_acls_ = true;
+  }
+
+  if (options_mgr_->GetValue("CVMFS_TALK_SOCKET", &optarg)) {
+    talk_socket_path_ = optarg;
+  }
+  if (options_mgr_->GetValue("CVMFS_TALK_OWNER", &optarg)) {
+    bool retval = GetUidOf(optarg, &talk_socket_uid_, &talk_socket_gid_);
+    if (!retval) {
+      boot_error_ = "unknown owner of cvmfs_talk socket: " + optarg;
+      boot_status_ = loader::kFailOptions;
+      return false;
+    }
+  }
+
+  return true;
 }
 
 

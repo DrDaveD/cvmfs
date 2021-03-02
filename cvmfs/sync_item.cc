@@ -16,6 +16,7 @@
 #include "ingestion/ingestion_source.h"
 #include "sync_mediator.h"
 #include "sync_union.h"
+#include "util/exception.h"
 
 using namespace std;  // NOLINT
 
@@ -67,10 +68,9 @@ SyncItemType SyncItem::GetGenericFiletype(const SyncItem::EntryStat &stat) const
 {
   const SyncItemType type = stat.GetSyncItemType();
   if (type == kItemUnknown) {
-    PrintWarning("'" + GetRelativePath() + "' has an unsupported file type "
-                 "(st_mode: " + StringifyInt(stat.stat.st_mode) +
-                 " errno: " + StringifyInt(stat.error_code) + ")");
-    abort();
+    PANIC(kLogStderr,
+          "[WARNING] '%s' has an unsupported file type (st_mode: %d errno: %d)",
+          GetRelativePath().c_str(), stat.stat.st_mode, stat.error_code);
   }
   return type;
 }
@@ -94,9 +94,8 @@ SyncItemType SyncItem::GetRdOnlyFiletype() const {
 SyncItemType SyncItemNative::GetScratchFiletype() const {
   StatScratch();
   if (scratch_stat_.error_code != 0) {
-    PrintWarning("Failed to stat() '" + GetRelativePath() + "' in scratch. "
-                 "(errno: " + StringifyInt(scratch_stat_.error_code) + ")");
-    abort();
+    PANIC(kLogStderr, "[WARNING] Failed to stat() '%s' in scratch. (errno: %s)",
+          GetRelativePath().c_str(), scratch_stat_.error_code);
   }
 
   return GetGenericFiletype(scratch_stat_);
@@ -139,8 +138,8 @@ void SyncItem::MarkAsWhiteout(const std::string &actual_filename) {
     // should not happen (actually AUFS prevents users from creating whiteouts)
     // but can be provoked through an AUFS 'bug' (see test 593 or CVM-880).
     // --> Warn the user, continue with kItemUnknown and cross your fingers!
-    PrintWarning("'" + GetRelativePath() + "' should be deleted, but was not "
-                 "found in repository.");
+    PrintWarning("'" + GetRelativePath() +
+                 "' should be deleted, but was not found in repository.");
   }
 }
 
@@ -264,7 +263,18 @@ void SyncItem::CheckMarkerFiles() {
 }
 
 void SyncItem::CheckCatalogMarker() {
-  has_catalog_marker_ = FileExists(GetUnionPath() + "/.cvmfscatalog");
+  std::string path(GetUnionPath() + "/.cvmfscatalog");
+  EntryStat stat;
+  StatGeneric(path, &stat, false);
+  if (stat.error_code) {
+    has_catalog_marker_ = false;
+    return;
+  }
+  if (stat.GetSyncItemType() == kItemFile) {
+    has_catalog_marker_ = true;
+    return;
+  }
+  PANIC(kLogStderr, "Error: '%s' is not a regular file.", path.c_str());
 }
 
 

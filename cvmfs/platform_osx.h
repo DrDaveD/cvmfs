@@ -75,6 +75,12 @@ inline bool platform_umount(const char *mountpoint, const bool lazy) {
   return retval == 0;
 }
 
+
+inline int platform_umount_lazy(const char *mountpoint) {
+  int retval = unmount(mountpoint, MNT_FORCE);
+  return retval == 0;
+}
+
 /**
  * Spinlocks on OS X are not in pthread but in OS X specific APIs.
  */
@@ -254,6 +260,23 @@ inline uint64_t platform_monotonic_time() {
   mach_timebase_info(&info);
   uint64_t val_ns = val_abs * (info.numer / info.denom);
   return val_ns * 1e-9;
+}
+
+inline uint64_t platform_monotonic_time_ns() {
+  uint64_t val_abs = mach_absolute_time();
+  // Doing the conversion every time is slow but thread-safe
+  mach_timebase_info_data_t info;
+  mach_timebase_info(&info);
+  uint64_t val_ns = val_abs * (info.numer / info.denom);
+  return val_ns;
+}
+
+inline uint64_t platform_realtime_ns() {
+  struct timeval tv;
+  int ret = gettimeofday(&tv, NULL);
+  assert(ret == 0);
+  uint64_t time = tv.tv_sec * 1e6 + tv.tv_usec * 1e3;
+  return time;
 }
 
 /**

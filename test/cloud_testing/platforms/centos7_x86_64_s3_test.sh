@@ -1,5 +1,7 @@
 #!/bin/sh
 
+export CVMFS_PLATFORM_NAME="centos7-x86_64_S3"
+
 # source the common platform independent functionality and option parsing
 script_location=$(cd "$(dirname "$0")"; pwd)
 . ${script_location}/common_test.sh
@@ -28,10 +30,14 @@ test_s3_pid=$(start_test_s3 $TEST_S3_LOGFILE) || { s3_retval=1; retval=1; echo "
 echo "done ($test_s3_pid)"
 create_test_s3_bucket
 
+# Exclusions
+# 682-enter: missing fuse-overlayfs
+
 if [ $s3_retval -eq 0 ]; then
   echo "running CernVM-FS server test cases against the test S3 provider..."
   CVMFS_TEST_S3_CONFIG=$TEST_S3_CONFIG                                      \
   CVMFS_TEST_HTTP_BASE=$TEST_S3_URL                                         \
+  CVMFS_TEST_S3_STORAGE=$TEST_S3_STORAGE/data/$TEST_S3_BUCKET               \
   CVMFS_TEST_CLASS_NAME=S3ServerIntegrationTests                            \
   ./run.sh $S3_TEST_LOGFILE -o ${S3_TEST_LOGFILE}${XUNIT_OUTPUT_SUFFIX}     \
                             -x src/518-hardlinkstresstest                   \
@@ -67,6 +73,10 @@ if [ $s3_retval -eq 0 ]; then
                                src/614-geoservice                           \
                                src/622-gracefulrmfs                         \
                                src/647-bearercvmfs                          \
+                               src/670-listreflog                           \
+                               src/672-publish_stats_hardlinks              \
+                               src/673-acl                                  \
+                               src/682-enter                                \
                                --                                           \
                                src/5*                                       \
                                src/6*                                       \

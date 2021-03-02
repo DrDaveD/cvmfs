@@ -308,6 +308,22 @@ void *TalkManager::MainResponder(void *data) {
         default:
           talk_mgr->Answer(con_fd, "internal error\n");
       }
+    } else if (line.substr(0, 6) == "chroot") {
+      if (line.length() < 8) {
+        talk_mgr->Answer(con_fd, "Usage: chroot <hash>\n");
+      } else {
+        std::string root_hash = Trim(line.substr(7), true /* trim_newline */);
+        FuseRemounter::Status status = remounter->ChangeRoot(
+          MkFromHexPtr(shash::HexPtr(root_hash), shash::kSuffixCatalog));
+        switch (status) {
+          case FuseRemounter::kStatusUp2Date:
+            talk_mgr->Answer(con_fd, "OK\n");
+            break;
+          default:
+            talk_mgr->Answer(con_fd, "Failed\n");
+            break;
+        }
+      }
     } else if (line == "detach nested catalogs") {
       mount_point->catalog_mgr()->DetachNested();
       talk_mgr->Answer(con_fd, "OK\n");
@@ -481,6 +497,8 @@ void *TalkManager::MainResponder(void *data) {
       // Manually setting the inode tracker numbers
       glue::InodeTracker::Statistics inode_stats =
         mount_point->inode_tracker()->GetStatistics();
+      glue::NentryTracker::Statistics nentry_stats =
+        mount_point->nentry_tracker()->GetStatistics();
       mount_point->statistics()->Lookup("inode_tracker.n_insert")->Set(
         atomic_read64(&inode_stats.num_inserts));
       mount_point->statistics()->Lookup("inode_tracker.n_remove")->Set(
@@ -493,6 +511,12 @@ void *TalkManager::MainResponder(void *data) {
         atomic_read64(&inode_stats.num_hits_path));
       mount_point->statistics()->Lookup("inode_tracker.n_miss_path")->Set(
         atomic_read64(&inode_stats.num_misses_path));
+      mount_point->statistics()->Lookup("nentry_tracker.n_insert")->Set(
+        nentry_stats.num_insert);
+      mount_point->statistics()->Lookup("nentry_tracker.n_remove")->Set(
+        nentry_stats.num_remove);
+      mount_point->statistics()->Lookup("nentry_tracker.n_prune")->Set(
+        nentry_stats.num_prune);
 
       if (file_system->cache_mgr()->id() == kPosixCacheManager) {
         PosixCacheManager *cache_mgr =
@@ -559,6 +583,21 @@ void *TalkManager::MainResponder(void *data) {
 
       result += "\nPer-Connection Memory Statistics:\n" +
                 mount_point->catalog_mgr()->PrintAllMemStatistics();
+
+      result += "\nLatency distribution of system calls:\n";
+
+      result += "Lookup\n" + file_system->hist_fs_lookup()->ToString();
+      result += "Forget\n" + file_system->hist_fs_forget()->ToString();
+      result += "Multi-Forget\n"
+                + file_system->hist_fs_forget_multi()->ToString();
+      result += "Getattr\n" + file_system->hist_fs_getattr()->ToString();
+      result += "Readlink\n" + file_system->hist_fs_readlink()->ToString();
+      result += "Opendir\n" + file_system->hist_fs_opendir()->ToString();
+      result += "Releasedir\n" + file_system->hist_fs_releasedir()->ToString();
+      result += "Readdir\n" + file_system->hist_fs_readdir()->ToString();
+      result += "Open\n" + file_system->hist_fs_open()->ToString();
+      result += "Read\n" + file_system->hist_fs_read()->ToString();
+      result += "Release\n" + file_system->hist_fs_release()->ToString();
 
       result += "\nRaw Counters:\n" +
         mount_point->statistics()->PrintList(perf::Statistics::kPrintHeader);
@@ -632,14 +671,100 @@ void *TalkManager::MainResponder(void *data) {
         file_system->TearDown2ReadOnly();
         talk_mgr->Answer(con_fd, "In read-only mode\n");
       }
+    } else if (line == "latency") {
+      string result = talk_mgr->FormatLatencies(*mount_point, file_system);
+      talk_mgr->Answer(con_fd, result);
     } else {
       talk_mgr->Answer(con_fd, "unknown command\n");
     }
   }
 
   return NULL;
-}
+}  // NOLINT(readability/fn_size)
 
+string TalkManager::FormatLatencies(const MountPoint &mount_point,
+                                    FileSystem *file_system) {
+  string result;
+  const unsigned int bufSize = 300;
+  char buffer[bufSize];
+
+  vector<float> qs;
+  qs.push_back(.1);
+  qs.push_back(.2);
+  qs.push_back(.25);
+  qs.push_back(.3);
+  qs.push_back(.4);
+  qs.push_back(.5);
+  qs.push_back(.6);
+  qs.push_back(.7);
+  qs.push_back(.75);
+  qs.push_back(.8);
+  qs.push_back(.9);
+  qs.push_back(.95);
+  qs.push_back(.99);
+  qs.push_back(.999);
+  qs.push_back(.9999);
+
+  string repo(mount_point.fqrn());
+
+  unsigned int format_index =
+      snprintf(buffer, bufSize, "\"%s\",\"%s\",\"%s\",\"%s\"", "repository",
+               "action", "total_count", "time_unit");
+  for (unsigned int i = 0; i < qs.size(); i++) {
+    format_index += snprintf(buffer + format_index, bufSize - format_index,
+                             ",%0.5f", qs[i]);
+  }
+  format_index += snprintf(buffer + format_index, bufSize - format_index, "\n");
+  assert(format_index < bufSize);
+
+  result += buffer;
+  memset(buffer, 0, sizeof(buffer));
+  format_index = 0;
+
+  vector<Log2Histogram *> hist;
+  vector<string> names;
+  hist.push_back(file_system->hist_fs_lookup());
+  names.push_back("lookup");
+  hist.push_back(file_system->hist_fs_forget());
+  names.push_back("forget");
+  hist.push_back(file_system->hist_fs_forget_multi());
+  names.push_back("forget_multi");
+  hist.push_back(file_system->hist_fs_getattr());
+  names.push_back("getattr");
+  hist.push_back(file_system->hist_fs_readlink());
+  names.push_back("readlink");
+  hist.push_back(file_system->hist_fs_opendir());
+  names.push_back("opendir");
+  hist.push_back(file_system->hist_fs_releasedir());
+  names.push_back("releasedir");
+  hist.push_back(file_system->hist_fs_readdir());
+  names.push_back("readdir");
+  hist.push_back(file_system->hist_fs_open());
+  names.push_back("open");
+  hist.push_back(file_system->hist_fs_read());
+  names.push_back("read");
+  hist.push_back(file_system->hist_fs_release());
+  names.push_back("release");
+
+  for (unsigned int j = 0; j < hist.size(); j++) {
+    Log2Histogram *h = hist[j];
+    unsigned int format_index =
+        snprintf(buffer, bufSize, "\"%s\",\"%s\",%ld,\"%s\"", repo.c_str(),
+                 names[j].c_str(), h->N(), "nanoseconds");
+    for (unsigned int i = 0; i < qs.size(); i++) {
+      format_index += snprintf(buffer + format_index, bufSize - format_index,
+                               ",%d", h->GetQuantile(qs[i]));
+    }
+    format_index +=
+        snprintf(buffer + format_index, bufSize - format_index, "\n");
+    assert(format_index < bufSize);
+
+    result += buffer;
+    memset(buffer, 0, sizeof(buffer));
+    format_index = 0;
+  }
+  return result;
+}
 
 TalkManager::TalkManager(
   const string &socket_path,
@@ -658,7 +783,7 @@ TalkManager::TalkManager(
 TalkManager::~TalkManager() {
   if (!socket_path_.empty()) {
     int retval = unlink(socket_path_.c_str());
-    if (retval != 0) {
+    if ((retval != 0) && (errno != ENOENT)) {
       LogCvmfs(kLogTalk, kLogSyslogWarn,
                "Could not remove cvmfs_io socket from cache directory (%d)",
                errno);

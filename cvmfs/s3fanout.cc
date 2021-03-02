@@ -7,6 +7,7 @@
 #include <pthread.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cerrno>
 #include <utility>
 
@@ -14,6 +15,7 @@
 #include "platform.h"
 #include "s3fanout.h"
 #include "upload_facility.h"
+#include "util/exception.h"
 #include "util/posix.h"
 #include "util/string.h"
 #include "util_concurrency.h"
@@ -134,27 +136,12 @@ static size_t CallbackCurlData(void *ptr, size_t size, size_t nmemb,
   if (num_bytes == 0)
     return 0;
 
-  if (info->origin == kOriginMem) {
-    const size_t avail_bytes = info->origin_mem.size - info->origin_mem.pos;
-    const size_t send_size = avail_bytes < num_bytes ? avail_bytes : num_bytes;
-    memcpy(ptr, info->origin_mem.data + info->origin_mem.pos, send_size);
-    info->origin_mem.pos += send_size;
-    LogCvmfs(kLogS3Fanout, kLogDebug, "mem pushed out %d bytes", send_size);
-    return send_size;
-  } else if (info->origin == kOriginPath) {
-    size_t read_bytes = fread(ptr, 1, num_bytes, info->origin_file);
-    if (read_bytes != num_bytes) {
-      if (ferror(info->origin_file) != 0) {
-        LogCvmfs(kLogS3Fanout, kLogStderr, "local I/O error reading %s",
-                 info->origin_path.c_str());
-        return CURL_READFUNC_ABORT;
-      }
-    }
-    LogCvmfs(kLogS3Fanout, kLogDebug, "file pushed out %d bytes", read_bytes);
-    return read_bytes;
-  }
+  uint64_t read_bytes = info->origin->Read(ptr, num_bytes);
 
-  return CURL_READFUNC_ABORT;
+  LogCvmfs(kLogS3Fanout, kLogDebug,
+           "source buffer pushed out %d bytes", read_bytes);
+
+  return read_bytes;
 }
 
 
@@ -184,8 +171,9 @@ int S3FanoutManager::CallbackCurlSocket(CURL *easy, curl_socket_t s, int action,
     return 0;
 
   // Find s in watch_fds_
+  // First 2 fds are job and terminate pipes (not curl related)
   unsigned index;
-  for (index = 0; index < s3fanout_mgr->watch_fds_inuse_; ++index) {
+  for (index = 2; index < s3fanout_mgr->watch_fds_inuse_; ++index) {
     if (s3fanout_mgr->watch_fds_[index].fd == s)
       break;
   }
@@ -230,7 +218,7 @@ int S3FanoutManager::CallbackCurlSocket(CURL *easy, curl_socket_t s, int action,
       }
       break;
     default:
-      abort();
+      PANIC(NULL);
   }
 
   return 0;
@@ -244,36 +232,53 @@ void *S3FanoutManager::MainUpload(void *data) {
   LogCvmfs(kLogS3Fanout, kLogDebug, "Upload I/O thread started");
   S3FanoutManager *s3fanout_mgr = static_cast<S3FanoutManager *>(data);
 
+  s3fanout_mgr->InitPipeWatchFds();
+
   // Don't schedule more jobs into the multi handle than the maximum number of
   // parallel connections.  This should prevent starvation and thus a timeout
   // of the authorization header (CVM-1339).
   unsigned jobs_in_flight = 0;
 
-  while (s3fanout_mgr->thread_upload_run_) {
-    JobInfo *info = NULL;
-    pthread_mutex_lock(s3fanout_mgr->jobs_todo_lock_);
-    if (!s3fanout_mgr->jobs_todo_.empty() &&
-        (jobs_in_flight < s3fanout_mgr->pool_max_handles_))
-    {
-      info = s3fanout_mgr->jobs_todo_.back();
-      s3fanout_mgr->jobs_todo_.pop_back();
+  while (true) {
+    // Check events with 100ms timeout
+    int timeout_ms = 100;
+    int retval = poll(s3fanout_mgr->watch_fds_, s3fanout_mgr->watch_fds_inuse_,
+                      timeout_ms);
+    if (retval == 0) {
+      // Handle timeout
+      int still_running = 0;
+      retval = curl_multi_socket_action(s3fanout_mgr->curl_multi_,
+                                        CURL_SOCKET_TIMEOUT,
+                                        0,
+                                        &still_running);
+      if (retval != CURLM_OK) {
+        LogCvmfs(kLogS3Fanout, kLogStderr, "Error, timeout due to: %d", retval);
+        assert(retval == CURLM_OK);
+      }
+    } else if (retval < 0) {
+      assert(errno == EINTR);
+      continue;
     }
-    pthread_mutex_unlock(s3fanout_mgr->jobs_todo_lock_);
 
-    if (info != NULL) {
+    // Terminate I/O thread
+    if (s3fanout_mgr->watch_fds_[0].revents)
+      break;
+
+    // New job incoming
+    if (s3fanout_mgr->watch_fds_[1].revents) {
+      s3fanout_mgr->watch_fds_[1].revents = 0;
+      JobInfo *info;
+      ReadPipe(s3fanout_mgr->pipe_jobs_[0], &info, sizeof(info));
       CURL *handle = s3fanout_mgr->AcquireCurlHandle();
       if (handle == NULL) {
-        LogCvmfs(kLogS3Fanout, kLogStderr, "Failed to acquire CURL handle.");
-        assert(handle != NULL);
+        PANIC(kLogStderr, "Failed to acquire CURL handle.");
       }
-
       s3fanout::Failures init_failure =
         s3fanout_mgr->InitializeRequest(info, handle);
       if (init_failure != s3fanout::kFailOk) {
-        LogCvmfs(kLogS3Fanout, kLogStderr,
-                "Failed to initialize CURL handle (error: %d - %s | errno: %d)",
-                 init_failure, Code2Ascii(init_failure), errno);
-        abort();
+        PANIC(kLogStderr,
+              "Failed to initialize CURL handle (error: %d - %s | errno: %d)",
+              init_failure, Code2Ascii(init_failure), errno);
       }
       s3fanout_mgr->SetUrlOptions(info);
 
@@ -291,32 +296,14 @@ void *S3FanoutManager::MainUpload(void *data) {
                retval, still_running);
     }
 
-    // Check events with 1ms timeout
-    int timeout = 1;
-    int retval = poll(s3fanout_mgr->watch_fds_, s3fanout_mgr->watch_fds_inuse_,
-                      timeout);
-    if (retval == 0) {
-      // Handle timeout
-      int still_running = 0;
-      retval = curl_multi_socket_action(s3fanout_mgr->curl_multi_,
-                                        CURL_SOCKET_TIMEOUT,
-                                        0,
-                                        &still_running);
-      if (retval != CURLM_OK) {
-        LogCvmfs(kLogS3Fanout, kLogStderr, "Error, timeout due to: %d", retval);
-        assert(retval == CURLM_OK);
-      }
-    } else if (retval < 0) {
-      assert(errno == EINTR);
-      continue;
-    }
 
     // Activity on curl sockets
     // Within this loop the curl_multi_socket_action() may cause socket(s)
     // to be removed from watch_fds_. If a socket is removed it is replaced
     // by the socket at the end of the array and the inuse count is decreased.
     // Therefore loop over the array in reverse order.
-    for (int32_t i = s3fanout_mgr->watch_fds_inuse_ - 1; i >= 0; --i) {
+    // First 2 fds are job and terminate pipes (not curl related)
+    for (int32_t i = s3fanout_mgr->watch_fds_inuse_ - 1; i >= 2; --i) {
       if (static_cast<uint32_t>(i) >= s3fanout_mgr->watch_fds_inuse_) {
         continue;
       }
@@ -368,9 +355,8 @@ void *S3FanoutManager::MainUpload(void *data) {
         s3fanout_mgr->ReleaseCurlHandle(info, easy_handle);
         s3fanout_mgr->available_jobs_->Decrement();
 
-        pthread_mutex_lock(s3fanout_mgr->jobs_completed_lock_);
+        MutexLockGuard m(s3fanout_mgr->jobs_completed_lock_);
         s3fanout_mgr->jobs_completed_.push_back(info);
-        pthread_mutex_unlock(s3fanout_mgr->jobs_completed_lock_);
       }
     }
   }
@@ -438,7 +424,7 @@ void S3FanoutManager::ReleaseCurlHandle(JobInfo *info, CURL *handle) const {
   set<CURL *>::iterator elem = pool_handles_inuse_->find(handle);
   assert(elem != pool_handles_inuse_->end());
 
-  if (pool_handles_idle_->size() > pool_max_handles_) {
+  if (pool_handles_idle_->size() > config_.pool_max_handles) {
     CURLcode retval = curl_easy_setopt(handle, CURLOPT_SHARE, NULL);
     assert(retval == CURLE_OK);
     curl_easy_cleanup(handle);
@@ -452,6 +438,18 @@ void S3FanoutManager::ReleaseCurlHandle(JobInfo *info, CURL *handle) const {
   pool_handles_inuse_->erase(elem);
 }
 
+void S3FanoutManager::InitPipeWatchFds() {
+  assert(watch_fds_inuse_ == 0);
+  assert(watch_fds_size_ >= 2);
+  watch_fds_[0].fd = pipe_terminate_[0];
+  watch_fds_[0].events = POLLIN | POLLPRI;
+  watch_fds_[0].revents = 0;
+  ++watch_fds_inuse_;
+  watch_fds_[1].fd = pipe_jobs_[0];
+  watch_fds_[1].events = POLLIN | POLLPRI;
+  watch_fds_[1].revents = 0;
+  ++watch_fds_inuse_;
+}
 
 /**
  * The Amazon AWS 2 authorization header according to
@@ -473,21 +471,21 @@ bool S3FanoutManager::MkV2Authz(const JobInfo &info, vector<string> *headers)
                    content_type + "\n" +
                    timestamp + "\n" +
                    "x-amz-acl:public-read" + "\n" +  // default ACL
-                   "/" + info.bucket + "/" + info.object_key;
+                   "/" + config_.bucket + "/" + info.object_key;
   LogCvmfs(kLogS3Fanout, kLogDebug, "%s string to sign for: %s",
            request.c_str(), info.object_key.c_str());
 
   shash::Any hmac;
   hmac.algorithm = shash::kSha1;
-  shash::Hmac(info.secret_key,
+  shash::Hmac(config_.secret_key,
               reinterpret_cast<const unsigned char *>(to_sign.data()),
               to_sign.length(), &hmac);
 
-  headers->push_back("Authorization: AWS " + info.access_key + ":" +
+  headers->push_back("Authorization: AWS " + config_.access_key + ":" +
                      Base64(string(reinterpret_cast<char *>(hmac.digest),
                                    hmac.GetDigestSize())));
   headers->push_back("Date: " + timestamp);
-  headers->push_back("x-amz-acl: public-read");
+  headers->push_back("X-Amz-Acl: public-read");
   if (!payload_hash.empty())
     headers->push_back("Content-MD5: " + payload_hash);
   if (!content_type.empty())
@@ -526,21 +524,18 @@ string S3FanoutManager::GetUriEncode(const string &val, bool encode_slash)
 }
 
 
-string S3FanoutManager::GetAwsV4SigningKey(
-  const JobInfo &info,
-  const string &date) const
+string S3FanoutManager::GetAwsV4SigningKey(const string &date) const
 {
-  string id = info.secret_key + info.region + date;
-  map<string, string>::const_iterator iter = signing_keys_.find(id);
-  if (iter != signing_keys_.end())
-    return iter->second;
+  if (last_signing_key_.first == date)
+    return last_signing_key_.second;
 
-  string date_key = shash::Hmac256("AWS4" + info.secret_key, date, true);
-  string date_region_key = shash::Hmac256(date_key, info.region, true);
+  string date_key = shash::Hmac256("AWS4" + config_.secret_key, date, true);
+  string date_region_key = shash::Hmac256(date_key, config_.region, true);
   string date_region_service_key = shash::Hmac256(date_region_key, "s3", true);
   string signing_key =
     shash::Hmac256(date_region_service_key, "aws4_request", true);
-  signing_keys_[id] = signing_key;
+  last_signing_key_.first = date;
+  last_signing_key_.second = signing_key;
   return signing_key;
 }
 
@@ -559,13 +554,11 @@ bool S3FanoutManager::MkV4Authz(const JobInfo &info, vector<string> *headers)
   string content_type = GetContentType(info);
   string timestamp = IsoTimestamp();
   string date = timestamp.substr(0, 8);
-  vector<string> tokens = SplitString(info.hostname, ':');
+  vector<string> tokens = SplitString(complete_hostname_, ':');
   assert(tokens.size() <= 2);
   string canonical_hostname = tokens[0];
   if (tokens.size() == 2 && String2Uint64(tokens[1]) != kDefaultHTTPPort)
     canonical_hostname += ":" + tokens[1];
-
-  if (dns_buckets_) canonical_hostname = info.bucket + "." + canonical_hostname;
 
   string signed_headers;
   string canonical_headers;
@@ -581,10 +574,10 @@ bool S3FanoutManager::MkV4Authz(const JobInfo &info, vector<string> *headers)
     "x-amz-content-sha256:" + payload_hash + "\n" +
     "x-amz-date:" + timestamp + "\n";
 
-  string scope = date + "/" + info.region + "/s3/aws4_request";
-  string uri = dns_buckets_ ?
+  string scope = date + "/" + config_.region + "/s3/aws4_request";
+  string uri = config_.dns_buckets ?
                  (string("/") + info.object_key) :
-                 (string("/") + info.bucket + "/" + info.object_key);
+                 (string("/") + config_.bucket + "/" + info.object_key);
 
   string canonical_request =
     GetRequestString(info) + "\n" +
@@ -602,20 +595,68 @@ bool S3FanoutManager::MkV4Authz(const JobInfo &info, vector<string> *headers)
     scope + "\n" +
     hash_request;
 
-  string signing_key = GetAwsV4SigningKey(info, date);
+  string signing_key = GetAwsV4SigningKey(date);
   string signature = shash::Hmac256(signing_key, string_to_sign);
 
-  headers->push_back("x-amz-acl: public-read");
-  headers->push_back("x-amz-content-sha256: " + payload_hash);
-  headers->push_back("x-amz-date: " + timestamp);
+  headers->push_back("X-Amz-Acl: public-read");
+  headers->push_back("X-Amz-Content-Sha256: " + payload_hash);
+  headers->push_back("X-Amz-Date: " + timestamp);
   headers->push_back(
     "Authorization: AWS4-HMAC-SHA256 "
-    "Credential=" + info.access_key + "/" + scope + ","
+    "Credential=" + config_.access_key + "/" + scope + ","
     "SignedHeaders=" + signed_headers + ","
     "Signature=" + signature);
   return true;
 }
 
+/**
+ * The Azure Blob authorization header according to
+ * https://docs.microsoft.com/en-us/rest/api/storageservices/authorize-with-shared-key 
+ */
+bool S3FanoutManager::MkAzureAuthz(const JobInfo &info, vector<string> *headers)
+  const
+{
+  string timestamp = RfcTimestamp();
+  string canonical_headers =
+    "x-ms-blob-type:BlockBlob\nx-ms-date:" +
+    timestamp +
+    "\nx-ms-version:2011-08-18";
+  string canonical_resource =
+    "/" + config_.access_key + "/" + config_.bucket + "/" + info.object_key;
+
+  string string_to_sign;
+  if ((info.request == JobInfo::kReqHeadOnly) ||
+     (info.request == JobInfo::kReqHeadPut) ||
+     (info.request == JobInfo::kReqDelete)) {
+    string_to_sign =
+      GetRequestString(info) +
+      string("\n\n\n") +
+      "\n\n\n\n\n\n\n\n\n" +
+      canonical_headers + "\n" +
+      canonical_resource;
+  } else {
+    string_to_sign =
+      GetRequestString(info) +
+      string("\n\n\n") +
+      string(StringifyInt(info.origin->GetSize())) + "\n\n\n\n\n\n\n\n\n" +
+      canonical_headers + "\n" +
+      canonical_resource;
+  }
+
+  string signing_key;
+  int retval = Debase64(config_.secret_key, &signing_key);
+  if (!retval)
+    return false;
+
+  string signature = shash::Hmac256(signing_key, string_to_sign, true);
+
+  headers->push_back("x-ms-date: " + timestamp);
+  headers->push_back("x-ms-version: 2011-08-18");
+  headers->push_back(
+    "Authorization: SharedKey " + config_.access_key + ":" + Base64(signature));
+  headers->push_back("x-ms-blob-type: BlockBlob");
+  return true;
+}
 
 void S3FanoutManager::InitializeDnsSettingsCurl(
   CURL *handle,
@@ -716,7 +757,7 @@ bool S3FanoutManager::MkPayloadHash(const JobInfo &info, string *hex_hash)
       (info.request == JobInfo::kReqHeadPut) ||
       (info.request == JobInfo::kReqDelete))
   {
-    switch (info.authz_method) {
+    switch (config_.authz_method) {
       case kAuthzAwsV2:
         hex_hash->clear();
         break;
@@ -725,85 +766,44 @@ bool S3FanoutManager::MkPayloadHash(const JobInfo &info, string *hex_hash)
         *hex_hash =
           "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         break;
+      case kAuthzAzure:
+        // no payload hash required for Azure signature
+        hex_hash->clear();
+        break;
       default:
-        abort();
+        PANIC(NULL);
     }
     return true;
   }
 
   // PUT, there is actually payload
   shash::Any payload_hash(shash::kMd5);
-  bool retval;
 
-  switch (info.origin) {
-    case kOriginMem:
-      switch (info.authz_method) {
-        case kAuthzAwsV2:
-          shash::HashMem(info.origin_mem.data, info.origin_mem.size,
-                         &payload_hash);
-          *hex_hash =
-            Base64(string(reinterpret_cast<char *>(payload_hash.digest),
-                          payload_hash.GetDigestSize()));
-          return true;
-        case kAuthzAwsV4:
-          *hex_hash =
-            shash::Sha256Mem(info.origin_mem.data, info.origin_mem.size);
-          return true;
-        default:
-          abort();
-      }
-    case kOriginPath:
-      switch (info.authz_method) {
-        case kAuthzAwsV2:
-          retval = shash::HashFile(info.origin_path, &payload_hash);
-          if (!retval) {
-            LogCvmfs(kLogS3Fanout, kLogStderr,
-                     "failed to hash file %s (errno: %d)",
-                     info.origin_path.c_str(), errno);
-            return false;
-          }
-          *hex_hash =
-            Base64(string(reinterpret_cast<char *>(payload_hash.digest),
-                          payload_hash.GetDigestSize()));
-          return true;
-        case kAuthzAwsV4:
-          *hex_hash = shash::Sha256File(info.origin_path);
-          if (hex_hash->empty()) {
-            LogCvmfs(kLogS3Fanout, kLogStderr,
-                     "failed to hash file %s (errno: %d)",
-                     info.origin_path.c_str(), errno);
-            return false;
-          }
-          return true;
-        default:
-          abort();
-      }
-    default:
-      abort();
-  }
-}
+  unsigned char *data;
+  unsigned int nbytes =
+    info.origin->Data(reinterpret_cast<void **>(&data),
+                             info.origin->GetSize(), 0);
+  assert(nbytes == info.origin->GetSize());
 
-
-bool S3FanoutManager::MkPayloadSize(const JobInfo &info, uint64_t *size) const {
-  int64_t file_size;
-  switch (info.origin) {
-    case kOriginMem:
-      *size = info.origin_mem.size;
+  switch (config_.authz_method) {
+    case kAuthzAwsV2:
+      shash::HashMem(data, nbytes, &payload_hash);
+      *hex_hash =
+        Base64(string(reinterpret_cast<char *>(payload_hash.digest),
+                      payload_hash.GetDigestSize()));
       return true;
-    case kOriginPath:
-      file_size = GetFileSize(info.origin_path);
-      if (file_size < 0) {
-        LogCvmfs(kLogS3Fanout, kLogStderr, "failed to stat file %s (errno: %d)",
-                 info.origin_path.c_str(), errno);
-        return false;
-      }
-      *size = file_size;
+    case kAuthzAwsV4:
+      *hex_hash =
+        shash::Sha256Mem(data, nbytes);
+      return true;
+    case kAuthzAzure:
+      // no payload hash required for Azure signature
+      hex_hash->clear();
       return true;
     default:
-      abort();
+      PANIC(NULL);
   }
 }
-
 
 string S3FanoutManager::GetRequestString(const JobInfo &info) const {
   switch (info.request) {
@@ -812,11 +812,13 @@ string S3FanoutManager::GetRequestString(const JobInfo &info) const {
       return "HEAD";
     case JobInfo::kReqPutCas:
     case JobInfo::kReqPutDotCvmfs:
+    case JobInfo::kReqPutHtml:
+    case JobInfo::kReqPutBucket:
       return "PUT";
     case JobInfo::kReqDelete:
       return "DELETE";
     default:
-      abort();
+      PANIC(NULL);
   }
 }
 
@@ -831,8 +833,12 @@ string S3FanoutManager::GetContentType(const JobInfo &info) const {
       return "application/octet-stream";
     case JobInfo::kReqPutDotCvmfs:
       return "application/x-cvmfs";
+    case JobInfo::kReqPutHtml:
+      return "text/html";
+    case JobInfo::kReqPutBucket:
+      return "text/xml";
     default:
-      abort();
+      PANIC(NULL);
   }
 }
 
@@ -851,13 +857,11 @@ Failures S3FanoutManager::InitializeRequest(JobInfo *info, CURL *handle) const {
   info->throttle_ms = 0;
   info->throttle_timestamp = 0;
   info->http_headers = NULL;
+  // info->payload_size is needed in S3Uploader::MainCollectResults,
+  // where info->origin is already destroyed.
+  info->payload_size = info->origin->GetSize();
 
-  InitializeDnsSettings(handle, info->hostname);
-
-  bool retval_b;
-  retval_b = MkPayloadSize(*info, &info->payload_size);
-  if (!retval_b)
-    return kFailLocalIO;
+  InitializeDnsSettings(handle, complete_hostname_);
 
   CURLcode retval;
   if ((info->request == JobInfo::kReqHeadOnly) ||
@@ -868,10 +872,9 @@ Failures S3FanoutManager::InitializeRequest(JobInfo *info, CURL *handle) const {
     assert(retval == CURLE_OK);
     retval = curl_easy_setopt(handle, CURLOPT_NOBODY, 1);
     assert(retval == CURLE_OK);
-    info->http_headers =
-      curl_slist_append(info->http_headers, "Content-Length: 0");
 
-    if (info->request == JobInfo::kReqDelete) {
+    if (info->request == JobInfo::kReqDelete)
+    {
       retval = curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST,
                                 GetRequestString(*info).c_str());
       assert(retval == CURLE_OK);
@@ -887,38 +890,34 @@ Failures S3FanoutManager::InitializeRequest(JobInfo *info, CURL *handle) const {
     retval = curl_easy_setopt(handle, CURLOPT_NOBODY, 0);
     assert(retval == CURLE_OK);
     retval = curl_easy_setopt(handle, CURLOPT_INFILESIZE_LARGE,
-                              static_cast<curl_off_t>(info->payload_size));
+                              static_cast<curl_off_t>(info->origin->GetSize()));
     assert(retval == CURLE_OK);
-    if (info->origin == kOriginPath) {
-      assert(info->origin_file == NULL);
-      info->origin_file = fopen(info->origin_path.c_str(), "r");
-      if (info->origin_file == NULL) {
-        LogCvmfs(kLogS3Fanout, kLogStderr, "failed to open file %s (errno: %d)",
-                 info->origin_path.c_str(), errno);
-        return kFailLocalIO;
-      }
-    }
 
     if (info->request == JobInfo::kReqPutDotCvmfs) {
       info->http_headers =
           curl_slist_append(info->http_headers, kCacheControlDotCvmfs);
-    } else {
+    } else if (info->request == JobInfo::kReqPutCas) {
       info->http_headers =
           curl_slist_append(info->http_headers, kCacheControlCas);
     }
   }
 
+  bool retval_b;
+
   // Authorization
   vector<string> authz_headers;
-  switch (info->authz_method) {
+  switch (config_.authz_method) {
     case kAuthzAwsV2:
       retval_b = MkV2Authz(*info, &authz_headers);
       break;
     case kAuthzAwsV4:
       retval_b = MkV4Authz(*info, &authz_headers);
       break;
+    case kAuthzAzure:
+      retval_b = MkAzureAuthz(*info, &authz_headers);
+      break;
     default:
-      abort();
+      PANIC(NULL);
   }
   if (!retval_b)
     return kFailLocalIO;
@@ -968,21 +967,22 @@ void S3FanoutManager::SetUrlOptions(JobInfo *info) const {
   CURL *curl_handle = info->curl_handle;
   CURLcode retval;
 
-  pthread_mutex_lock(lock_options_);
-  retval = curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, opt_timeout_);
+  retval = curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT,
+                            config_.opt_timeout_sec);
   assert(retval == CURLE_OK);
   retval = curl_easy_setopt(curl_handle, CURLOPT_LOW_SPEED_LIMIT,
                             kLowSpeedLimit);
   assert(retval == CURLE_OK);
-  retval = curl_easy_setopt(curl_handle, CURLOPT_LOW_SPEED_TIME, opt_timeout_);
+  retval = curl_easy_setopt(curl_handle, CURLOPT_LOW_SPEED_TIME,
+                            config_.opt_timeout_sec);
   assert(retval == CURLE_OK);
+
   if (is_curl_debug_) {
     retval = curl_easy_setopt(curl_handle, CURLOPT_VERBOSE, 1);
     assert(retval == CURLE_OK);
   }
-  pthread_mutex_unlock(lock_options_);
 
-  string url = MkUrl(info->hostname, info->bucket, (info->object_key));
+  string url = MkUrl(info->object_key);
   retval = curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
   assert(retval == CURLE_OK);
 }
@@ -1003,16 +1003,12 @@ void S3FanoutManager::UpdateStatistics(CURL *handle) {
  * Retry if possible and if not already done too often.
  */
 bool S3FanoutManager::CanRetry(const JobInfo *info) {
-  pthread_mutex_lock(lock_options_);
-  unsigned max_retries = opt_max_retries_;
-  pthread_mutex_unlock(lock_options_);
-
   return
       (info->error_code == kFailHostConnection ||
        info->error_code == kFailHostResolve ||
        info->error_code == kFailServiceUnavailable ||
        info->error_code == kFailRetry) &&
-      (info->num_retries < max_retries);
+      (info->num_retries < config_.opt_max_retries);
 }
 
 
@@ -1022,11 +1018,6 @@ bool S3FanoutManager::CanRetry(const JobInfo *info) {
  * \return true if backoff has been performed, false otherwise
  */
 void S3FanoutManager::Backoff(JobInfo *info) {
-  pthread_mutex_lock(lock_options_);
-  unsigned backoff_init_ms = opt_backoff_init_ms_;
-  unsigned backoff_max_ms = opt_backoff_max_ms_;
-  pthread_mutex_unlock(lock_options_);
-
   if (info->error_code != kFailRetry)
     info->num_retries++;
   statistics_->num_retries++;
@@ -1050,12 +1041,13 @@ void S3FanoutManager::Backoff(JobInfo *info) {
     }
   } else {
     if (info->backoff_ms == 0) {
-      info->backoff_ms = prng_.Next(backoff_init_ms + 1);  // Must be != 0
+      // Must be != 0
+      info->backoff_ms = prng_.Next(config_.opt_backoff_init_ms + 1);
     } else {
       info->backoff_ms *= 2;
     }
-    if (info->backoff_ms > backoff_max_ms)
-      info->backoff_ms = backoff_max_ms;
+    if (info->backoff_ms > config_.opt_backoff_max_ms)
+      info->backoff_ms = config_.opt_backoff_max_ms;
 
     LogCvmfs(kLogS3Fanout, kLogDebug, "backing off for %d ms",
              info->backoff_ms);
@@ -1124,17 +1116,14 @@ bool S3FanoutManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
                                                         info->curl_handle);
 
     if (init_failure != s3fanout::kFailOk) {
-      LogCvmfs(kLogS3Fanout, kLogStderr, "Failed to initialize CURL handle "
-                                         "(error: %d - %s | errno: %d)",
-               init_failure, Code2Ascii(init_failure), errno);
-      abort();
+      PANIC(kLogStderr,
+            "Failed to initialize CURL handle "
+            "(error: %d - %s | errno: %d)",
+            init_failure, Code2Ascii(init_failure), errno);
     }
     SetUrlOptions(info);
     // Reset origin
-    if (info->origin == kOriginMem)
-      info->origin_mem.pos = 0;
-    if (info->origin == kOriginPath)
-      rewind(info->origin_file);
+    info->origin->Rewind();
     return true;  // Again, Put
   }
 
@@ -1145,16 +1134,12 @@ bool S3FanoutManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
   }
   if (try_again) {
     if (info->request == JobInfo::kReqPutCas ||
-        info->request == JobInfo::kReqPutDotCvmfs) {
+        info->request == JobInfo::kReqPutDotCvmfs ||
+        info->request == JobInfo::kReqPutHtml) {
       LogCvmfs(kLogS3Fanout, kLogDebug, "Trying again to upload %s",
                info->object_key.c_str());
       // Reset origin
-      if (info->origin == kOriginMem)
-        info->origin_mem.pos = 0;
-      if (info->origin == kOriginPath) {
-        assert(info->origin_file != NULL);
-        rewind(info->origin_file);
-      }
+      info->origin->Rewind();
     }
     Backoff(info);
     info->error_code = kFailOk;
@@ -1166,21 +1151,7 @@ bool S3FanoutManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
   }
 
   // Cleanup opened resources
-  if (info->origin == kOriginPath) {
-    assert(info->mmf == NULL);
-    if (info->origin_file != NULL) {
-      if (fclose(info->origin_file) != 0)
-        info->error_code = kFailLocalIO;
-      info->origin_file = NULL;
-    }
-  } else if (info->origin == kOriginMem) {
-    assert(info->origin_file == NULL);
-    if (info->mmf != NULL) {
-      info->mmf->Unmap();
-      delete info->mmf;
-      info->mmf = NULL;
-    }
-  }
+  info->origin.Destroy();
 
   if ((info->error_code != kFailOk) &&
       (info->http_error != 0) && (info->http_error != 404))
@@ -1190,30 +1161,14 @@ bool S3FanoutManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
   return false;  // stop transfer
 }
 
-S3FanoutManager::S3FanoutManager() {
-  active_requests_ = NULL;
-  pool_handles_idle_ = NULL;
-  pool_handles_inuse_ = NULL;
-  sharehandles_ = NULL;
-  curl_sharehandles_ = NULL;
-  pool_max_handles_ = 0;
-  curl_multi_ = NULL;
-  user_agent_ = NULL;
-
-  dns_buckets_ = true;
-
+S3FanoutManager::S3FanoutManager(const S3Config &config) : config_(config) {
   atomic_init32(&multi_threaded_);
-  watch_fds_ = NULL;
-  watch_fds_size_ = 0;
-  watch_fds_inuse_ = 0;
-  watch_fds_max_ = 0;
+  MakePipe(pipe_terminate_);
+  MakePipe(pipe_jobs_);
 
-  lock_options_ =
-      reinterpret_cast<pthread_mutex_t *>(smalloc(sizeof(pthread_mutex_t)));
-  int retval = pthread_mutex_init(lock_options_, NULL);
-  assert(retval == 0);
   jobs_completed_lock_ =
       reinterpret_cast<pthread_mutex_t *>(smalloc(sizeof(pthread_mutex_t)));
+  int retval;
   retval = pthread_mutex_init(jobs_completed_lock_, NULL);
   assert(retval == 0);
   jobs_todo_lock_ =
@@ -1225,58 +1180,23 @@ S3FanoutManager::S3FanoutManager() {
   retval = pthread_mutex_init(curl_handle_lock_, NULL);
   assert(retval == 0);
 
-  opt_timeout_ = 0;
-  opt_max_retries_ = 0;
-  opt_backoff_init_ms_ = 0;
-  opt_backoff_max_ms_ = 0;
-  opt_ipv4_only_ = false;
-
-  max_available_jobs_ = 0;
-  thread_upload_ = 0;
-  thread_upload_run_ = false;
-  resolver_ = NULL;
-  available_jobs_ = NULL;
-  statistics_ = NULL;
-  timestamp_last_throttle_report_ = 0;
-  is_curl_debug_ = (getenv("_CVMFS_CURL_DEBUG") != NULL);
-}
-
-
-S3FanoutManager::~S3FanoutManager() {
-  pthread_mutex_destroy(lock_options_);
-  free(lock_options_);
-  pthread_mutex_destroy(jobs_completed_lock_);
-  free(jobs_completed_lock_);
-  pthread_mutex_destroy(jobs_todo_lock_);
-  free(jobs_todo_lock_);
-  pthread_mutex_destroy(curl_handle_lock_);
-  free(curl_handle_lock_);
-}
-
-void S3FanoutManager::Init(const unsigned int max_pool_handles,
-                           bool dns_buckets) {
-  atomic_init32(&multi_threaded_);
-  CURLcode retval = curl_global_init(CURL_GLOBAL_ALL);
-  assert(retval == CURLE_OK);
   active_requests_ = new set<JobInfo *>;
   pool_handles_idle_ = new set<CURL *>;
   pool_handles_inuse_ = new set<CURL *>;
   curl_sharehandles_ = new map<CURL *, S3FanOutDnsEntry *>;
   sharehandles_ = new set<S3FanOutDnsEntry *>;
-  pool_max_handles_ = max_pool_handles;
-  watch_fds_max_ = 4 * pool_max_handles_;
-
-  max_available_jobs_ = 4 * pool_max_handles_;
+  watch_fds_max_ = 4 * config_.pool_max_handles;
+  max_available_jobs_ = 4 * config_.pool_max_handles;
   available_jobs_ = new Semaphore(max_available_jobs_);
   assert(NULL != available_jobs_);
 
-  opt_timeout_ = 20;
   statistics_ = new Statistics();
   user_agent_ = new string();
   *user_agent_ = "User-Agent: cvmfs " + string(VERSION);
+  complete_hostname_ = MkCompleteHostname();
 
-  dns_buckets_ = dns_buckets;
-
+  CURLcode cretval = curl_global_init(CURL_GLOBAL_ALL);
+  assert(cretval == CURLE_OK);
   curl_multi_ = curl_multi_init();
   assert(curl_multi_ != NULL);
   CURLMcode mretval;
@@ -1287,32 +1207,46 @@ void S3FanoutManager::Init(const unsigned int max_pool_handles,
                               static_cast<void *>(this));
   assert(mretval == CURLM_OK);
   mretval = curl_multi_setopt(curl_multi_, CURLMOPT_MAX_TOTAL_CONNECTIONS,
-                              pool_max_handles_);
+                              config_.pool_max_handles);
   assert(mretval == CURLM_OK);
 
   prng_.InitLocaltime();
+
+  thread_upload_ = 0;
+  timestamp_last_throttle_report_ = 0;
+  is_curl_debug_ = (getenv("_CVMFS_CURL_DEBUG") != NULL);
 
   // Parsing environment variables
   if ((getenv("CVMFS_IPV4_ONLY") != NULL) &&
       (strlen(getenv("CVMFS_IPV4_ONLY")) > 0)) {
     opt_ipv4_only_ = true;
+  } else {
+    opt_ipv4_only_ = false;
   }
-
-  watch_fds_ = static_cast<struct pollfd *>(smalloc(2 * sizeof(struct pollfd)));
-  watch_fds_size_ = 2;
-  watch_fds_inuse_ = 0;
-
-  SetRetryParameters(3, 100, 2000);
 
   resolver_ = dns::CaresResolver::Create(opt_ipv4_only_, 2, 2000);
+
+  watch_fds_ = static_cast<struct pollfd *>(smalloc(4 * sizeof(struct pollfd)));
+  watch_fds_size_ = 4;
+  watch_fds_inuse_ = 0;
 }
 
-void S3FanoutManager::Fini() {
+S3FanoutManager::~S3FanoutManager() {
+  pthread_mutex_destroy(jobs_completed_lock_);
+  free(jobs_completed_lock_);
+  pthread_mutex_destroy(jobs_todo_lock_);
+  free(jobs_todo_lock_);
+  pthread_mutex_destroy(curl_handle_lock_);
+  free(curl_handle_lock_);
+
   if (atomic_xadd32(&multi_threaded_, 0) == 1) {
     // Shutdown I/O thread
-    thread_upload_run_ = false;
+    char buf = 'T';
+    WritePipe(pipe_terminate_[1], &buf, 1);
     pthread_join(thread_upload_, NULL);
   }
+  ClosePipe(pipe_terminate_);
+  ClosePipe(pipe_jobs_);
 
   set<CURL *>::iterator             i    = pool_handles_idle_->begin();
   const set<CURL *>::const_iterator iEnd = pool_handles_idle_->end();
@@ -1337,30 +1271,20 @@ void S3FanoutManager::Fini() {
   delete sharehandles_;
   delete user_agent_;
   curl_multi_cleanup(curl_multi_);
-  active_requests_ = NULL;
-  pool_handles_idle_ = NULL;
-  pool_handles_inuse_ = NULL;
-  curl_sharehandles_ = NULL;
-  sharehandles_ = NULL;
-  user_agent_ = NULL;
-  curl_multi_ = NULL;
 
   delete statistics_;
-  statistics_ = NULL;
 
   delete available_jobs_;
 
   curl_global_cleanup();
 }
 
-
 /**
- * Spawns the I/O worker thread.  No way back except Fini(); Init();
+ * Spawns the I/O worker thread.  No way back except ~S3FanoutManager.
  */
 void S3FanoutManager::Spawn() {
   LogCvmfs(kLogS3Fanout, kLogDebug, "S3FanoutManager spawned");
 
-  thread_upload_run_ = true;
   int retval = pthread_create(&thread_upload_, NULL, MainUpload,
                               static_cast<void *>(this));
   assert(retval == 0);
@@ -1368,55 +1292,21 @@ void S3FanoutManager::Spawn() {
   atomic_inc32(&multi_threaded_);
 }
 
-
-/**
- * The timeout counts for all sorts of connection phases,
- * DNS, HTTP connect, etc.
- */
-void S3FanoutManager::SetTimeout(const unsigned seconds) {
-  pthread_mutex_lock(lock_options_);
-  opt_timeout_ = seconds;
-  pthread_mutex_unlock(lock_options_);
-}
-
-
-/**
- * Receives the currently active timeout value.
- */
-void S3FanoutManager::GetTimeout(unsigned *seconds) {
-  pthread_mutex_lock(lock_options_);
-  *seconds = opt_timeout_;
-  pthread_mutex_unlock(lock_options_);
-}
-
-
 const Statistics &S3FanoutManager::GetStatistics() {
   return *statistics_;
-}
-
-
-void S3FanoutManager::SetRetryParameters(const unsigned max_retries,
-                                         const unsigned backoff_init_ms,
-                                         const unsigned backoff_max_ms) {
-  pthread_mutex_lock(lock_options_);
-  opt_max_retries_ = max_retries;
-  opt_backoff_init_ms_ = backoff_init_ms;
-  opt_backoff_max_ms_ = backoff_max_ms;
-  pthread_mutex_unlock(lock_options_);
 }
 
 /**
  * Get completed jobs, so they can be cleaned and deleted properly.
  */
 int S3FanoutManager::PopCompletedJobs(std::vector<s3fanout::JobInfo*> *jobs) {
-  pthread_mutex_lock(jobs_completed_lock_);
+  MutexLockGuard m(jobs_completed_lock_);
   std::vector<JobInfo*>::iterator             it    = jobs_completed_.begin();
   const std::vector<JobInfo*>::const_iterator itend = jobs_completed_.end();
   for (; it != itend; ++it) {
     jobs->push_back(*it);
   }
   jobs_completed_.clear();
-  pthread_mutex_unlock(jobs_completed_lock_);
 
   return 0;
 }
@@ -1426,10 +1316,7 @@ int S3FanoutManager::PopCompletedJobs(std::vector<s3fanout::JobInfo*> *jobs) {
  */
 void S3FanoutManager::PushNewJob(JobInfo *info) {
   available_jobs_->Increment();
-
-  pthread_mutex_lock(jobs_todo_lock_);
-  jobs_todo_.push_back(info);
-  pthread_mutex_unlock(jobs_todo_lock_);
+  WritePipe(pipe_jobs_[1], &info, sizeof(info));
 }
 
 //------------------------------------------------------------------------------

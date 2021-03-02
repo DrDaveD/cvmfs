@@ -6,6 +6,7 @@ set (PROJECT_TEST_NAME "cvmfs_unittests")
 set (PROJECT_TEST_DEBUG_NAME ${PROJECT_TEST_NAME}_debug)
 set (PROJECT_TEST_CACHE_NAME "cvmfs_test_cache")
 set (PROJECT_TEST_SHRINKWRAP_NAME "cvmfs_test_shrinkwrap")
+set (PROJECT_TEST_PUBLISH_NAME "cvmfs_test_publish")
 
 # Add the test/common directory to the include path
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../common)
@@ -27,6 +28,7 @@ set(CVMFS_UNITTEST_FILES
   t_authz_session.cc
   t_backoff.cc
   t_base64.cc
+  t_bigqueue.cc
   t_bigvector.cc
   t_blocking_counter.cc
   t_cache.cc
@@ -38,6 +40,7 @@ set(CVMFS_UNITTEST_FILES
   t_catalog_counters.cc
   t_catalog_merge_tool.cc
   t_catalog_mgr.cc
+  t_catalog_mgr_rw.cc
   t_catalog_sql.cc
   t_catalog_traversal.cc
   t_catalog_virtual.cc
@@ -52,6 +55,7 @@ set(CVMFS_UNITTEST_FILES
   t_fd_table.cc
   t_fence.cc
   t_fetch.cc
+  t_file_backed_buffer.cc
   t_file_chunk.cc
   t_file_guard.cc
   t_file_sandbox.cc
@@ -65,20 +69,24 @@ set(CVMFS_UNITTEST_FILES
   t_history.cc
   t_ingestion.cc
   t_ingestion_stress.cc
+  t_ingestion_tube.cc
   t_json.cc
   t_kvstore.cc
   t_lease_path_util.cc
   t_libcvmfs.cc
   t_logging.cc
   t_lru.cc
+  t_magic_xattr.cc
   t_malloc_arena.cc
   t_malloc_heap.cc
   t_manifest.cc
-  t_notify_messages.cc
   t_mountpoint.cc
+  t_namespace.cc
+  t_notify_messages.cc
   t_object_fetcher.cc
   t_options.cc
   t_pack.cc
+  t_panic.cc
   t_pathspec.cc
   t_payload_processor.cc
   t_pipe.cc
@@ -98,9 +106,11 @@ set(CVMFS_UNITTEST_FILES
   t_smallhash.cc
   t_smalloc.cc
   t_shared_ptr.cc
+  t_signature.cc
   t_sqlite_database.cc
   t_sqlitemem.cc
   t_statistics.cc
+  t_statistics_sql.cc
   t_suid_util.cc
   t_supervisor.cc
   t_swissknife_lease.cc
@@ -156,9 +166,10 @@ set (CVMFS_UNITTEST_SOURCES
   ${CVMFS_SOURCE_DIR}/clientctx.cc
   ${CVMFS_SOURCE_DIR}/compression.cc
   ${CVMFS_SOURCE_DIR}/cvmfs_suid_util.cc
+  ${CVMFS_SOURCE_DIR}/directory_entry.cc
   ${CVMFS_SOURCE_DIR}/dns.cc
   ${CVMFS_SOURCE_DIR}/download.cc
-  ${CVMFS_SOURCE_DIR}/directory_entry.cc
+  ${CVMFS_SOURCE_DIR}/duplex_fuse.cc
   ${CVMFS_SOURCE_DIR}/encrypt.cc
   ${CVMFS_SOURCE_DIR}/fetch.cc
   ${CVMFS_SOURCE_DIR}/file_chunk.cc
@@ -187,6 +198,7 @@ set (CVMFS_UNITTEST_SOURCES
   ${CVMFS_SOURCE_DIR}/libcvmfs_legacy.cc
   ${CVMFS_SOURCE_DIR}/libcvmfs_options.cc
   ${CVMFS_SOURCE_DIR}/logging.cc
+  ${CVMFS_SOURCE_DIR}/magic_xattr.cc
   ${CVMFS_SOURCE_DIR}/malloc_arena.cc
   ${CVMFS_SOURCE_DIR}/malloc_heap.cc
   ${CVMFS_SOURCE_DIR}/manifest.cc
@@ -222,6 +234,7 @@ set (CVMFS_UNITTEST_SOURCES
   ${CVMFS_SOURCE_DIR}/sqlitemem.cc
   ${CVMFS_SOURCE_DIR}/sqlitevfs.cc
   ${CVMFS_SOURCE_DIR}/statistics.cc
+  ${CVMFS_SOURCE_DIR}/statistics_database.cc
   ${CVMFS_SOURCE_DIR}/supervisor.cc
   ${CVMFS_SOURCE_DIR}/swissknife.cc
   ${CVMFS_SOURCE_DIR}/swissknife_assistant.cc
@@ -242,7 +255,10 @@ set (CVMFS_UNITTEST_SOURCES
   ${CVMFS_SOURCE_DIR}/upload_spooler_definition.cc
   ${CVMFS_SOURCE_DIR}/url.cc
   ${CVMFS_SOURCE_DIR}/util/algorithm.cc
+  ${CVMFS_SOURCE_DIR}/util/exception.cc
+  ${CVMFS_SOURCE_DIR}/util/file_backed_buffer.cc
   ${CVMFS_SOURCE_DIR}/util/mmap_file.cc
+  ${CVMFS_SOURCE_DIR}/util/namespace.cc
   ${CVMFS_SOURCE_DIR}/util/posix.cc
   ${CVMFS_SOURCE_DIR}/util/string.cc
   ${CVMFS_SOURCE_DIR}/util/raii_temp_dir.cc
@@ -253,6 +269,7 @@ set (CVMFS_UNITTEST_SOURCES
   ${CVMFS_SOURCE_DIR}/xattr.cc
 
   cache.pb.cc cache.pb.h
+  c_http_server.cc
 )
 
 # Lower optimization level for this file. Xcode 9.3+ gives different results in Os and above
@@ -300,6 +317,7 @@ set (CVMFS_TEST_CACHE_SOURCES
   ${CVMFS_SOURCE_DIR}/logging.cc
   ${CVMFS_SOURCE_DIR}/manifest.cc
   ${CVMFS_SOURCE_DIR}/quota.cc
+  ${CVMFS_SOURCE_DIR}/util/exception.cc
   ${CVMFS_SOURCE_DIR}/util/posix.cc
   ${CVMFS_SOURCE_DIR}/util/string.cc
   ${CVMFS_SOURCE_DIR}/util_concurrency.cc
@@ -328,6 +346,7 @@ set (CVMFS_CLIENT_SOURCES
   ${CVMFS_SOURCE_DIR}/directory_entry.cc
   ${CVMFS_SOURCE_DIR}/dns.cc
   ${CVMFS_SOURCE_DIR}/download.cc
+  ${CVMFS_SOURCE_DIR}/duplex_fuse.cc
   ${CVMFS_SOURCE_DIR}/fetch.cc
   ${CVMFS_SOURCE_DIR}/file_chunk.cc
   ${CVMFS_SOURCE_DIR}/file_watcher.cc
@@ -339,6 +358,7 @@ set (CVMFS_CLIENT_SOURCES
   ${CVMFS_SOURCE_DIR}/json_document.cc
   ${CVMFS_SOURCE_DIR}/kvstore.cc
   ${CVMFS_SOURCE_DIR}/logging.cc
+  ${CVMFS_SOURCE_DIR}/magic_xattr.cc
   ${CVMFS_SOURCE_DIR}/malloc_arena.cc
   ${CVMFS_SOURCE_DIR}/malloc_heap.cc
   ${CVMFS_SOURCE_DIR}/manifest.cc
@@ -358,6 +378,7 @@ set (CVMFS_CLIENT_SOURCES
   ${CVMFS_SOURCE_DIR}/tracer.cc
   ${CVMFS_SOURCE_DIR}/uuid.cc
   ${CVMFS_SOURCE_DIR}/util/algorithm.cc
+  ${CVMFS_SOURCE_DIR}/util/exception.cc
   ${CVMFS_SOURCE_DIR}/util/posix.cc
   ${CVMFS_SOURCE_DIR}/util/string.cc
   ${CVMFS_SOURCE_DIR}/util_concurrency.cc
@@ -408,6 +429,107 @@ set (CVMFS_TEST_SHRINKWRAP_SOURCES
   ${LIBCVMFS_SOURCES}
 )
 
+set (CVMFS_TEST_PUBLISH_SOURCES
+  c_http_server.cc
+  publish/c_repository.cc
+  publish/main.cc
+  publish/t_command.cc
+  publish/t_env.cc
+  publish/t_diff.cc
+  publish/t_session.cc
+  publish/t_repository.cc
+  publish/t_settings.cc
+  publish/t_transaction.cc
+  publish/t_util.cc
+
+  ../common/env.cc
+
+  ${CVMFS_SOURCE_DIR}/publish/cmd_help.cc
+  ${CVMFS_SOURCE_DIR}/publish/cmd_mkfs.cc
+  ${CVMFS_SOURCE_DIR}/publish/cmd_util.cc
+  ${CVMFS_SOURCE_DIR}/publish/cmd_zpipe.cc
+  ${CVMFS_SOURCE_DIR}/publish/command.cc
+  ${CVMFS_SOURCE_DIR}/publish/except.cc
+  ${CVMFS_SOURCE_DIR}/publish/repository.cc
+  ${CVMFS_SOURCE_DIR}/publish/repository_env.cc
+  ${CVMFS_SOURCE_DIR}/publish/repository_diff.cc
+  ${CVMFS_SOURCE_DIR}/publish/repository_managed.cc
+  ${CVMFS_SOURCE_DIR}/publish/repository_session.cc
+  ${CVMFS_SOURCE_DIR}/publish/repository_tags.cc
+  ${CVMFS_SOURCE_DIR}/publish/repository_transaction.cc
+  ${CVMFS_SOURCE_DIR}/publish/repository_util.cc
+  ${CVMFS_SOURCE_DIR}/publish/settings.cc
+
+  ${CVMFS_SOURCE_DIR}/backoff.cc
+  ${CVMFS_SOURCE_DIR}/catalog.cc
+  ${CVMFS_SOURCE_DIR}/catalog_counters.cc
+  ${CVMFS_SOURCE_DIR}/catalog_sql.cc
+  ${CVMFS_SOURCE_DIR}/catalog_rw.cc
+  ${CVMFS_SOURCE_DIR}/catalog_mgr_ro.cc
+  ${CVMFS_SOURCE_DIR}/catalog_mgr_rw.cc
+  ${CVMFS_SOURCE_DIR}/catalog_virtual.cc
+  ${CVMFS_SOURCE_DIR}/compression.cc
+  ${CVMFS_SOURCE_DIR}/directory_entry.cc
+  ${CVMFS_SOURCE_DIR}/dns.cc
+  ${CVMFS_SOURCE_DIR}/download.cc
+  ${CVMFS_SOURCE_DIR}/gateway_util.cc
+  ${CVMFS_SOURCE_DIR}/globals.cc
+  ${CVMFS_SOURCE_DIR}/hash.cc
+  ${CVMFS_SOURCE_DIR}/history_sql.cc
+  ${CVMFS_SOURCE_DIR}/history_sqlite.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/chunk_detector.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/item.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/item_mem.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/pipeline.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/task_chunk.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/task_compress.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/task_hash.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/task_read.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/task_register.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/task_write.cc
+  ${CVMFS_SOURCE_DIR}/json_document.cc
+  ${CVMFS_SOURCE_DIR}/logging.cc
+  ${CVMFS_SOURCE_DIR}/malloc_arena.cc
+  ${CVMFS_SOURCE_DIR}/manifest.cc
+  ${CVMFS_SOURCE_DIR}/manifest_fetch.cc
+  ${CVMFS_SOURCE_DIR}/options.cc
+  ${CVMFS_SOURCE_DIR}/pack.cc
+  ${CVMFS_SOURCE_DIR}/reflog.cc
+  ${CVMFS_SOURCE_DIR}/reflog_sql.cc
+  ${CVMFS_SOURCE_DIR}/s3fanout.cc
+  ${CVMFS_SOURCE_DIR}/sanitizer.cc
+  ${CVMFS_SOURCE_DIR}/session_context.cc
+  ${CVMFS_SOURCE_DIR}/signature.cc
+  ${CVMFS_SOURCE_DIR}/sql.cc
+  ${CVMFS_SOURCE_DIR}/sqlitemem.cc
+  ${CVMFS_SOURCE_DIR}/statistics.cc
+  ${CVMFS_SOURCE_DIR}/swissknife_assistant.cc
+  ${CVMFS_SOURCE_DIR}/swissknife_lease_curl.cc
+  ${CVMFS_SOURCE_DIR}/sync_item.cc
+  ${CVMFS_SOURCE_DIR}/sync_item_tar.cc
+  ${CVMFS_SOURCE_DIR}/sync_mediator.cc
+  ${CVMFS_SOURCE_DIR}/sync_union.cc
+  ${CVMFS_SOURCE_DIR}/sync_union_aufs.cc
+  ${CVMFS_SOURCE_DIR}/sync_union_overlayfs.cc
+  ${CVMFS_SOURCE_DIR}/sync_union_tarball.cc
+  ${CVMFS_SOURCE_DIR}/upload.cc
+  ${CVMFS_SOURCE_DIR}/upload_facility.cc
+  ${CVMFS_SOURCE_DIR}/upload_gateway.cc
+  ${CVMFS_SOURCE_DIR}/upload_local.cc
+  ${CVMFS_SOURCE_DIR}/upload_s3.cc
+  ${CVMFS_SOURCE_DIR}/upload_spooler_definition.cc
+  ${CVMFS_SOURCE_DIR}/util_concurrency.cc
+  ${CVMFS_SOURCE_DIR}/util/algorithm.cc
+  ${CVMFS_SOURCE_DIR}/util/exception.cc
+  ${CVMFS_SOURCE_DIR}/util/file_backed_buffer.cc
+  ${CVMFS_SOURCE_DIR}/util/mmap_file.cc
+  ${CVMFS_SOURCE_DIR}/util/posix.cc
+  ${CVMFS_SOURCE_DIR}/util/raii_temp_dir.cc
+  ${CVMFS_SOURCE_DIR}/util/string.cc
+  ${CVMFS_SOURCE_DIR}/whitelist.cc
+  ${CVMFS_SOURCE_DIR}/xattr.cc
+)
+
 #
 # Compiler and Linker Flags for unit tests
 #
@@ -415,10 +537,12 @@ set (CVMFS_UNITTESTS_CFLAGS "${CVMFS_UNITTESTS_CFLAGS} -DGTEST_USE_OWN_TR1_TUPLE
 set (CVMFS_TEST_SHRINKWRAP_CFLAGS "${CVMFS_UNITTESTS_CFLAGS}")
 set (CVMFS_UNITTESTS_DEBUG_CFLAGS "${CVMFS_UNITTESTS_CFLAGS} -O0 -DDEBUGMSG -g")
 set (CVMFS_TEST_CACHE_CFLAGS "${CVMFS_TEST_CACHE_CFLAGS} -DGTEST_USE_OWN_TR1_TUPLE=1 -DCVMFS_LIBCVMFS -D_FILE_OFFSET_BITS=64 -D_GLIBCXX_DEBUG -fexceptions")
+set (CVMFS_TEST_PUBLISH_CFLAGS "${CVMFS_UNITTESTS_CFLAGS}")
 set (CVMFS_UNITTESTS_LD_FLAGS "${CVMFS_UNITTESTS_LD_FLAGS}")
 set (CVMFS_UNITTESTS_DEBUG_LD_FLAGS "${CVMFS_UNITTESTS_LD_FLAGS}")
 set (CVMFS_TEST_CACHE_LD_FLAGS "${CVMFS_TEST_CACHE_LD_FLAGS}")
 set (CVMFS_TEST_SHRINKWRAP_LD_FLAGS "${CVMFS_TEST_SHRINKWRAP_LD_FLAGS}")
+set (CVMFS_TEST_PUBLISH_LD_FLAGS "${CVMFS_TEST_PUBLISH_LD_FLAGS}")
 
 #
 # build CernVM-FS test cases
@@ -442,6 +566,10 @@ if (BUILD_UNITTESTS OR BUILD_UNITTESTS_DEBUG)
     add_executable (${PROJECT_TEST_SHRINKWRAP_NAME} ${CVMFS_TEST_SHRINKWRAP_SOURCES})
     add_dependencies (${PROJECT_TEST_SHRINKWRAP_NAME} cache.pb.generated-unittests)
   endif (BUILD_SHRINKWRAP)
+
+  if (BUILD_SERVER)
+    add_executable (${PROJECT_TEST_PUBLISH_NAME} ${CVMFS_TEST_PUBLISH_SOURCES})
+  endif ()
 endif (BUILD_UNITTESTS OR BUILD_UNITTESTS_DEBUG)
 
 add_test (NAME ${PROJECT_TEST_NAME} COMMAND ${PROJECT_TEST_NAME} --gtest_filter=-*Slow)
@@ -467,6 +595,9 @@ endif (BUILD_LIBCVMFS_CACHE)
 if (BUILD_SHRINKWRAP)
   set_target_properties (${PROJECT_TEST_SHRINKWRAP_NAME} PROPERTIES COMPILE_FLAGS "${CVMFS_TEST_SHRINKWRAP_CFLAGS}" LINK_FLAGS "${CVMFS_TEST_SHRINKWRAP_LD_FLAGS}")
 endif (BUILD_SHRINKWRAP)
+if (BUILD_SERVER)
+  set_target_properties (${PROJECT_TEST_PUBLISH_NAME} PROPERTIES COMPILE_FLAGS "${CVMFS_TEST_PUBLISH_CFLAGS}" LINK_FLAGS "${CVMFS_TEST_PUBLISH_LD_FLAGS}")
+endif (BUILD_SERVER)
 
 
 #
@@ -475,7 +606,7 @@ endif (BUILD_SHRINKWRAP)
 
 list (APPEND UNITTEST_LINK_LIBRARIES ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES}
                                      ${OPENSSL_LIBRARIES}
-                                     ${CURL_LIBRARIES} ${CARES_LIBRARIES}
+                                     ${CURL_LIBRARIES} ${CARES_LIBRARIES} ${CARES_LDFLAGS}
                                      ${OPENSSL_LIBRARIES} ${SQLITE3_LIBRARY}
                                      ${ZLIB_LIBRARIES} ${RT_LIBRARY} ${UUID_LIBRARIES}
                                      ${PACPARSER_LIBRARIES} ${SHA3_LIBRARIES}
@@ -501,12 +632,22 @@ if (BUILD_SHRINKWRAP)
   target_link_libraries (${PROJECT_TEST_SHRINKWRAP_NAME}
                           ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES}
                           ${OPENSSL_LIBRARIES} ${CURL_LIBRARIES}
-                          ${CARES_LIBRARIES} ${OPENSSL_LIBRARIES}
+                          ${CARES_LIBRARIES} ${CARES_LDFLAGS} ${OPENSSL_LIBRARIES}
                           ${SQLITE3_LIBRARY} ${ZLIB_LIBRARIES} ${RT_LIBRARY}
                           ${UUID_LIBRARIES} ${PACPARSER_LIBRARIES}
                           ${SHA3_LIBRARIES} ${VJSON_LIBRARIES}
                           ${PROTOBUF_LITE_LIBRARY}  ${CAP_LIBRARIES} ${LibArchive_LIBRARY} pthread dl)
 endif (BUILD_SHRINKWRAP)
+
+if (BUILD_SERVER)
+  target_link_libraries (${PROJECT_TEST_PUBLISH_NAME}
+                          ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES}
+                          ${OPENSSL_LIBRARIES} ${CURL_LIBRARIES}
+                          ${CARES_LIBRARIES} ${CARES_LDFLAGS} ${OPENSSL_LIBRARIES}
+                          ${SQLITE3_LIBRARY} ${ZLIB_LIBRARIES} ${RT_LIBRARY}
+                          ${SHA3_LIBRARIES} ${VJSON_LIBRARIES}
+                          ${CAP_LIBRARIES} ${LibArchive_LIBRARY} pthread dl)
+endif (BUILD_SERVER)
 
 
 #
@@ -534,6 +675,14 @@ if (INSTALL_UNITTESTS)
       DESTINATION    bin
     )
   endif (BUILD_SHRINKWRAP)
+
+  if (BUILD_SERVER)
+    install (
+      TARGETS        ${PROJECT_TEST_PUBLISH_NAME}
+      RUNTIME
+      DESTINATION    bin
+    )
+  endif (BUILD_SERVER)
 endif (INSTALL_UNITTESTS)
 
 if (INSTALL_UNITTESTS_DEBUG)

@@ -4,14 +4,14 @@
 %define sle12 1
 %define dist .sle12
 %endif
-%if 0%{?el6} || 0%{?el7} || 0%{?fedora}
+%if 0%{?rhel} >= 6 || 0%{?fedora}
 %define selinux_cvmfs 1
 %define selinux_variants mls strict targeted
 %endif
-%if 0%{?el7} || 0%{?fedora}
+%if 0%{?rhel} >= 7 || 0%{?fedora}
 %define selinux_cvmfs_server 1
 %endif
-%if 0%{?el7} || 0%{?fedora} >= 29
+%if 0%{?rhel} >= 7 || 0%{?fedora} >= 29
   %if "%{?_arch}" != "aarch64"
     %define build_ducc 1
   %endif
@@ -26,8 +26,23 @@
 %endif
 
 # List of platforms that require systemd/autofs fix as described in CVM-1200
-%if 0%{?el7} || 0%{?fedora} || 0%{?sle12}
+%if 0%{?rhel} >= 7 || 0%{?fedora} || 0%{?sle12}
 %define systemd_autofs_patch 1
+%endif
+
+# fuse3 is in epel starting with epel6
+%if 0%{?fedora} >= 29 || 0%{?rhel} >= 6
+%define build_fuse3 1
+%endif
+
+%define cvmfs_python python
+%if 0%{?el8} || 0%{?fedora} >= 31
+%define cvmfs_python python2
+%endif
+
+%define hardlink /usr/sbin/hardlink
+%if 0%{?fedora} >= 31
+%define hardlink /usr/bin/hardlink
 %endif
 
 %define __strip /bin/true
@@ -38,7 +53,7 @@
 
 Summary: CernVM File System
 Name: cvmfs
-Version: 2.6.3
+Version: 2.8.0
 Release: 1%{?dist}
 Source0: https://ecsft.cern.ch/dist/cvmfs/%{name}-%{version}/%{name}-%{version}.tar.gz
 %if 0%{?selinux_cvmfs}
@@ -68,11 +83,14 @@ BuildRequires: valgrind-devel
 %endif
 BuildRequires: cmake
 BuildRequires: fuse-devel
+%if 0%{?build_fuse3}
+BuildRequires: fuse3-devel
+%endif
 BuildRequires: libattr-devel
 BuildRequires: openssl-devel
 BuildRequires: patch
 BuildRequires: pkgconfig
-BuildRequires: python-devel
+BuildRequires: %{cvmfs_python}-devel
 BuildRequires: unzip
 
 Requires: bash
@@ -80,7 +98,6 @@ Requires: coreutils
 Requires: grep
 Requires: gawk
 Requires: sed
-Requires: perl
 Requires: psmisc
 Requires: autofs
 Requires: fuse
@@ -109,7 +126,7 @@ Requires: shadow-utils
 Requires: SysVinit
 Requires: e2fsprogs
   %else
-    %if 0%{?fedora}
+    %if 0%{?fedora} || 0%{?rhel} >= 8
 Requires: procps-ng
     %else
 Requires: sysvinit-tools
@@ -120,10 +137,6 @@ Requires: util-linux-ng
 Requires: util-linux
     %endif
   %endif
-%endif
-%if 0%{?fedora}
-# For cvmfs_talk, does not necessarily come with Fedora >= 25
-Requires: perl-Getopt-Long
 %endif
 Requires: cvmfs-config
 
@@ -145,6 +158,17 @@ HTTP File System for Distributing Software to CernVM.
 See http://cernvm.cern.ch
 Copyright (c) CERN
 
+%if 0%{?build_fuse3}
+%package fuse3
+Summary: additional libraries to enable libfuse3 support
+Group: Applications/System
+Requires: cvmfs = %{version}
+Requires: fuse3
+Requires: fuse3-libs
+%description fuse3
+Shared libraries implementing the CernVM-FS fuse module based on libfuse3
+%endif
+
 %package devel
 Summary: CernVM-FS static client library
 Group: Applications/System
@@ -155,10 +179,10 @@ CernVM-FS static client library for pure user-space use
 %package server
 Summary: CernVM-FS server tools
 Group: Application/System
-BuildRequires: python-devel
+BuildRequires: %{cvmfs_python}-devel
 BuildRequires: libcap-devel
 BuildRequires: unzip
-BuildRequires: python-setuptools
+BuildRequires: %{cvmfs_python}-setuptools
 %if 0%{?suse_version}
 Requires: insserv
 %else
@@ -179,7 +203,7 @@ Requires: lsof
 Requires: rsync
 Requires: usbutils
 Requires: sqlite
-%if 0%{?el6} || 0%{?el7} || 0%{?fedora} || 0%{?suse_version} >= 1300
+%if 0%{?rhel} >= 6 || 0%{?fedora} || 0%{?suse_version} >= 1300
 Requires: jq
 %endif
 %if 0%{?selinux_cvmfs_server}
@@ -210,6 +234,7 @@ CernVM-FS unit tests binary.  This RPM is not required except for testing.
 Summary: ducc: Daemon Unpacking Containers in CVMFS
 Group: Application/System
 BuildRequires: golang >= 1.11.4
+Requires: singularity >= 3.5
 %description ducc
 Daemon to automatically unpack and expose containers images into CernVM-FS
 %endif
@@ -345,13 +370,20 @@ mkdir -p $RPM_BUILD_ROOT/cvmfs
 mkdir -p $RPM_BUILD_ROOT/etc/cvmfs/config.d
 mkdir -p $RPM_BUILD_ROOT/etc/cvmfs/repositories.d
 mkdir -p $RPM_BUILD_ROOT/etc/bash_completion.d
+mkdir -p $RPM_BUILD_ROOT/usr/share/cvmfs-server
 
 # Keys and configs are in cvmfs-config
 rm -rf $RPM_BUILD_ROOT/etc/cvmfs/keys/*
+rm -f $RPM_BUILD_ROOT/etc/cvmfs/config.d/README
 rm -f $RPM_BUILD_ROOT/etc/cvmfs/config.d/*.conf
 rm -f $RPM_BUILD_ROOT/etc/cvmfs/domain.d/*.conf
 rm -f $RPM_BUILD_ROOT/etc/cvmfs/default.d/*.conf
 rm -f $RPM_BUILD_ROOT/etc/cvmfs/serverorder.sh
+
+# Don't install coincidentially built libfuse3 libraries
+%if ! 0%{?build_fuse3}
+rm -f $RPM_BUILD_ROOT%{_libdir}/libcvmfs_fuse3*
+%endif
 
 # Fix docdir on SuSE
 %if 0%{?suse_version}
@@ -360,7 +392,7 @@ mv $RPM_BUILD_ROOT/usr/share/doc/%{name}-%{version} %RPM_BUILD_ROOT/usr/share/do
 %endif
 
 # Fix docdir on Fedora
-%if 0%{?fedora}
+%if 0%{?fedora} || 0%{?rhel} >= 8
 rm -rf $RPM_BUILD_ROOT/usr/share/doc/%{name}-%{version}
 %endif
 
@@ -374,7 +406,7 @@ do
 done
 popd
 # Hardlink identical policy module packages together
-/usr/sbin/hardlink -cv $RPM_BUILD_ROOT%{_datadir}/selinux
+%{hardlink} -cv $RPM_BUILD_ROOT%{_datadir}/selinux
 %endif
 
 %if 0%{?systemd_autofs_patch}
@@ -391,6 +423,10 @@ EOF
 rm -rf $RPM_BUILD_ROOT
 
 %post
+if [ $1 -eq 1 ]; then
+   mkdir /cvmfs
+   chmod 755 /cvmfs
+fi
 %if 0%{?selinux_cvmfs}
 # Install SELinux policy modules
 for selinuxvariant in %{selinux_variants}
@@ -408,6 +444,11 @@ if [ -d /var/run/cvmfs ]; then
   /usr/bin/cvmfs_config reload
 fi
 :
+
+%if 0%{?build_fuse3}
+%post fuse3
+/sbin/ldconfig
+%endif
 
 %post server
 /usr/bin/cvmfs_server fix-permissions || :
@@ -440,6 +481,8 @@ if [ $1 -eq 0 ]; then
    then
      rm -f /etc/auto.master.d/cvmfs.autofs
    fi
+   [ -f /var/lock/subsys/autofs ] && /sbin/service autofs reload >/dev/null
+   rmdir /cvmfs
 fi
 
 %if 0%{?selinux_cvmfs}
@@ -461,6 +504,8 @@ fi
 %files
 %defattr(-,root,root)
 %{_bindir}/cvmfs2
+%{_libdir}/libcvmfs_fuse_stub.so
+%{_libdir}/libcvmfs_fuse_stub.so.%{version}
 %{_libdir}/libcvmfs_fuse.so
 %{_libdir}/libcvmfs_fuse.so.%{version}
 %{_libdir}/libcvmfs_fuse_debug.so
@@ -472,6 +517,7 @@ fi
 /usr/libexec/cvmfs/authz/cvmfs_allow_helper
 /usr/libexec/cvmfs/authz/cvmfs_deny_helper
 /usr/libexec/cvmfs/cache/cvmfs_cache_ram
+/usr/libexec/cvmfs/cache/cvmfs_cache_posix
 %{_sysconfdir}/auto.cvmfs
 %{_sysconfdir}/cvmfs/config.sh
 %if 0%{?selinux_cvmfs}
@@ -485,13 +531,24 @@ fi
 /sbin/mount.cvmfs
 %dir %{_sysconfdir}/cvmfs/config.d
 %dir %{_sysconfdir}/cvmfs/domain.d
-%dir /cvmfs
 %attr(700,cvmfs,cvmfs) %dir /var/lib/cvmfs
 %{_sysconfdir}/cvmfs/default.d/README
 %config %{_sysconfdir}/cvmfs/default.conf
 %dir %{_sysconfdir}/bash_completion.d
 %config(noreplace) %{_sysconfdir}/bash_completion.d/cvmfs
 %doc COPYING AUTHORS README.md ChangeLog
+
+%if 0%{?build_fuse3}
+%files fuse3
+%defattr(-,root,root)
+%{_libdir}/libcvmfs_fuse3_stub.so
+%{_libdir}/libcvmfs_fuse3_stub.so.%{version}
+%{_libdir}/libcvmfs_fuse3.so
+%{_libdir}/libcvmfs_fuse3.so.%{version}
+%{_libdir}/libcvmfs_fuse3_debug.so
+%{_libdir}/libcvmfs_fuse3_debug.so.%{version}
+%doc COPYING AUTHORS README.md ChangeLog
+%endif
 
 %files devel
 %defattr(-,root,root)
@@ -503,13 +560,18 @@ fi
 
 %files server
 %defattr(-,root,root)
+%{_bindir}/cvmfs_publish
+%{_bindir}/cvmfs_publish_debug
 %{_bindir}/cvmfs_receiver
 %{_bindir}/cvmfs_swissknife
 %{_bindir}/cvmfs_swissknife_debug
 %{_bindir}/cvmfs_suid_helper
 %{_bindir}/cvmfs_server
 %{_bindir}/cvmfs_rsync
-%{_bindir}/cvmfs_stratum_agent
+%{_libdir}/libcvmfs_server.so
+%{_libdir}/libcvmfs_server.so.%{version}
+%{_libdir}/libcvmfs_server_debug.so
+%{_libdir}/libcvmfs_server_debug.so.%{version}
 %{_sysconfdir}/cvmfs/cvmfs_server_hooks.sh.demo
 %dir %{_sysconfdir}/cvmfs/repositories.d
 /var/www/wsgi-scripts/cvmfs-server/cvmfs-api.wsgi
@@ -529,14 +591,25 @@ fi
 %{_bindir}/cvmfs_unittests
 %{_bindir}/cvmfs_test_cache
 %{_bindir}/cvmfs_test_shrinkwrap
+%{_bindir}/cvmfs_test_publish
 %doc COPYING AUTHORS README.md ChangeLog
 
 %if 0%{?build_ducc}
 %files ducc
 %{_bindir}/cvmfs_ducc
+%{_unitdir}/cvmfs_ducc.service
 %endif
 
 %changelog
+* Tue Apr 14 2020 Jan Priessnitz <jan.priessnitz@cern.ch> - 2.7.2
+- Fix python2-devel dependency for Fedora >=31
+- Change to /usr/bin/hardlink for Fedora >=31
+* Thu Oct 03 2019 Jakob Blomer <jblomer@cern.ch> - 2.7.0
+- Add EL8 support
+* Wed Jun 12 2019 Jakob Blomer <jblomer@cern.ch> - 2.7.0
+- Remove cvmfs_stratum_agent
+* Wed Apr 03 2019 Jakob Blomer <jblomer@cern.ch> - 2.7.0
+- Add fuse3 sub package
 * Tue Feb 19 2019 Simone Mosciatti <simone.mosciatti@cern.ch> - 2.6.0
 - Add ducc sub package
 * Wed Sep 26 2018 Jakob Blomer <jblomer@cern.ch> - 2.6.0

@@ -10,10 +10,6 @@ clean_up() {
     rm -rvf /tmp/cvmfs_out_*
 }
 
-check_status() {
-    echo $(( $1 || 0 ))
-}
-
 compare_file_checksum() {
     local file_name=$1
     local target_checksum=$2
@@ -35,23 +31,26 @@ save_repo_contents() {
 run_transactions() {
     set_up_repository_gateway
 
-    echo "Pre-checks"
+    echo "*** Pre-checks"
 
     ## Pre-checks: starting and aborting transactions should leave no trace
+    cvmfs_server transaction test.repo.org  || return 10
+    cvmfs_server abort -f test.repo.org     || return 11
+    cvmfs_server check test.repo.org        || return 12
+
     cvmfs_server transaction test.repo.org
+    mkdir -p /cvmfs/test.repo.org/usr/bin
+    for f in $(find /usr/bin -type f | head -n32); do
+      cp -v $f /cvmfs/test.repo.org/usr/bin/
+    done
     cvmfs_server abort -f test.repo.org
     cvmfs_server check test.repo.org
 
-    cvmfs_server transaction test.repo.org
-    cp -r /usr/bin /cvmfs/test.repo.org
-    cvmfs_server abort -f test.repo.org
-    cvmfs_server check test.repo.org
+    echo "*** Checking transaction + publish"
 
-    echo "Checking transaction + publish"
+    ## Transaction 1 (Modifying existing file and creating files)
 
-    ## Transaction 1 (Modifying existing file and creating a new one)
-
-    echo "  Starting transaction 1"
+    echo "***  Starting transaction 1"
     cvmfs_server transaction test.repo.org
 
     echo "  Writing to a new file"
@@ -61,15 +60,15 @@ run_transactions() {
     echo "test" >> /cvmfs/test.repo.org/new_repository
 
     echo "  Publishing changes 1"
-    cvmfs_server publish test.repo.org
-    cvmfs_server check test.repo.org
+    cvmfs_server publish test.repo.org || return 20
+    cvmfs_server check test.repo.org   || return 21
 
     echo "  Copy the contents of the repository"
     save_repo_contents /tmp/cvmfs_out_1
 
     ## Transaction 2 (Deleting a file and creating a new directory with the same name)
 
-    echo "  Starting transaction 2"
+    echo "***  Starting transaction 2"
     cvmfs_server transaction test.repo.org
 
     echo "  Replacing a file with a directory"
@@ -78,30 +77,30 @@ run_transactions() {
     echo "test" >> /cvmfs/test.repo.org/new_repository/another_file.txt
 
     echo "  Publishing changes 2"
-    cvmfs_server publish test.repo.org
-    cvmfs_server check test.repo.org
+    cvmfs_server publish test.repo.org || return 31
+    cvmfs_server check test.repo.org   || return 32
 
     echo "  Copy the contents of the repository"
     save_repo_contents /tmp/cvmfs_out_2
 
     ## Transaction 3 (Deleting the directory created in the previous transaction)
 
-    echo "  Starting transaction 3"
+    echo "***  Starting transaction 3"
     cvmfs_server transaction test.repo.org
 
     echo "  Deleting a directory"
     rm -rv /cvmfs/test.repo.org/new_repository
 
     echo "  Publishing changes 3"
-    cvmfs_server publish test.repo.org
-    cvmfs_server check test.repo.org
+    cvmfs_server publish test.repo.org || return 41
+    cvmfs_server check test.repo.org   || return 42
 
     echo "  Copy the contents of the repository"
     save_repo_contents /tmp/cvmfs_out_3
 
     ## Transaction 4 (Creating a new deep directory sub-tree)
 
-    echo "  Starting transaction 4"
+    echo "***  Starting transaction 4"
     cvmfs_server transaction test.repo.org
 
     echo "  Create a deep directory hierarchy"
@@ -110,15 +109,15 @@ run_transactions() {
     echo "New file" > /cvmfs/test.repo.org/new
 
     echo "  Publishing changes 4"
-    cvmfs_server publish test.repo.org
-    cvmfs_server check test.repo.org
+    cvmfs_server publish test.repo.org || return 51
+    cvmfs_server check test.repo.org   || return 52
 
     echo "  Copy the contents of the repository"
     save_repo_contents /tmp/cvmfs_out_4
 
     ## Transaction 5 (Creating a new deep directory sub-tree in place of a former file)
 
-    echo "  Starting transaction 5"
+    echo "***  Starting transaction 5"
     cvmfs_server transaction test.repo.org
 
     echo "  Create a deep directory hierarchy"
@@ -127,56 +126,56 @@ run_transactions() {
     echo "New file" > /cvmfs/test.repo.org/new/c/d/new_file.txt
 
     echo "  Publishing changes 5"
-    cvmfs_server publish test.repo.org
-    cvmfs_server check test.repo.org
+    cvmfs_server publish test.repo.org || return 61
+    cvmfs_server check test.repo.org   || return 62
 
     echo "  Copy the contents of the repository"
     save_repo_contents /tmp/cvmfs_out_5
 
     ## Transaction 6 (Lease on a subpath - valid changes)
 
-    echo "  Starting transaction 6"
+    echo "***  Starting transaction 6"
     cvmfs_server transaction test.repo.org/new/c
     echo "New file" > /cvmfs/test.repo.org/new/c/another_file.txt
 
     echo "  Publishing changes 6"
-    cvmfs_server publish test.repo.org
-    cvmfs_server check test.repo.org
+    cvmfs_server publish test.repo.org || return 71
+    cvmfs_server check test.repo.org   || return 72
 
     echo "  Copy the contents of the repository"
     save_repo_contents /tmp/cvmfs_out_6
 
     ## Transaction 7 (Lease on a subpath - changes outside of lease)
 
-    echo "  Starting transaction 7"
+    echo "***  Starting transaction 7"
     cvmfs_server transaction test.repo.org/new/c
     echo "New file" > /cvmfs/test.repo.org/new/invalid_file.txt
 
     echo "  Publishing changes 7"
-    cvmfs_server publish test.repo.org
-    cvmfs_server check test.repo.org
+    cvmfs_server publish test.repo.org || return 81
+    cvmfs_server check test.repo.org   || return 82
 
     echo "  Copy the contents of the repository"
     save_repo_contents /tmp/cvmfs_out_7
 
     ## Transaction 8 (Check creation of auto-tag)
 
-    echo "  Starting transaction 8"
+    echo "***  Starting transaction 8"
     num_tags_before=$(cvmfs_server tag -l test.repo.org | grep -a generic | wc -l)
     cvmfs_server transaction test.repo.org
     echo "New file" > /cvmfs/test.repo.org/marker
 
     echo "  Publishing changes 8"
-    cvmfs_server publish test.repo.org
-    cvmfs_server check test.repo.org
+    cvmfs_server publish test.repo.org || return 90
+    cvmfs_server check test.repo.org   || return 91
 
     echo "  Get list of tags"
     num_tags_after=$(cvmfs_server tag -l test.repo.org | grep -a generic | wc -l)
     num_generic_tags_created=$((num_tags_after - num_tags_before))
 
-    ## Transaction 8 (Check creation of named tag)
+    ## Transaction 9 (Check creation of named tag)
 
-    echo "  Starting transaction 9"
+    echo "***  Starting transaction 9"
     cvmfs_server transaction test.repo.org
     echo "New file" > /cvmfs/test.repo.org/marker
 
@@ -188,45 +187,75 @@ run_transactions() {
     echo "  Check that the named tag has been created"
     specialtag_line=$(cvmfs_server tag -l test.repo.org | grep specialtag)
 
+    ## Transaction 10 (Lease on a subpath with trailing slash)
+    ## Very similar to transaction 6, but note the trailing slash after the
+    ## directory
+    echo "***  Starting transaction 10"
+    cvmfs_server transaction test.repo.org/new/c/
+    echo "New file" > /cvmfs/test.repo.org/new/c/another_file_trailing.txt
+
+    echo "  Publishing changes 10"
+    cvmfs_server publish test.repo.org || return 92
+    cvmfs_server check test.repo.org   || return 93
+
+    echo "  Copy the contents of the repository"
+    save_repo_contents /tmp/cvmfs_out_10
+
     ## Check results
 
     if [ $? -ne 0 ]; then
         echo "Repository integrity check failed: $integrity_check_res"
-        return 1
+        return 95
     fi
 
-    compare_file_checksum /tmp/cvmfs_out_1/new_file.txt d8e8fca2dc0f896fd7cb4cb0031ba249
-    compare_file_checksum /tmp/cvmfs_out_1/new_repository e5747677debcb10cabe17d87a40e7fa4
+    compare_file_checksum /tmp/cvmfs_out_1/new_file.txt d8e8fca2dc0f896fd7cb4cb0031ba249 || return 101
+    compare_file_checksum /tmp/cvmfs_out_1/new_repository e5747677debcb10cabe17d87a40e7fa4 || return 102
 
-    compare_file_checksum /tmp/cvmfs_out_2/new_repository/another_file.txt d8e8fca2dc0f896fd7cb4cb0031ba249
+    compare_file_checksum /tmp/cvmfs_out_2/new_repository/another_file.txt d8e8fca2dc0f896fd7cb4cb0031ba249 || return 103
 
     if [ -d /tmp/cvmfs_out_3/new_repository ]; then
         echo "/cvmfs/test.repo.org/new_repository should have been deleted in transaction 3"
         return 1
     fi
 
-    compare_file_checksum /tmp/cvmfs_out_4/a/b/new_file.txt f1885b1a57c71cacbd923fc5e9aefef3
+    compare_file_checksum /tmp/cvmfs_out_4/a/b/new_file.txt f1885b1a57c71cacbd923fc5e9aefef3 || return 104
 
-    compare_file_checksum /tmp/cvmfs_out_5/new/c/d/new_file.txt f1885b1a57c71cacbd923fc5e9aefef3
+    compare_file_checksum /tmp/cvmfs_out_5/new/c/d/new_file.txt f1885b1a57c71cacbd923fc5e9aefef3 || return 105
 
-    compare_file_checksum /tmp/cvmfs_out_6/new/c/another_file.txt f1885b1a57c71cacbd923fc5e9aefef3
+    compare_file_checksum /tmp/cvmfs_out_6/new/c/another_file.txt f1885b1a57c71cacbd923fc5e9aefef3 || return 106
+
+    compare_file_checksum /tmp/cvmfs_out_10/new/c/another_file_trailing.txt f1885b1a57c71cacbd923fc5e9aefef3 || return 107
 
     if [ -f /tmp/cvmfs_out_7/new/invalid_file.txt ]; then
         echo "/cvmfs/test.repo.org/new/invalid_file.txt should not have been create in transaction 7"
-        return 1
+        return 110
     fi
 
     if [ $num_generic_tags_created -lt 1 ]; then
       echo "Autotags were not created during transaction 8"
-      return 1
+      return 110
     fi
 
     if [ x"$specialtag_line" = x"" ]; then
       echo "Named tag was not created during transaction 9"
-      return 1
+      return 110
     fi
 
+    check_repo_integrity test.repo.org || return 110
+
+    local reflog_url="$(get_repo_url test.repo.org)/.cvmfsreflog"
+    curl -s $reflog_url > reflog.db
+    sqlite3 reflog.db "select hash from refs where type=0;" | sort | uniq > reflog_catalogs.txt
+    if running_on_s3 ; then
+        local repo_storage=${CVMFS_TEST_S3_STORAGE}/test.repo.org
+    else
+        local repo_storage=$(get_local_repo_storage test.repo.org)
+    fi
+    find ${repo_storage}/data -type f -name *C 2>/dev/null | rev | cut -d"/" -f 1-2 | rev | tr -d "/C" | sort | uniq > actual_catalogs.txt
+    diff reflog_catalogs.txt actual_catalogs.txt || return 111
+
     clean_up
+    return 0
 }
 
 cvmfs_run_test() {
@@ -235,6 +264,6 @@ cvmfs_run_test() {
     run_transactions
     local status=$?
 
-    return $(check_status $status)
+    return $status
 }
 

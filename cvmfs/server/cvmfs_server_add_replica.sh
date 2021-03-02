@@ -22,10 +22,11 @@ cvmfs_server_add_replica() {
   local enable_auto_gc=0
   local s3_config
   local snapshot_group
+  local is_passthrough=0
 
   # optional parameter handling
   OPTIND=1
-  while getopts "o:u:n:w:azs:pg:" option
+  while getopts "o:u:n:w:azs:pg:P" option
   do
     case $option in
       u)
@@ -55,6 +56,9 @@ cvmfs_server_add_replica() {
       g)
         snapshot_group=$OPTARG
       ;;
+      P)
+        is_passthrough=1
+      ;;
       ?)
         shift $(($OPTIND-2))
         usage "Command add-replica: Unrecognized option: $1"
@@ -64,10 +68,15 @@ cvmfs_server_add_replica() {
 
    # get stratum0 url and path of public key
   shift $(($OPTIND-1))
-  check_parameter_count 2 $#
 
-  stratum0=$1
-  public_key=$2
+  if [ $is_passthrough -eq 0 ]; then
+    check_parameter_count 2 $#
+    stratum0=$1
+    public_key=$2
+  else
+    check_parameter_count 1 $#
+    stratum0=$1
+  fi
 
   # get the name of the repository pointed to by $stratum0
   name=$(get_repo_info_from_url $stratum0 -L -n) || die "Failed to access Stratum0 repository at $stratum0"
@@ -87,6 +96,11 @@ cvmfs_server_add_replica() {
     else
       die "There is already a Stratum1 repository $alias_name"
     fi
+  fi
+
+  if [ $is_passthrough -eq 1 ]; then
+    [ -z "$upstream" ] || die "Pass-through repository and non-default upstream storage are mutually exclusive"
+    [ $enable_auto_gc -eq 0 ] || die "Pass-through repository and garbage collection are mutually exclusive"
   fi
 
   # upstream generation (defaults to local upstream)
@@ -122,16 +136,21 @@ cvmfs_server_add_replica() {
   check_user $cvmfs_user || die "No user $cvmfs_user"
   check_upstream_validity $upstream
   if is_local_upstream $upstream; then
+    _update_geodb -l
     if [ $silence_httpd_warning -eq 0 ]; then
       check_apache || die "Apache must be installed and running"
       check_wsgi_module
       if [ x"$cvmfs_user" != x"root" ]; then
         echo "NOTE: If snapshot is not run regularly as root, the GeoIP database will not be updated."
-        echo "      You have three options:"
-        echo "      1. chown -R $CVMFS_UPDATEGEO_DIR accordingly OR"
-        echo "      2. run update-geodb monthly as root OR"
-        echo "      3. chown -R $CVMFS_UPDATEGEO_DIR to a dedicated"
-        echo "         user ID and run update-geodb monthly as that user"
+        echo "  You have some options:"
+        echo "    1. chown -R $CVMFS_UPDATEGEO_DIR accordingly"
+        echo "    2. Run update-geodb from cron as root"
+        echo "    3. chown -R $CVMFS_UPDATEGEO_DIR to a dedicated"
+        echo "       user ID and run update-geodb monthly as that user"
+        echo "    4. Use another update tool such as Maxmind's geoipupdate and"
+        echo "       set CVMFS_GEO_DB_FILE to point to the downloaded file"
+        echo "    5. Disable the geo api with CVMFS_GEO_DB_FILE=none"
+        echo "  See 'Geo API Setup' in the cvmfs documentation for more info."
       fi
     else
       check_apache || echo "Warning: Apache is needed to access this CVMFS replication"
@@ -152,13 +171,20 @@ CVMFS_STRATUM1=$stratum1
 CVMFS_UPSTREAM_STORAGE=$upstream
 CVMFS_SNAPSHOT_GROUP=$snapshot_group
 EOF
-  cat > /etc/cvmfs/repositories.d/${alias_name}/replica.conf << EOF
+  if [ $is_passthrough -eq 1 ]; then
+    cat > /etc/cvmfs/repositories.d/${alias_name}/replica.conf << EOF
+# Created by cvmfs_server.
+CVMFS_PASSTHROUGH=true
+EOF
+  else
+    cat > /etc/cvmfs/repositories.d/${alias_name}/replica.conf << EOF
 # Created by cvmfs_server.
 CVMFS_NUM_WORKERS=16
 CVMFS_PUBLIC_KEY=$public_key
 CVMFS_HTTP_TIMEOUT=10
 CVMFS_HTTP_RETRIES=3
 EOF
+  fi
 
   # append GC specific configuration
   if [ $enable_auto_gc != 0 ]; then
@@ -170,7 +196,6 @@ EOF
   echo "done"
 
   if is_local_upstream $upstream; then
-    _update_geodb -l
     create_global_info_skeleton
 
     echo -n "Create CernVM-FS Storage... "
@@ -181,12 +206,19 @@ EOF
     if [ $configure_apache -eq 1 ]; then
       echo -n "Update Apache configuration... "
       ensure_enabled_apache_modules
-      create_apache_config_for_endpoint $alias_name $storage_dir "with wsgi"
+      if [ $is_passthrough -eq 1 ]; then
+        check_proxy_module
+        create_apache_proxy_config_for_endpoint $alias_name $stratum0 "with wsgi"
+      else
+        create_apache_config_for_endpoint $alias_name $storage_dir "with wsgi"
+      fi
       create_apache_config_for_global_info
       reload_apache > /dev/null
-      touch $storage_dir/.cvmfsempty
-      wait_for_apache "${stratum1}/.cvmfsempty" || die "fail (Apache configuration)"
-      rm -f $storage_dir/.cvmfsempty
+      if [ $is_passthrough -eq 0 ]; then
+        touch $storage_dir/.cvmfsempty
+        wait_for_apache "${stratum1}/.cvmfsempty" || die "fail (Apache configuration)"
+        rm -f $storage_dir/.cvmfsempty
+      fi
       echo "done"
     fi
   fi
@@ -206,11 +238,13 @@ EOF
 
   syncfs
 
-  echo "\
+  if [ $is_passthrough -eq 0 ]; then
+    echo "\
 
 Use 'cvmfs_server snapshot' to replicate $alias_name.
 Make sure to install the repository public key in /etc/cvmfs/keys/
 You might have to add the key in /etc/cvmfs/repositories.d/${alias_name}/replica.conf"
+  fi
 }
 
 

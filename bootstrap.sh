@@ -2,18 +2,17 @@
 
 set -e
 
-SSL_VERSION=2.4.4
-CARES_VERSION=1.15.0
-CURL_VERSION=7.63.0
+SSL_VERSION=3.1.2
+CARES_VERSION=1.16.1
+CURL_VERSION=7.71.1
 PACPARSER_VERSION=1.3.5
 ZLIB_VERSION=1.2.8
 SPARSEHASH_VERSION=1.12
 LEVELDB_VERSION=1.18
 GOOGLETEST_VERSION=1.8.0
 IPADDRESS_VERSION=1.0.22
-MAXMINDDB_VERSION=1.4.0
+MAXMINDDB_VERSION=1.5.4
 PROTOBUF_VERSION=2.6.1
-MONGOOSE_VERSION=3.8
 RAPIDCHECK_VERSION=0.0
 LIBARCHIVE_VERSION=3.3.2
 
@@ -153,8 +152,9 @@ build_lib() {
       ;;
     pacparser)
       do_extract "pacparser"    "pacparser-${PACPARSER_VERSION}.tar.gz"
-      patch_external "pacparser"   "fix_find_proxy_ex.patch"            \
-                                   "fix_cflags.patch"
+      patch_external "pacparser"   "fix_find_proxy_ex.patch" \
+                                   "fix_cflags.patch"        \
+                                   "fix_python.patch"
       do_build "pacparser"
       ;;
     zlib)
@@ -220,11 +220,6 @@ build_lib() {
       do_copy "sha3"
       do_build "sha3"
       ;;
-    mongoose)
-      do_extract "mongoose" "mongoose-${MONGOOSE_VERSION}.tar.gz"
-      patch_external "mongoose" "keep_sigchld.patch"
-      do_build "mongoose"
-      ;;
     rapidcheck)
       if [ x"$BUILD_QC_TESTS" != x"" ]; then
         do_extract "rapidcheck" "rapidcheck-${RAPIDCHECK_VERSION}.tar.gz"
@@ -245,7 +240,7 @@ build_lib() {
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 # Build a list of libs that need to be built
-missing_libs="libcurl pacparser zlib sparsehash leveldb googletest ipaddress maxminddb protobuf googlebench sqlite3 vjson sha2 sha3 mongoose libarchive"
+missing_libs="libcurl pacparser zlib sparsehash leveldb googletest ipaddress maxminddb protobuf googlebench sqlite3 vjson sha2 sha3 libarchive"
 if [ x"$BUILD_QC_TESTS" != x"" ]; then
     missing_libs="$missing_libs rapidcheck"
 fi
@@ -254,9 +249,12 @@ if [ -f $externals_install_dir/.bootstrapDone ]; then
   existing_libs=$(cat $externals_install_dir/.bootstrapDone)
   for l in $existing_libs; do
     if [ x"$l" != x ]; then
+      echo "Bootstrap - found $l"
       missing_libs=$(echo $missing_libs | sed -e "s/$l//")
     fi
   done
+else
+  echo "Bootstrap - clean build"
 fi
 
 mkdir -p $externals_build_dir
@@ -269,7 +267,7 @@ for l in $existing_libs; do
 done
 
 if [ x"$missing_libs" != x ]; then
-  echo "Bulding libraries: $missing_libs"
+  echo "Building libraries: $missing_libs"
 fi
 
 for l in $missing_libs; do

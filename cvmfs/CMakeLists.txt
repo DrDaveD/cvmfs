@@ -1,9 +1,18 @@
 #
-# Define the sources needed to compile the different
-# executables in this directory
+# This file is part of the CernVM File System
 #
 
-set (CVMFS_LOADER_SOURCES
+# /usr/bin/cvmfs2
+set (CVMFS2_BINARY_SOURCES
+  fuse_main.cc
+  logging.cc
+  util/exception.cc
+  util/posix.cc
+  util/string.cc
+)
+
+# /usr/lib/libcvmfs_fuse_stub[3]
+set (CVMFS_STUB_SOURCES
   globals.cc
   hash.cc
   loader.cc
@@ -12,10 +21,12 @@ set (CVMFS_LOADER_SOURCES
   options.cc
   sanitizer.cc
   statistics.cc
+  util/exception.cc
   util/posix.cc
   util/string.cc
 )
 
+# /usr/lib/libcvmfs_fuse[3] and /usr/lib/libcvmfs.a
 set (CVMFS_CLIENT_SOURCES
   authz/authz.cc
   authz/authz_curl.cc
@@ -36,6 +47,7 @@ set (CVMFS_CLIENT_SOURCES
   clientctx.cc
   compression.cc
   directory_entry.cc
+  duplex_fuse.cc
   dns.cc
   download.cc
   fetch.cc
@@ -49,6 +61,7 @@ set (CVMFS_CLIENT_SOURCES
   json_document.cc
   kvstore.cc
   logging.cc
+  magic_xattr.cc
   malloc_arena.cc
   malloc_heap.cc
   manifest.cc
@@ -68,6 +81,7 @@ set (CVMFS_CLIENT_SOURCES
   tracer.cc
   uuid.cc
   util/algorithm.cc
+  util/exception.cc
   util/posix.cc
   util/string.cc
   util_concurrency.cc
@@ -85,6 +99,10 @@ else(APPLE)
   endif(CVMFS_ENABLE_INOTIFY)
 endif (APPLE)
 
+if (CVMFS_ENABLE_FUSE3_CACHE_READDIR)
+  add_definitions(-DCVMFS_ENABLE_FUSE3_CACHE_READDIR)
+endif()
+
 # First .h then .cc is important to avoid races during the build process
 set_source_files_properties(cache.pb.h cache.pb.cc
                             PROPERTIES GENERATED true)
@@ -100,7 +118,8 @@ add_custom_command(OUTPUT cache.pb.h cache.pb.cc
 add_custom_target(cache.pb.generated
                   DEPENDS cache.pb.h cache.pb.cc)
 
-set (CVMFS2_DEBUG_SOURCES
+# /usr/lib/libcvmfs_fuse[3]_debug
+set (CVMFS_FUSE_SOURCES
   ${CVMFS_CLIENT_SOURCES}
 
   auto_umount.cc
@@ -120,10 +139,7 @@ set (CVMFS2_DEBUG_SOURCES
   url.cc
 )
 
-set (CVMFS2_SOURCES
-  ${CVMFS2_DEBUG_SOURCES}
-)
-
+# /usr/lib/libcvmfs.a
 set (LIBCVMFS_SOURCES
   ${CVMFS_CLIENT_SOURCES}
 
@@ -137,6 +153,7 @@ set (TEST_LIBCVMFS_SOURCES
   test_libcvmfs.cc
 )
 
+# /usr/lib/libcvmfs_cache.a
 set (LIBCVMFS_CACHE_SOURCES
   cache.pb.cc cache.pb.h
   cache_plugin/libcvmfs_cache.cc
@@ -148,6 +165,7 @@ set (LIBCVMFS_CACHE_SOURCES
   monitor.cc
   options.cc
   sanitizer.cc
+  util/exception.cc
   util/posix.cc
   util/string.cc
   util_concurrency.cc
@@ -163,6 +181,21 @@ set (CVMFS_CACHE_RAM_SOURCES
   malloc_heap.cc
   statistics.cc
   util_concurrency.cc
+  util/exception.cc
+  util/posix.cc
+  util/string.cc
+)
+
+set (CVMFS_CACHE_POSIX_SOURCES
+  cache_plugin/cvmfs_cache_posix.cc
+  cache.cc
+  cache_posix.cc
+  compression.cc
+  hash.cc
+  logging.cc
+  manifest.cc
+  quota.cc
+  util/exception.cc
   util/posix.cc
   util/string.cc
 )
@@ -173,6 +206,7 @@ set (CVMFS_FSCK_SOURCES
   hash.cc
   logging.cc
   statistics.cc
+  util/exception.cc
   util/posix.cc
   util/string.cc
 )
@@ -182,6 +216,7 @@ set (CVMFS_TALK_SOURCES
   logging.cc
   options.cc
   sanitizer.cc
+  util/exception.cc
   util/posix.cc
   util/string.cc
 )
@@ -200,9 +235,127 @@ set (CVMFS_SHRINKWRAP_SOURCES
   shrinkwrap/spec_tree.cc
   shrinkwrap/util.cc
   statistics.cc
+  util/exception.cc
   util/posix.cc
   util/string.cc
   util_concurrency.cc
+  xattr.cc
+)
+
+# TODO(jblomer) Rename to cvmfs_server
+set (CVMFS_PUBLISH_SOURCES
+  backoff.cc
+  compression.cc
+  directory_entry.cc
+  dns.cc
+  download.cc
+  hash.cc
+  logging.cc
+  manifest.cc
+  options.cc
+  publish/cmd_diff.cc
+  publish/cmd_enter.cc
+  publish/cmd_hash.cc
+  publish/cmd_help.cc
+  publish/cmd_info.cc
+  publish/cmd_mkfs.cc
+  publish/cmd_transaction.cc
+  publish/cmd_util.cc
+  publish/cmd_zpipe.cc
+  publish/command.cc
+  publish/except.cc
+  publish/main.cc
+  publish/settings.cc
+  sanitizer.cc
+  signature.cc
+  statistics.cc
+  upload_spooler_definition.cc
+  util/algorithm.cc
+  util/exception.cc
+  util/namespace.cc
+  util/posix.cc
+  util/string.cc
+  whitelist.cc
+)
+
+set (LIBCVMFS_SERVER_SOURCES
+  backoff.cc
+  catalog.cc
+  catalog_counters.cc
+  catalog_rw.cc
+  catalog_sql.cc
+  catalog_mgr_ro.cc
+  catalog_mgr_rw.cc
+  catalog_virtual.cc
+  compression.cc
+  directory_entry.cc
+  dns.cc
+  download.cc
+  gateway_util.cc
+  globals.cc
+  hash.cc
+  history_sql.cc
+  history_sqlite.cc
+  ingestion/chunk_detector.cc
+  ingestion/item.cc
+  ingestion/item_mem.cc
+  ingestion/pipeline.cc
+  ingestion/task_chunk.cc
+  ingestion/task_compress.cc
+  ingestion/task_hash.cc
+  ingestion/task_read.cc
+  ingestion/task_register.cc
+  ingestion/task_write.cc
+  json_document.cc
+  logging.cc
+  manifest.cc
+  manifest_fetch.cc
+  malloc_arena.cc
+  options.cc
+  pack.cc
+  publish/except.cc
+  publish/repository.cc
+  publish/repository_env.cc
+  publish/repository_diff.cc
+  publish/repository_managed.cc
+  publish/repository_session.cc
+  publish/repository_tags.cc
+  publish/repository_transaction.cc
+  publish/repository_util.cc
+  publish/settings.cc
+  reflog.cc
+  reflog_sql.cc
+  s3fanout.cc
+  sanitizer.cc
+  session_context.cc
+  signature.cc
+  sql.cc
+  sqlitemem.cc
+  statistics.cc
+  swissknife_assistant.cc
+  swissknife_lease_curl.cc
+  sync_item.cc
+  sync_item_tar.cc
+  sync_mediator.cc
+  sync_union.cc
+  sync_union_aufs.cc
+  sync_union_overlayfs.cc
+  sync_union_tarball.cc
+  upload.cc
+  upload_facility.cc
+  upload_gateway.cc
+  upload_local.cc
+  upload_s3.cc
+  upload_spooler_definition.cc
+  util_concurrency.cc
+  util/algorithm.cc
+  util/exception.cc
+  util/file_backed_buffer.cc
+  util/mmap_file.cc
+  util/posix.cc
+  util/raii_temp_dir.cc
+  util/string.cc
+  whitelist.cc
   xattr.cc
 )
 
@@ -242,6 +395,7 @@ set (CVMFS_SWISSKNIFE_SOURCES
   malloc_arena.cc
   manifest.cc
   manifest_fetch.cc
+  monitor.cc
   notify/cmd_pub.cc
   notify/cmd_sub.cc
   notify/messages.cc
@@ -273,11 +427,8 @@ set (CVMFS_SWISSKNIFE_SOURCES
   swissknife_assistant.cc
   swissknife_capabilities.cc
   swissknife_check.cc
-  swissknife_diff.cc
-  swissknife_diff_tool.cc
   swissknife_gc.cc
   swissknife_graft.cc
-  swissknife_hash.cc
   swissknife_history.cc
   swissknife_info.cc
   swissknife_ingest.cc
@@ -285,12 +436,14 @@ set (CVMFS_SWISSKNIFE_SOURCES
   swissknife_lease_curl.cc
   swissknife_lease_json.cc
   swissknife_letter.cc
+  swissknife_list_reflog.cc
   swissknife_lsrepo.cc
   swissknife_main.cc
   swissknife_migrate.cc
   swissknife_notify.cc
   swissknife_pull.cc
   swissknife_reflog.cc
+  swissknife_filestats.cc
   swissknife_scrub.cc
   swissknife_sign.cc
   swissknife_sync.cc
@@ -310,6 +463,8 @@ set (CVMFS_SWISSKNIFE_SOURCES
   upload_spooler_definition.cc
   url.cc
   util/algorithm.cc
+  util/exception.cc
+  util/file_backed_buffer.cc
   util/mmap_file.cc
   util/posix.cc
   util/string.cc
@@ -317,10 +472,6 @@ set (CVMFS_SWISSKNIFE_SOURCES
   util_concurrency.cc
   whitelist.cc
   xattr.cc
-)
-
-set (CVMFS_SWISSKNIFE_DEBUG_SOURCES
-  ${CVMFS_SWISSKNIFE_SOURCES}
 )
 
 set (CVMFS_SUID_HELPER_SOURCES
@@ -383,6 +534,8 @@ set (CVMFS_PRELOADER_SOURCES
   upload_s3.cc
   upload_spooler_definition.cc
   util/algorithm.cc
+  util/exception.cc
+  util/file_backed_buffer.cc
   util/mmap_file.cc
   util/posix.cc
   util/string.cc
@@ -392,29 +545,11 @@ set (CVMFS_PRELOADER_SOURCES
   xattr.cc
 )
 
-set (CVMFS_STRATUM_AGENT_SOURCES
-  compression.cc
-  dns.cc
-  download.cc
-  hash.cc
-  letter.cc
-  logging.cc
-  options.cc
-  pathspec/pathspec.cc
-  pathspec/pathspec_pattern.cc
-  sanitizer.cc
-  signature.cc
-  statistics.cc
-  stratum_agent/stratum_agent.cc
-  stratum_agent/uri_map.cc
-  util/algorithm.cc
-  util/posix.cc
-  util/string.cc
-  util_concurrency.cc
-  uuid.cc
-  whitelist.cc
-)
-
+if(NOT BUILD_RECEIVER)
+  if(BUILD_RECEIVER_DEBUG)
+    message( FATAL_ERROR "BUILD_RECEIVER needs to be on with BUILD_RECEIVER_DEBUG set. Exiting." )
+  endif(BUILD_RECEIVER_DEBUG)
+endif(NOT BUILD_RECEIVER)
 
 if(BUILD_RECEIVER)
   set (CVMFS_RECEIVER_SOURCES
@@ -457,6 +592,7 @@ if(BUILD_RECEIVER)
     malloc_arena.cc
     manifest.cc
     manifest_fetch.cc
+    monitor.cc
     options.cc
     pack.cc
     reflog.cc
@@ -469,6 +605,7 @@ if(BUILD_RECEIVER)
     signature.cc
     signing_tool.cc
     statistics.cc
+    statistics_database.cc
     swissknife.cc
     swissknife_history.cc
     swissknife_lease_curl.cc
@@ -482,6 +619,8 @@ if(BUILD_RECEIVER)
     upload_s3.cc
     upload_spooler_definition.cc
     util/algorithm.cc
+    util/exception.cc
+    util/file_backed_buffer.cc
     util/mmap_file.cc
     util/posix.cc
     util/string.cc
@@ -493,41 +632,51 @@ if(BUILD_RECEIVER)
     )
 
   add_executable(cvmfs_receiver ${CVMFS_RECEIVER_SOURCES})
-  target_link_libraries(cvmfs_receiver ${CURL_LIBRARIES} ${CARES_LIBRARIES}
+  target_link_libraries(cvmfs_receiver ${CURL_LIBRARIES} ${CARES_LIBRARIES} ${CARES_LDFLAGS}
                         ${SHA3_LIBRARIES} ${SQLITE3_LIBRARY} ${VJSON_LIBRARIES}
                         ${OPENSSL_LIBRARIES} ${UUID_LIBRARIES} ${ZLIB_LIBRARIES}
                         ${RT_LIBRARY} ${LibArchive_LIBRARY} pthread dl)
 
-  set (CVMFS_RECEIVER_CFLAGS "${CMAKE_CXX_FLAGS} -D_FILE_OFFSET_BITS=64 -fexceptions")
+  set (CVMFS_RECEIVER_CFLAGS "${CMAKE_CXX_FLAGS} -D_FILE_OFFSET_BITS=64 -DCVMFS_LIBCVMFS -DCVMFS_RAISE_EXCEPTIONS -fexceptions")
   set_target_properties (cvmfs_receiver PROPERTIES COMPILE_FLAGS "${CVMFS_RECEIVER_CFLAGS}")
 
+  if(BUILD_RECEIVER_DEBUG)
+    add_executable(cvmfs_receiver_debug ${CVMFS_RECEIVER_SOURCES})
+    target_link_libraries(cvmfs_receiver_debug
+                          ${CURL_LIBRARIES} ${CARES_LIBRARIES} ${CARES_LDFLAGS}
+                          ${SHA3_LIBRARIES} ${SQLITE3_LIBRARY} ${VJSON_LIBRARIES}
+                          ${OPENSSL_LIBRARIES} ${UUID_LIBRARIES} ${ZLIB_LIBRARIES}
+                          ${RT_LIBRARY} ${LibArchive_LIBRARY} pthread dl)
+
+    set (CVMFS_RECEIVER_DEBUG_CFLAGS "${CVMFS_RECEIVER_CFLAGS} -DDEBUGMSG -g -O0")
+    set_target_properties (cvmfs_receiver_debug PROPERTIES COMPILE_FLAGS "${CVMFS_RECEIVER_DEBUG_CFLAGS}")
+  endif(BUILD_RECEIVER_DEBUG)
 endif(BUILD_RECEIVER)
 
 #
 # configure some compiler flags for proper build
 #
 
-set (CVMFS_LOADER_CFLAGS "${CVMFS_LOADER_CFLAGS} -DCVMFS_CLIENT -DCVMFS_NAMESPACE_GUARD=loader")
-
-set (CVMFS2_CFLAGS "${CVMFS2_CFLAGS} -DCVMFS_CLIENT -D_FILE_OFFSET_BITS=64 -fexceptions")
-set (CVMFS2_DEBUG_CFLAGS "${CVMFS2_DEBUG_CFLAGS} ${CVMFS2_CFLAGS} -D_FILE_OFFSET_BITS=64 -O0 -DDEBUGMSG")
-
-set (CVMFS_SWISSKNIFE_DEBUG_CFLAGS "${CVMFS_SWISSKNIFE_DEBUG_CFLAGS} -DDEBUGMSG -g -O0")
-
-set (CVMFS_FSCK_CFLAGS "${CVMFS_FSCK_CFLAGS} -DCVMFS_CLIENT")
-
-set (CVMFS_TALK_CFLAGS "${CVMFS_TALK_CFLAGS} -DCVMFS_CLIENT")
-
-set (LIBCVMFS_CFLAGS "${LIBCVMFS_CFLAGS} -D_FILE_OFFSET_BITS=64 -DCVMFS_CLIENT -DCVMFS_LIBCVMFS -fexceptions")
-
-set (LIBCVMFS_CACHE_CFLAGS "${LIBCVMFS_CACHE_CFLAGS} -D_FILE_OFFSET_BITS=64 -DCVMFS_CLIENT -DCVMFS_LIBCVMFS -fexceptions")
-
-set (CVMFS_SHRINKWRAP_CFLAGS "${CVMFS_SHRINKWRAP_CFLAGS} -D_FILE_OFFSET_BITS=64 -DCVMFS_CLIENT -DCVMFS_LIBCVMFS -fexceptions")
+set (CVMFS2_BINARY_CFLAGS "-DCVMFS_NAMESPACE_GUARD=stub -DCVMFS_FUSE_MODULE")
+set (CVMFS_FUSE_CFLAGS "-DCVMFS_CLIENT -DCVMFS_FUSE_MODULE -DCVMFS_USE_LIBFUSE=2 -D_FILE_OFFSET_BITS=64 -fexceptions")
+set (CVMFS_FUSE3_CFLAGS "-DCVMFS_CLIENT -DCVMFS_FUSE_MODULE -DCVMFS_USE_LIBFUSE=3 -D_FILE_OFFSET_BITS=64 -fexceptions")
+set (CVMFS_FUSE_DEBUG_CFLAGS "${CVMFS_FUSE_CFLAGS} -O0 -DDEBUGMSG")
+set (CVMFS_FUSE3_DEBUG_CFLAGS "${CVMFS_FUSE3_CFLAGS} -O0 -DDEBUGMSG")
+set (CVMFS_STUB_CFLAGS "-DCVMFS_CLIENT -DCVMFS_FUSE_MODULE -DCVMFS_NAMESPACE_GUARD=loader -DCVMFS_USE_LIBFUSE=2 -D_FILE_OFFSET_BITS=64 -fexceptions")
+set (CVMFS_STUB3_CFLAGS "-DCVMFS_CLIENT -DCVMFS_FUSE_MODULE -DCVMFS_NAMESPACE_GUARD=loader -DCVMFS_USE_LIBFUSE=3 -D_FILE_OFFSET_BITS=64 -fexceptions")
+set (CVMFS_FSCK_CFLAGS "-DCVMFS_CLIENT")
+set (CVMFS_TALK_CFLAGS "-DCVMFS_CLIENT")
+set (LIBCVMFS_CFLAGS "-D_FILE_OFFSET_BITS=64 -DCVMFS_CLIENT -DCVMFS_LIBCVMFS -fexceptions -fPIC")
+set (LIBCVMFS_CACHE_CFLAGS "-D_FILE_OFFSET_BITS=64 -DCVMFS_CLIENT -DCVMFS_LIBCVMFS -fexceptions")
+set (CVMFS_SHRINKWRAP_CFLAGS "-D_FILE_OFFSET_BITS=64 -DCVMFS_CLIENT -DCVMFS_LIBCVMFS -fexceptions")
+set (CVMFS_SWISSKNIFE_CFLAGS "-DCVMFS_SWISSKNIFE")
 
 #
 # set some include and linking stuff
 #
-set (CVMFS2_LD_FLAGS "${CVMFS2_LD_FLAGS} -ldl -lm")
+set (CVMFS2_BINARY_LD_FLAGS "-ldl")
+set (CVMFS_FUSE_LD_FLAGS "-ldl -lm")
+set (CVMFS_STUB_LD_FLAGS "-ldl -lm")
 include_directories (cvmfs ${CMAKE_CURRENT_BINARY_DIR} ${INCLUDE_DIRECTORIES})
 
 #
@@ -538,28 +687,60 @@ include_directories (cvmfs ${CMAKE_CURRENT_BINARY_DIR} ${INCLUDE_DIRECTORIES})
 #
 
 if (BUILD_CVMFS)
-  add_executable (cvmfs2 ${CVMFS_LOADER_SOURCES})
-  add_library (cvmfs_fuse_debug SHARED  ${CVMFS2_DEBUG_SOURCES})
-  add_library (cvmfs_fuse SHARED ${CVMFS2_SOURCES})
+  add_executable (cvmfs2 ${CVMFS2_BINARY_SOURCES})
+  add_library (cvmfs_fuse_stub SHARED ${CVMFS_STUB_SOURCES})
+  add_library (cvmfs_fuse_debug SHARED ${CVMFS_FUSE_SOURCES})
+  add_library (cvmfs_fuse SHARED ${CVMFS_FUSE_SOURCES})
   add_dependencies (cvmfs_fuse_debug cache.pb.generated)
   add_dependencies (cvmfs_fuse cache.pb.generated)
+  if (FUSE3_FOUND)
+    add_library (cvmfs_fuse3_stub SHARED ${CVMFS_STUB_SOURCES})
+    add_library (cvmfs_fuse3_debug SHARED ${CVMFS_FUSE_SOURCES})
+    add_library (cvmfs_fuse3 SHARED ${CVMFS_FUSE_SOURCES})
+    add_dependencies (cvmfs_fuse3_debug cache.pb.generated)
+    add_dependencies (cvmfs_fuse3 cache.pb.generated)
+  endif()
+
   add_executable (cvmfs_fsck ${CVMFS_FSCK_SOURCES})
   add_executable (cvmfs_talk ${CVMFS_TALK_SOURCES})
 
-  # set some properties
-  set (CVMFS_LOADER_LD_FLAGS "${CVMFS_LOADER_LD_FLAGS} -ldl -lm")
-  set_target_properties (cvmfs2 PROPERTIES COMPILE_FLAGS "${CVMFS_LOADER_CFLAGS}" LINK_FLAGS "${CVMFS_LOADER_LD_FLAGS}")
-  set_target_properties (cvmfs_fuse_debug PROPERTIES COMPILE_FLAGS "${CVMFS2_DEBUG_CFLAGS}" LINK_FLAGS "${CVMFS2_LD_FLAGS} ${CVMFS2_DEBUG_LD_FLAGS}")
-  set_target_properties (cvmfs_fuse PROPERTIES COMPILE_FLAGS "${CVMFS2_CFLAGS}" LINK_FLAGS "${CVMFS2_LD_FLAGS}")
-  set_target_properties (cvmfs_fsck PROPERTIES COMPILE_FLAGS "${CVMFS_FSCK_CFLAGS}" LINK_FLAGS "${CVMFS_FSCK_LD_FLAGS}")
-  set_target_properties (cvmfs_talk PROPERTIES COMPILE_FLAGS "${CVMFS_TALK_CFLAGS}" LINK_FLAGS "${CVMFS_TALK_LD_FLAGS}")
+  set_target_properties (cvmfs2 PROPERTIES COMPILE_FLAGS "${CVMFS2_BINARY_CFLAGS}"
+                                           LINK_FLAGS "${CVMFS2_BINARY_LD_FLAGS}")
+  set_target_properties (cvmfs_fuse_stub PROPERTIES
+                                         COMPILE_FLAGS "${CVMFS_STUB_CFLAGS}"
+                                         LINK_FLAGS "${CVMFS_STUB_LD_FLAGS}")
+  set_target_properties (cvmfs_fuse_debug PROPERTIES
+                                          COMPILE_FLAGS "${CVMFS_FUSE_DEBUG_CFLAGS}"
+                                          LINK_FLAGS "${CVMFS_FUSE_DEBUG_LD_FLAGS}")
+  set_target_properties (cvmfs_fuse PROPERTIES COMPILE_FLAGS "${CVMFS_FUSE_CFLAGS}"
+                                               LINK_FLAGS "${CVMFS_FUSE_LD_FLAGS}")
+  if (FUSE3_FOUND)
+    set_target_properties (cvmfs_fuse3_stub PROPERTIES
+                                            COMPILE_FLAGS "${CVMFS_STUB3_CFLAGS}"
+                                            LINK_FLAGS "${CVMFS_STUB_LD_FLAGS}")
+    set_target_properties (cvmfs_fuse3_debug PROPERTIES
+                                             COMPILE_FLAGS "${CVMFS_FUSE3_DEBUG_CFLAGS}"
+                                             LINK_FLAGS "${CVMFS_FUSE_DEBUG_LD_FLAGS}")
+    set_target_properties (cvmfs_fuse3 PROPERTIES COMPILE_FLAGS "${CVMFS_FUSE3_CFLAGS}"
+                                                  LINK_FLAGS "${CVMFS_FUSE_LD_FLAGS}")
+  endif()
+  set_target_properties (cvmfs_fsck PROPERTIES COMPILE_FLAGS "${CVMFS_FSCK_CFLAGS}"
+                                               LINK_FLAGS "${CVMFS_FSCK_LD_FLAGS}")
+  set_target_properties (cvmfs_talk PROPERTIES COMPILE_FLAGS "${CVMFS_TALK_CFLAGS}"
+                                               LINK_FLAGS "${CVMFS_TALK_LD_FLAGS}")
 
+  set_target_properties (cvmfs_fuse_stub PROPERTIES VERSION ${CernVM-FS_VERSION_STRING})
   set_target_properties (cvmfs_fuse PROPERTIES VERSION ${CernVM-FS_VERSION_STRING})
   set_target_properties (cvmfs_fuse_debug PROPERTIES VERSION ${CernVM-FS_VERSION_STRING})
+  if (FUSE3_FOUND)
+    set_target_properties (cvmfs_fuse3_stub PROPERTIES VERSION ${CernVM-FS_VERSION_STRING})
+    set_target_properties (cvmfs_fuse3 PROPERTIES VERSION ${CernVM-FS_VERSION_STRING})
+    set_target_properties (cvmfs_fuse3_debug PROPERTIES VERSION ${CernVM-FS_VERSION_STRING})
+  endif()
 
   set (CVMFS_FUSE_LINK_LIBRARIES "")
   list(APPEND CVMFS_FUSE_LINK_LIBRARIES ${CURL_LIBRARIES}
-                                        ${CARES_LIBRARIES}
+                                        ${CARES_LIBRARIES} ${CARES_LDFLAGS}
                                         ${OPENSSL_LIBRARIES}
                                         ${PACPARSER_LIBRARIES}
                                         ${SQLITE3_LIBRARY}
@@ -571,20 +752,25 @@ if (BUILD_CVMFS)
                                         ${PROTOBUF_LITE_LIBRARY}
                                         ${VJSON_LIBRARIES}
                                         ${RT_LIBRARY}
-                                        ${UUID_LIBRARIES}
-                                        ${FUSE_LIBRARIES}
-                                        pthread dl)
+                                        ${UUID_LIBRARIES})
+  list (APPEND CVMFS_FUSE_LINK_LIBRARIES pthread dl)
 
-  target_link_libraries (cvmfs2 ${CVMFS_LOADER_LIBS} ${OPENSSL_LIBRARIES}
-                                ${CVMFS_FUSE_LINK_LIBRARIES} ${RT_LIBRARY}
-                                ${UUID_LIBRARIES} ${SHA3_LIBRARIES} pthread dl)
-  target_link_libraries (cvmfs_fuse_debug ${CVMFS2_DEBUG_LIBS} ${CVMFS_FUSE_LINK_LIBRARIES})
-  target_link_libraries (cvmfs_fuse       ${CVMFS2_LIBS} ${CVMFS_FUSE_LINK_LIBRARIES})
-  target_link_libraries (cvmfs_fsck       ${CVMFS_FSCK_LIBS} ${ZLIB_LIBRARIES}
-                                          ${OPENSSL_LIBRARIES} ${ZLIB_LIBRARIES}
-                                          ${SHA3_LIBRARIES} ${RT_LIBRARY} pthread)
-  target_link_libraries (cvmfs_talk       ${CVMFS_TALK_LIBS}
-                                          ${RT_LIBRARY} pthread)
+  target_link_libraries(cvmfs2 pthread dl)
+  target_link_libraries (cvmfs_fuse_stub   ${OPENSSL_LIBRARIES} ${SHA3_LIBRARIES}
+                                           ${FUSE_LIBRARIES} pthread dl)
+  target_link_libraries (cvmfs_fuse_debug  ${FUSE_LIBRARIES} ${CVMFS_FUSE_LINK_LIBRARIES})
+  target_link_libraries (cvmfs_fuse        ${FUSE_LIBRARIES} ${CVMFS_FUSE_LINK_LIBRARIES})
+  if (FUSE3_FOUND)
+    target_link_libraries (cvmfs_fuse3_stub  ${OPENSSL_LIBRARIES} ${SHA3_LIBRARIES}
+                                             ${FUSE3_LIBRARIES} pthread dl)
+    target_link_libraries (cvmfs_fuse3_debug ${FUSE3_LIBRARIES} ${CVMFS_FUSE_LINK_LIBRARIES})
+    target_link_libraries (cvmfs_fuse3       ${FUSE3_LIBRARIES} ${CVMFS_FUSE_LINK_LIBRARIES})
+  endif()
+  target_link_libraries (cvmfs_fsck        ${ZLIB_LIBRARIES} ${OPENSSL_LIBRARIES}
+                                           ${ZLIB_LIBRARIES} ${SHA3_LIBRARIES}
+                                           ${RT_LIBRARY} pthread)
+  target_link_libraries (cvmfs_talk        ${CVMFS_TALK_LIBS}
+                                           ${RT_LIBRARY} pthread)
 
 
   set (CVMFS_ALLOW_HELPER_SOURCES
@@ -658,6 +844,16 @@ if (BUILD_LIBCVMFS_CACHE)
                         ${CMAKE_CURRENT_BINARY_DIR}/libcvmfs_cache.a
                         ${OPENSSL_LIBRARIES} ${RT_LIBRARY} pthread)
   add_dependencies(cvmfs_cache_ram libcvmfs_cache)
+
+  add_executable(cvmfs_cache_posix ${CVMFS_CACHE_POSIX_SOURCES})
+  set (CVMFS_CACHE_POSIX_CFLAGS "${CMAKE_CXX_FLAGS} -DDEBUGMSG")
+  set_target_properties (cvmfs_cache_posix PROPERTIES COMPILE_FLAGS
+                         "${CVMFS_CACHE_POSIX_CFLAGS}")
+  target_link_libraries(cvmfs_cache_posix
+                        ${CMAKE_CURRENT_BINARY_DIR}/libcvmfs_cache.a
+                        ${OPENSSL_LIBRARIES} ${SHA3_LIBRARIES}
+                        ${ZLIB_LIBRARIES} pthread)
+  add_dependencies(cvmfs_cache_posix libcvmfs_cache)
 endif (BUILD_LIBCVMFS_CACHE)
 
 
@@ -703,7 +899,7 @@ if (BUILD_LIBCVMFS)
   add_dependencies(test_libcvmfs libcvmfs)
 
   list(APPEND TEST_LIBCVMFS_LIBS ${SQLITE3_LIBRARY} ${CURL_LIBRARIES}
-                                 ${CARES_LIBRARIES} ${PACPARSER_LIBRARIES} ${ZLIB_LIBRARIES}
+                                 ${CARES_LIBRARIES} ${CARES_LDFLAGS} ${PACPARSER_LIBRARIES} ${ZLIB_LIBRARIES}
                                  ${OPENSSL_LIBRARIES} ${RT_LIBRARY} ${UUID_LIBRARIES} pthread dl)
 
   target_link_libraries(test_libcvmfs ${CMAKE_CURRENT_BINARY_DIR}/libcvmfs.a ${TEST_LIBCVMFS_LIBS})
@@ -715,7 +911,7 @@ if (BUILD_LIBCVMFS)
 
     set (CVMFS_SHRINKWRAP_LIBS
                           ${CMAKE_CURRENT_BINARY_DIR}/libcvmfs.a
-                          ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${CARES_LIBRARIES}
+                          ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${CARES_LIBRARIES} ${CARES_LDFLAGS}
                           ${PACPARSER_LIBRARIES} ${ZLIB_LIBRARIES} ${OPENSSL_LIBRARIES}
                           ${SHA3_LIBRARIES} ${VJSON_LIBRARIES}
                           ${PROTOBUF_LITE_LIBRARY}
@@ -733,7 +929,7 @@ if (BUILD_SHRINKWRAP)
 
   set (CVMFS_SHRINKWRAP_LIBS
                         ${CMAKE_CURRENT_BINARY_DIR}/libcvmfs.a
-                        ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${CARES_LIBRARIES}
+                        ${SQLITE3_LIBRARY} ${CURL_LIBRARIES} ${CARES_LIBRARIES} ${CARES_LDFLAGS}
                         ${PACPARSER_LIBRARIES} ${ZLIB_LIBRARIES} ${OPENSSL_LIBRARIES}
                         ${SHA3_LIBRARIES} ${VJSON_LIBRARIES}
                         ${PROTOBUF_LITE_LIBRARY}
@@ -744,41 +940,70 @@ if (BUILD_SHRINKWRAP)
 endif(BUILD_SHRINKWRAP)
 
 
+if(NOT BUILD_SERVER)
+  if(BUILD_SERVER_DEBUG)
+    message( FATAL_ERROR "BUILD_SERVER needs to be on with BUILD_SERVER_DEBUG set. Exiting." )
+  endif(BUILD_SERVER_DEBUG)
+endif(NOT BUILD_SERVER)
 
 if (BUILD_SERVER)
+  set (CVMFS_PUBLISH_CFLAGS "${CMAKE_CXX_FLAGS} -D_FILE_OFFSET_BITS=64 -fexceptions")
+  set (LIBCVMFS_SERVER_CFLAGS "${CMAKE_CXX_FLAGS} -D_FILE_OFFSET_BITS=64 -fexceptions")
+
   # create targets with corresponding sources and static link libraries
   add_executable (cvmfs_swissknife ${CVMFS_SWISSKNIFE_SOURCES})
   add_executable (cvmfs_suid_helper ${CVMFS_SUID_HELPER_SOURCES})
-  add_executable (cvmfs_stratum_agent ${CVMFS_STRATUM_AGENT_SOURCES})
+  add_library (cvmfs_server SHARED ${LIBCVMFS_SERVER_SOURCES})
+  add_executable (cvmfs_publish ${CVMFS_PUBLISH_SOURCES})
 
   set_target_properties (cvmfs_swissknife PROPERTIES COMPILE_FLAGS "${CVMFS_SWISSKNIFE_CFLAGS}" LINK_FLAGS "${CVMFS_SWISSKNIFE_LD_FLAGS}")
+  set_target_properties (cvmfs_server PROPERTIES
+    VERSION ${CernVM-FS_VERSION_STRING}
+    COMPILE_FLAGS "${LIBCVMFS_SERVER_CFLAGS}")
+  set_target_properties (cvmfs_publish PROPERTIES COMPILE_FLAGS "${CVMFS_PUBLISH_CFLAGS}" LINK_FLAGS "${CVMFS_PUBLISH_LD_FLAGS}")
 
   # link the stuff (*_LIBRARIES are dynamic link libraries)
+  set (LIBCVMFS_SERVER_LINK_LIBRARIES "")
+  list(APPEND LIBCVMFS_SERVER_LINK_LIBRARIES ${CURL_LIBRARIES}
+                                             ${CARES_LIBRARIES} ${CARES_LDFLAGS}
+                                             ${OPENSSL_LIBRARIES}
+                                             ${SQLITE3_LIBRARY}
+                                             ${ZLIB_LIBRARIES}
+                                             ${SHA3_LIBRARIES}
+                                             ${VJSON_LIBRARIES}
+                                             ${CAP_LIBRARIES}
+                                             ${LibArchive_LIBRARY}
+                                             ${RT_LIBRARY}
+                                             pthread dl)
   target_link_libraries (cvmfs_swissknife
                          ${SQLITE3_LIBRARY} ${CURL_LIBRARIES}
-                         ${CARES_LIBRARIES} ${ZLIB_LIBRARIES}
+                         ${CARES_LIBRARIES} ${CARES_LDFLAGS} ${ZLIB_LIBRARIES}
                          ${OPENSSL_LIBRARIES} ${RT_LIBRARY} ${VJSON_LIBRARIES}
                          ${SHA3_LIBRARIES} ${CAP_LIBRARIES} ${LibArchive_LIBRARY}
                          pthread dl)
-
-  target_link_libraries(cvmfs_stratum_agent
-                        ${CURL_LIBRARIES} ${CARES_LIBRARIES}
-                        ${SHA3_LIBRARIES} ${SHA2_LIBRARIES} ${ZLIB_LIBRARIES}
-                        ${MONGOOSE_LIBRARIES} ${OPENSSL_LIBRARIES}
-                        ${UUID_LIBRARIES} ${VJSON_LIBRARIES}
-                        ${RT_LIBRARY} pthread dl)
-
+  target_link_libraries (cvmfs_server ${LIBCVMFS_SERVER_LIBS} ${LIBCVMFS_SERVER_LINK_LIBRARIES})
+  target_link_libraries (cvmfs_publish cvmfs_server)
   if (BUILD_SERVER_DEBUG)
-    add_executable (cvmfs_swissknife_debug ${CVMFS_SWISSKNIFE_DEBUG_SOURCES})
-
-    set_target_properties (cvmfs_swissknife_debug PROPERTIES COMPILE_FLAGS "${CVMFS_SWISSKNIFE_DEBUG_CFLAGS}" LINK_FLAGS "${CVMFS_SWISSKNIFE_DEBUG_LD_FLAGS}")
-
+    add_executable (cvmfs_swissknife_debug ${CVMFS_SWISSKNIFE_SOURCES})
+    set_target_properties (cvmfs_swissknife_debug PROPERTIES COMPILE_FLAGS "${CVMFS_SWISSKNIFE_CFLAGS} -DDEBUGMSG -g -O0" LINK_FLAGS "${CVMFS_SWISSKNIFE_DEBUG_LD_FLAGS}")
     target_link_libraries (cvmfs_swissknife_debug
                            ${SQLITE3_LIBRARY}  ${CURL_LIBRARIES}
-                           ${CARES_LIBRARIES} ${ZLIB_LIBRARIES}
+                           ${CARES_LIBRARIES} ${CARES_LDFLAGS} ${ZLIB_LIBRARIES}
                            ${OPENSSL_LIBRARIES} ${RT_LIBRARY} ${VJSON_LIBRARIES}
                            ${SHA3_LIBRARIES} ${CAP_LIBRARIES} ${LibArchive_LIBRARY}
                            pthread dl)
+
+    add_library (cvmfs_server_debug SHARED ${LIBCVMFS_SERVER_SOURCES})
+    set_target_properties (cvmfs_server_debug PROPERTIES
+      VERSION ${CernVM-FS_VERSION_STRING}
+      COMPILE_FLAGS "${LIBCVMFS_SERVER_CFLAGS} -DDEBUGMSG -g -O0")
+    target_link_libraries (cvmfs_server_debug ${LIBCVMFS_SERVER_LIBS} ${LIBCVMFS_SERVER_LINK_LIBRARIES})
+
+    add_executable (cvmfs_publish_debug ${CVMFS_PUBLISH_SOURCES})
+    set_target_properties (cvmfs_publish_debug
+      PROPERTIES COMPILE_FLAGS "${CVMFS_PUBLISH_CFLAGS} -DDEBUGMSG -g -O0"
+      LINK_FLAGS "${CVMFS_PUBLISH_LD_FLAGS}")
+    target_link_libraries (cvmfs_publish_debug cvmfs_server_debug)
   endif (BUILD_SERVER_DEBUG)
 endif (BUILD_SERVER)
 
@@ -786,7 +1011,7 @@ if (BUILD_PRELOADER)
   add_executable (cvmfs_preload_bin ${CVMFS_PRELOADER_SOURCES})
 
   target_link_libraries(cvmfs_preload_bin ${SQLITE3_LIBRARY} ${CURL_LIBRARIES}
-                        ${CARES_LIBRARIES} ${ZLIB_LIBRARIES}
+                        ${CARES_LIBRARIES} ${CARES_LDFLAGS} ${ZLIB_LIBRARIES}
                         ${OPENSSL_LIBRARIES} ${CARES_LIBRARIS} ${RT_LIBRARY}
                         ${UUID_LIBRARIES} ${VJSON_LIBRARIES} ${SHA3_LIBRARIES}
                         pthread dl)
@@ -808,7 +1033,7 @@ endif (BUILD_PRELOADER)
 # Generate the "cvmfs_server" script using "make_cvmfs_server.sh"
 #
 add_custom_target (
-  cvmfs_server
+  cvmfs_server_script
   ALL
   COMMAND cd ${CMAKE_CURRENT_SOURCE_DIR} && ./make_cvmfs_server.sh ${CMAKE_CURRENT_BINARY_DIR}/cvmfs_server
   COMMENT "Generating the cvmfs_server script"
@@ -832,10 +1057,17 @@ if (BUILD_CVMFS)
   )
 
   install (
-    TARGETS      cvmfs_fuse cvmfs_fuse_debug
+    TARGETS      cvmfs_fuse_stub cvmfs_fuse cvmfs_fuse_debug
     LIBRARY
     DESTINATION    ${CMAKE_INSTALL_LIBDIR}
   )
+  if (FUSE3_FOUND)
+    install (
+      TARGETS      cvmfs_fuse3_stub cvmfs_fuse3 cvmfs_fuse3_debug
+      LIBRARY
+      DESTINATION    ${CMAKE_INSTALL_LIBDIR}
+    )
+  endif ()
 
   install (
     FILES      cvmfs_config
@@ -895,6 +1127,11 @@ if (BUILD_LIBCVMFS_CACHE)
     RUNTIME
     DESTINATION  ${CVMFS_LIBEXEC_DIR}/cache
   )
+  install (
+    TARGETS     cvmfs_cache_posix
+    RUNTIME
+    DESTINATION  ${CVMFS_LIBEXEC_DIR}/cache
+  )
 endif (BUILD_LIBCVMFS_CACHE)
 
 if (BUILD_RECEIVER)
@@ -907,15 +1144,15 @@ endif(BUILD_RECEIVER)
 
 if (BUILD_SERVER)
   install (
-    TARGETS     cvmfs_swissknife cvmfs_stratum_agent
+    TARGETS     cvmfs_swissknife cvmfs_publish
     RUNTIME
     DESTINATION    bin
   )
 
-  install(
-    FILES        stratum_agent/cvmfs_stratum_agent.service stratum_agent/cvmfs_stratum_agent.initd
-    DESTINATION  "/usr/share/cvmfs-server/agent"
-    PERMISSIONS  OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+  install (
+    TARGETS     cvmfs_server
+    LIBRARY
+    DESTINATION    ${CMAKE_INSTALL_LIBDIR}
   )
 
   install (
@@ -930,6 +1167,18 @@ if (BUILD_SERVER)
       TARGETS     cvmfs_swissknife_debug
       RUNTIME
       DESTINATION   bin
+    )
+
+    install (
+      TARGETS     cvmfs_publish_debug
+      RUNTIME
+      DESTINATION   bin
+    )
+
+    install (
+      TARGETS     cvmfs_server_debug
+      LIBRARY
+      DESTINATION    ${CMAKE_INSTALL_LIBDIR}
     )
   endif (BUILD_SERVER_DEBUG)
 
@@ -955,6 +1204,24 @@ if (BUILD_SERVER)
     FILES      webapi/cvmfs-api.wsgi
     DESTINATION    "/var/www/wsgi-scripts/cvmfs-server"
     PERMISSIONS    OWNER_READ OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+  )
+
+  install(
+    FILES      server/generate_stats_plots.C
+    DESTINATION    "/usr/share/cvmfs-server"
+    PERMISSIONS    OWNER_READ GROUP_READ WORLD_READ
+  )
+
+  install(
+    FILES      server/upload_stats_plots.sh
+    DESTINATION    "/usr/share/cvmfs-server"
+    PERMISSIONS    OWNER_READ OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+  )
+
+  install(
+    FILES      server/stats_index.html.tpl
+    DESTINATION    "/usr/share/cvmfs-server"
+    PERMISSIONS    OWNER_READ GROUP_READ WORLD_READ
   )
 
   install(
@@ -992,6 +1259,7 @@ if (BUILD_SERVER)
     PERMISSIONS    OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
     RENAME         README
   )
+
 endif (BUILD_SERVER)
 
 if (BUILD_PRELOADER)

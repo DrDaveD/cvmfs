@@ -1,5 +1,7 @@
 #!/bin/sh
 
+export CVMFS_PLATFORM_NAME="slc6-x86_64_gcov"
+
 # source the common platform independent functionality and option parsing
 script_location=$(cd "$(dirname "$0")"; pwd)
 . ${script_location}/common.sh
@@ -83,6 +85,7 @@ CVMFS_TEST_CLASS_NAME=ClientIntegrationTests                                  \
                                  src/005-asetup                               \
                                  src/006-buildkernel                          \
                                  src/024-reload-during-asetup                 \
+                                 src/084-premounted                           \
                                  --                                           \
                                  src/0*                                       \
                               || retval=1

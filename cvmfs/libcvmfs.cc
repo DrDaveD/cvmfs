@@ -396,6 +396,29 @@ int cvmfs_listdir_contents(
   return 0;
 }
 
+int cvmfs_listdir_stat(
+  LibContext *ctx,
+  const char *path,
+  struct cvmfs_stat_t **buf,
+  size_t *listlen,
+  size_t *buflen
+) {
+  string lpath;
+  int rc;
+  rc = expand_path(0, ctx, path, &lpath);
+  if (rc < 0) {
+    return -1;
+  }
+  path = lpath.c_str();
+
+  rc = ctx->ListDirectoryStat(path, buf, listlen, buflen);
+  if (rc < 0) {
+    errno = -rc;
+    return -1;
+  }
+  return 0;
+}
+
 
 
 int cvmfs_stat_nc(
@@ -544,6 +567,12 @@ char *cvmfs_statistics_format(cvmfs_context *ctx) {
 
 
 int cvmfs_remount(LibContext *ctx) {
-  // not implemented
-  return -1;
+  assert(ctx != NULL);
+  return ctx->Remount();
+}
+
+
+uint64_t cvmfs_get_revision(LibContext *ctx) {
+  assert(ctx != NULL);
+  return ctx->GetRevision();
 }

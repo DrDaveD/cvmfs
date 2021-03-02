@@ -200,11 +200,7 @@ cvmfs_server_mkfs() {
   # sanity checks
   check_repository_existence $name  && die "The repository $name already exists"
   check_upstream_validity $upstream
-  if [ $unionfs = "overlayfs" ]; then
-    local msg
-    msg="`check_overlayfs_version`" || die "$msg"
-    echo "Warning: CernVM-FS filesystems using overlayfs may not enforce hard link semantics during publishing."
-  else
+  if [ $unionfs = "aufs" ]; then
     check_aufs                      || die "aufs kernel module missing"
   fi
   check_cvmfs2_client               || die "cvmfs client missing"
@@ -365,7 +361,7 @@ cvmfs_server_mkfs() {
 
   health_check $name || die "fail! (health check after mount)"
 
-  if [ x"$upstream_type" != xgw ]; then
+  if [ x"$upstream_type" != xgw -a "x$voms_authz" = "x" ]; then
       echo -n "Initial commit... "
       cvmfs_server_transaction $name > /dev/null || die "fail (transaction)"
       echo "New CernVM-FS repository for $name" > /cvmfs/${name}/new_repository

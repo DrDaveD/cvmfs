@@ -126,6 +126,7 @@ class AbstractCatalogManager : public SingleCopy {
   void SetInodeAnnotation(InodeAnnotation *new_annotation);
   virtual bool Init();
   LoadError Remount(const bool dry_run);
+  LoadError ChangeRoot(const shash::Any &root_hash);
   void DetachNested();
 
   bool LookupPath(const PathString &path, const LookupOptions options,
@@ -146,7 +147,11 @@ class AbstractCatalogManager : public SingleCopy {
   bool ListCatalogSkein(const PathString &path,
                         std::vector<PathString> *result_list);
 
-  bool Listing(const PathString &path, DirectoryEntryList *listing);
+  bool Listing(const PathString &path, DirectoryEntryList *listing,
+               const bool expand_symlink);
+  bool Listing(const PathString &path, DirectoryEntryList *listing) {
+    return Listing(path, listing, true);
+  }
   bool Listing(const std::string &path, DirectoryEntryList *listing) {
     PathString p;
     p.Assign(&path[0], path.length());
@@ -195,6 +200,9 @@ class AbstractCatalogManager : public SingleCopy {
     return (inode <= kInodeOffset) ? GetRootInode() : inode;
   }
 
+  catalog::Counters LookupCounters(const PathString &path,
+                                   std::string *subcatalog_path);
+
  protected:
   /**
    * Load the catalog and return a file name and the catalog hash. Derived
@@ -224,7 +232,9 @@ class AbstractCatalogManager : public SingleCopy {
 
   CatalogT *MountCatalog(const PathString &mountpoint, const shash::Any &hash,
                          CatalogT *parent_catalog);
-  bool MountSubtree(const PathString &path, const CatalogT *entry_point,
+  bool MountSubtree(const PathString &path,
+                    const CatalogT *entry_point,
+                    bool can_listing,
                     CatalogT **leaf_catalog);
 
   bool AttachCatalog(const std::string &db_path, CatalogT *new_catalog);

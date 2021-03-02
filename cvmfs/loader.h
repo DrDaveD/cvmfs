@@ -5,16 +5,16 @@
 #ifndef CVMFS_LOADER_H_
 #define CVMFS_LOADER_H_
 
-#define FUSE_USE_VERSION 26
 #define _FILE_OFFSET_BITS 64
 
-#include <fuse/fuse_lowlevel.h>
 #include <stdint.h>
 #include <time.h>
 
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include "duplex_fuse.h"
 
 namespace loader {
 
@@ -101,7 +101,8 @@ enum StateId {
   kStateOpenChunksV2,       // >= 2.1.20
   kStateOpenChunksV3,       // >= 2.2.0
   kStateOpenChunksV4,       // >= 2.2.3
-  kStateOpenFiles           // >= 2.4
+  kStateOpenFiles,          // >= 2.4
+  kStateNentryTracker       // >= 2.7
 
   // Note: kStateOpenFilesXXX was renamed to kStateOpenChunksXXX as of 2.4
 };
@@ -148,6 +149,7 @@ typedef std::vector<LoadEvent *> EventList;
  * CernVM-FS 2.1.8 --> Version 2
  * CernVM-FS 2.2.0 --> Version 3
  * CernVM-FS 2.4.0 --> Version 4
+ * CernVM-FS 2.7.0 --> Version 4, fuse_channel --> fuse_channel_or_session
  */
 struct LoaderExports {
   LoaderExports() :
@@ -157,7 +159,7 @@ struct LoaderExports {
     foreground(false),
     disable_watchdog(false),
     simple_options_parsing(false),
-    fuse_channel(NULL)
+    fuse_channel_or_session(NULL)
   { }
 
   ~LoaderExports() {
@@ -184,7 +186,11 @@ struct LoaderExports {
   bool simple_options_parsing;
 
   // added with CernVM-FS 2.4.0 (LoaderExports Version: 4)
-  struct fuse_chan **fuse_channel;
+  // As of CernVM-FS 2.7, this has been rebranded from
+  // struct fuse_chan **fuse_channel  to
+  // void **fuse_channel_or_session
+  // in order to work with both libfuse2 and libfuse3
+  void **fuse_channel_or_session;
 };
 
 
@@ -192,6 +198,9 @@ struct LoaderExports {
  * This contains the public interface of the cvmfs fuse module.
  * Whenever something changes, change the version number.
  * A global CvmfsExports struct is looked up by the loader via dlsym.
+ *
+ * Note: as of cvmfs version 2.8, we set cvmfs_operations.forget_multi on new
+ * enough fuse
  */
 struct CvmfsExports {
   CvmfsExports() {
