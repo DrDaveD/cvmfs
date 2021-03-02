@@ -29,5 +29,16 @@ echo "  ffffffffffffffffffffffffffffffff 99999 file1"
 echo "  ffffffffffffffffffffffffffffffff 99999 file2"
 ) > $PKG.dsc
 #
-tar czf debian.tar.gz --exclude $PKG.dsc --exclude debian.tar.gz --exclude obsupdate.sh --exclude source *
+cleanout=
+for f in *.in; do
+  base=`basename $f .in`
+  if [ ! -f $base ]; then
+    cp $f $base
+    cleanout="$cleanout $base"
+  fi
+done
+if [ -n "$cleanout" ]; then
+  trap "rm -f $cleanout" 0
+fi
+tar czf debian.tar.gz --exclude $PKG.dsc --exclude debian.tar.gz --exclude obsupdate.sh --exclude source --exclude "*.in" *
 echo "Updated $HERE/$PKG.dsc and $HERE/debian.tar.gz; check them into git"
