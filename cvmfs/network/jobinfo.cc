@@ -50,7 +50,6 @@ void JobInfo::Init() {
   gid_ = -1;
   cred_data_ = NULL;
   interrupt_cue_ = NULL;
-  sink_ = NULL;
   expected_hash_ = NULL;
   extra_info_ = NULL;
   //
@@ -66,11 +65,14 @@ void JobInfo::Init() {
   nocache_ = false;
   error_code_ = kFailOther;
   http_code_ = -1;
+  link_ = "";
   num_used_proxies_ = 0;
+  num_used_metalinks_ = 0;
   num_used_hosts_ = 0;
   num_retries_ = 0;
   backoff_ms_ = 0;
-  current_host_chain_index_ = 0;
+  current_metalink_chain_index_ = -1;
+  current_host_chain_index_ = -1;
 
   allow_failure_ = false;
 
