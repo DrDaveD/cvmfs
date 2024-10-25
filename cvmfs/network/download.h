@@ -287,6 +287,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   void Backoff(JobInfo *info);
   void SetNocache(JobInfo *info);
   void SetRegularCache(JobInfo *info);
+  void ProcessLink(JobInfo *info);
   bool VerifyAndFinalize(const int curl_error, JobInfo *info);
   void InitHeaders();
   void CloneProxyConfig(DownloadManager *clone);
@@ -344,7 +345,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   bool enable_http_tracing_;
   std::vector<std::string> http_tracing_headers_;
 
-  // Metalink
+  // Metalink list
   HostInfo opt_metalink_;
   time_t opt_metalink_timestamp_link_;
 
