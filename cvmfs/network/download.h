@@ -287,6 +287,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   void Backoff(JobInfo *info);
   void SetNocache(JobInfo *info);
   void SetRegularCache(JobInfo *info);
+  void ProcessLink(JobInfo *info);
   bool VerifyAndFinalize(const int curl_error, JobInfo *info);
   void InitHeaders();
   void CloneProxyConfig(DownloadManager *clone);
