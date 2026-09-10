@@ -248,10 +248,12 @@ void BashOptionsManager::ParsePath(const string &config_file,
 
     ConfigValue value;
     value.source = config_file;
-    const string sh_echo = "echo $" + parameter + "\n";
+    const string sh_echo = "echo ${" + parameter + "-xNOTxSETx}\n";
     WritePipe(fd_stdin, sh_echo.data(), sh_echo.length());
     GetLineFd(fd_stdout, &value.value);
-    PopulateParameter(parameter, value);
+    if (value.value != "xNOTxSETx") {
+      PopulateParameter(parameter, value);
+    }
   }
 
   close(fd_stderr);
